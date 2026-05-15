@@ -1,5 +1,5 @@
 // ============================================================
-// MapView.jsx — Leaflet map with Geoman drawing tools & H3 grid
+// MapView.jsx — Premium Fullscreen Map with Precise H3 Hex Grid
 // ============================================================
 import { useEffect, useRef } from 'react'
 import { MapContainer, TileLayer, useMap } from 'react-leaflet'
@@ -7,9 +7,9 @@ import 'leaflet/dist/leaflet.css'
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css'
 import L from 'leaflet'
 import '@geoman-io/leaflet-geoman-free'
-import { polygonToCells, cellToBoundary } from 'h3-js'
+import { latLngToCell, disk, cellToBoundary } from 'h3-js'
 
-// Fix default marker icon paths broken by Vite bundling
+// Fix default marker icon paths
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
@@ -17,7 +17,7 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
 })
 
-// ── H3 Hexagonal Grid Overlay ────────────────────────────────
+// ── Precise H3 Hexagonal Grid (Centered around viewport) ─────
 function H3GridControls({ enabled }) {
   const map = useMap()
   const layerGroupRef = useRef(null)
@@ -44,55 +44,38 @@ function H3GridControls({ enabled }) {
       layerGroup.clearLayers()
 
       const zoom = map.getZoom()
+      // Scale H3 resolution smoothly with map zoom
       let res = 2
-      if (zoom >= 16) res = 9
-      else if (zoom >= 14) res = 8
-      else if (zoom >= 12) res = 7
-      else if (zoom >= 10) res = 6
-      else if (zoom >= 8) res = 5
-      else if (zoom >= 6) res = 4
-      else if (zoom >= 4) res = 3
+      let ringRadius = 5
+      if (zoom >= 16) { res = 9; ringRadius = 15 }
+      else if (zoom >= 14) { res = 8; ringRadius = 15 }
+      else if (zoom >= 12) { res = 7; ringRadius = 12 }
+      else if (zoom >= 10) { res = 6; ringRadius = 10 }
+      else if (zoom >= 8) { res = 5; ringRadius = 8 }
+      else if (zoom >= 6) { res = 4; ringRadius = 6 }
+      else if (zoom >= 4) { res = 3; ringRadius = 5 }
 
-      const bounds = map.getBounds()
-      const nw = bounds.getNorthWest()
-      const ne = bounds.getNorthEast()
-      const se = bounds.getSouthEast()
-      const sw = bounds.getSouthWest()
-
-      const clampLat = lat => Math.max(-89.9, Math.min(89.9, lat))
-      let minLng = Math.min(nw.lng, sw.lng)
-      let maxLng = Math.max(ne.lng, se.lng)
-      if (maxLng - minLng > 350) {
-        minLng = -179.9
-        maxLng = 179.9
-      }
-
-      const poly = [
-        [minLng, clampLat(nw.lat)],
-        [maxLng, clampLat(ne.lat)],
-        [maxLng, clampLat(se.lat)],
-        [minLng, clampLat(sw.lat)],
-        [minLng, clampLat(nw.lat)],
-      ]
-
+      const center = map.getCenter()
       try {
-        const cells = polygonToCells([poly], res, true)
-        const cappedCells = cells.slice(0, 500)
+        // Get the center H3 index
+        const centerHex = latLngToCell(center.lat, center.lng, res)
+        // Get a perfect grid disk of hexagons around the viewport center
+        const hexDisk = disk(centerHex, ringRadius)
 
-        cappedCells.forEach(cell => {
-          const boundary = cellToBoundary(cell) // [[lat, lng], [lat, lng], ...]
-          const polyLayer = L.polygon(boundary, {
-            color: '#06b6d4',
+        hexDisk.forEach(hex => {
+          const boundary = cellToBoundary(hex)
+          const hexLayer = L.polygon(boundary, {
+            color: '#00f2fe',
             weight: 1.5,
-            opacity: 0.7,
-            fillColor: '#06b6d4',
-            fillOpacity: 0.08,
+            opacity: 0.45,
+            fillColor: '#00f2fe',
+            fillOpacity: 0.04,
             interactive: false,
           })
-          layerGroup.addLayer(polyLayer)
+          layerGroup.addLayer(hexLayer)
         })
       } catch (err) {
-        console.warn('H3 grid calculation info:', err)
+        console.warn('H3 hex grid generation info:', err)
       }
     }
 
@@ -110,7 +93,7 @@ function H3GridControls({ enabled }) {
   return null
 }
 
-// ── Geoman Controls ──────────────────────────────────────────
+// ── Geoman Controls (positioned perfectly away from UI) ──────
 function GeomanControls({ onShapeDrawn }) {
   const map = useMap()
   const drawnLayersRef = useRef([])
@@ -164,8 +147,8 @@ function GeomanControls({ onShapeDrawn }) {
   return null
 }
 
-// ── Main MapView export ────────────────────────────────────────
-export default function MapView({ onShapeDrawn, showGrid = true, mapStyle = 'colored' }) {
+// ── Main MapView Export ────────────────────────────────────────
+export default function MapView({ onShapeDrawn, showGrid = true, mapStyle = 'dark' }) {
   const tileUrls = {
     colored: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
     dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
@@ -174,16 +157,16 @@ export default function MapView({ onShapeDrawn, showGrid = true, mapStyle = 'col
 
   return (
     <MapContainer
-      center={[25, 10]}
-      zoom={3}
+      center={[35, -20]}
+      zoom={4}
       minZoom={2}
-      className="w-full h-full"
+      className="w-full h-full absolute inset-0 z-0"
       zoomControl={true}
     >
       <TileLayer
         key={mapStyle}
-        url={tileUrls[mapStyle] || tileUrls.colored}
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; CARTO'
+        url={tileUrls[mapStyle] || tileUrls.dark}
+        attribution='&copy; OpenStreetMap &copy; CARTO'
         subdomains="abcd"
         maxZoom={20}
       />
