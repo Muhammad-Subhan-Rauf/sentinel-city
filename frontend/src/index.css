@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
 @import "tailwindcss";
 
 /* ─── Base ──────────────────────────────────────────────────── */
@@ -14,6 +14,23 @@ html, body, #root {
   -webkit-font-smoothing: antialiased;
 }
 
+/* ─── Glassmorphic HUD Panels ───────────────────────────────── */
+.glass-panel {
+  background: rgba(15, 22, 41, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(30, 45, 77, 0.75);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+}
+
+.glass-panel-glow {
+  background: rgba(15, 22, 41, 0.9);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glow-border, rgba(249,115,22,0.5));
+  box-shadow: 0 0 35px 0 var(--glow-shadow, rgba(249,115,22,0.3));
+}
+
 /* ─── Leaflet overrides ─────────────────────────────────────── */
 .leaflet-container {
   width: 100%;
@@ -21,30 +38,41 @@ html, body, #root {
   background: #060c1a !important;
 }
 
+.leaflet-control-zoom {
+  border: none !important;
+  box-shadow: 0 0 20px rgba(0,0,0,0.5) !important;
+}
+
 .leaflet-control-zoom a,
 .leaflet-bar a {
-  background: #0f1629 !important;
+  background: rgba(15, 22, 41, 0.9) !important;
+  backdrop-filter: blur(8px) !important;
   border-color: #1e2d4d !important;
   color: #c9d6f0 !important;
+  transition: all 0.2s ease !important;
 }
 
 .leaflet-control-zoom a:hover,
 .leaflet-bar a:hover {
-  background: #141d35 !important;
+  background: #1e2d4d !important;
   color: #f97316 !important;
+  transform: scale(1.05);
 }
 
 /* Geoman toolbar */
 .leaflet-pm-toolbar .button-container button {
-  background: #0f1629 !important;
+  background: rgba(15, 22, 41, 0.9) !important;
+  backdrop-filter: blur(8px) !important;
   border-color: #1e2d4d !important;
   color: #c9d6f0 !important;
+  transition: all 0.2s ease !important;
 }
 
 .leaflet-pm-toolbar .button-container button:hover,
 .leaflet-pm-toolbar .button-container button.active {
   background: #1e2d4d !important;
-  color: #f97316 !important;
+  color: #06b6d4 !important;
+  box-shadow: 0 0 15px rgba(6,182,212,0.4) !important;
 }
 
 /* ─── Scrollbar ─────────────────────────────────────────────── */
@@ -54,25 +82,26 @@ html, body, #root {
 ::-webkit-scrollbar-thumb:hover { background: #f97316; }
 
 /* ─── Custom slider thumb ───────────────────────────────────── */
-input[type='range'] { -webkit-appearance: none; appearance: none; }
+input[type='range'] { -webkit-appearance: none; appearance: none; background: transparent; }
 input[type='range']::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
-  background: #f97316;
+  background: var(--slider-color, #f97316);
   cursor: pointer;
-  border: 2px solid #0a0e1a;
-  box-shadow: 0 0 8px rgba(249,115,22,0.5);
-  transition: box-shadow 0.2s;
+  border: 3px solid #0a0e1a;
+  box-shadow: 0 0 12px var(--slider-color, #f97316);
+  transition: all 0.2s ease;
 }
 input[type='range']::-webkit-slider-thumb:hover {
-  box-shadow: 0 0 16px rgba(249,115,22,0.8);
+  transform: scale(1.2);
+  box-shadow: 0 0 20px var(--slider-color, #f97316);
 }
 input[type='range']::-webkit-slider-runnable-track {
-  height: 4px;
-  border-radius: 2px;
-  background: linear-gradient(to right, #f97316 var(--range-pct, 50%), #1e2d4d var(--range-pct, 50%));
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(to right, var(--slider-color, #f97316) var(--range-pct, 50%), #1e2d4d var(--range-pct, 50%));
 }
 
 /* ─── Animations ────────────────────────────────────────────── */
@@ -82,8 +111,13 @@ input[type='range']::-webkit-slider-runnable-track {
 }
 
 @keyframes blink {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0; }
+  0%, 100% { opacity: 1; filter: drop-shadow(0 0 6px currentColor); }
+  50%       { opacity: 0.3; filter: none; }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 15px var(--glow-color, rgba(249,115,22,0.4)); opacity: 1; }
+  50% { box-shadow: 0 0 25px var(--glow-color, rgba(249,115,22,0.8)); opacity: 0.85; }
 }
 
 .scanline {
@@ -91,8 +125,9 @@ input[type='range']::-webkit-slider-runnable-track {
   position: fixed;
   inset: 0;
   z-index: 9999;
-  background: linear-gradient(transparent 50%, rgba(249,115,22,0.015) 50%);
+  background: linear-gradient(transparent 50%, rgba(249,115,22,0.02) 50%);
   background-size: 100% 4px;
 }
 
-.status-blink { animation: blink 1.2s ease-in-out infinite; }
+.status-blink { animation: blink 1.5s ease-in-out infinite; }
+.animate-pulse-glow { animation: pulse-glow 2s infinite ease-in-out; }
