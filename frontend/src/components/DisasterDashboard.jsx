@@ -49,6 +49,8 @@ export default function DisasterDashboard() {
   const [notes, setNotes] = useState('')
   const [geometry, setGeometry] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [showGrid, setShowGrid] = useState(true)
+  const [mapStyle, setMapStyle] = useState('colored') // 'colored' | 'dark' | 'satellite'
   const [log, setLog] = useState([
     { type: 'info', time: now(), message: 'Sentinel-City online. Draw an area to begin.' },
   ])
@@ -273,23 +275,66 @@ export default function DisasterDashboard() {
 
       {/* ─── MAP ─────────────────────────────────────────────── */}
       <main className="flex-1 relative">
-        <div className="absolute top-3 right-3 z-[500] flex items-center gap-2 px-3 py-1.5
-                        bg-[#0f1629]/90 backdrop-blur border border-[#1e2d4d] rounded-md">
-          <span className="w-1.5 h-1.5 rounded-full status-blink" style={{ background: currentDisaster?.color || '#f97316' }} />
-          <span className="text-[10px] font-mono text-[#c9d6f0] uppercase tracking-wider">
-            {disasterType} · SEV {severity}
-          </span>
+        {/* Top-right Controls Bar: Grid Toggle & Map Theme Toggle */}
+        <div className="absolute top-3 right-3 z-[500] flex items-center gap-3.5">
+          
+          {/* Map style selector */}
+          <div className="flex items-center gap-1 p-1 bg-[#0f1629]/90 backdrop-blur border border-[#1e2d4d] rounded-lg">
+            <button
+              onClick={() => setMapStyle('colored')}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition-all ${
+                mapStyle === 'colored' ? 'bg-[#f97316] text-white shadow-[0_0_10px_rgba(249,115,22,0.4)]' : 'text-[#6b82a8] hover:text-[#c9d6f0]'
+              }`}
+            >
+              🌍 Colored
+            </button>
+            <button
+              onClick={() => setMapStyle('dark')}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition-all ${
+                mapStyle === 'dark' ? 'bg-[#f97316] text-white shadow-[0_0_10px_rgba(249,115,22,0.4)]' : 'text-[#6b82a8] hover:text-[#c9d6f0]'
+              }`}
+            >
+              🌙 Dark
+            </button>
+            <button
+              onClick={() => setMapStyle('satellite')}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition-all ${
+                mapStyle === 'satellite' ? 'bg-[#f97316] text-white shadow-[0_0_10px_rgba(249,115,22,0.4)]' : 'text-[#6b82a8] hover:text-[#c9d6f0]'
+              }`}
+            >
+              🛰️ Sat
+            </button>
+          </div>
+
+          {/* Grid toggle */}
+          <button
+            onClick={() => setShowGrid(g => !g)}
+            className={`flex items-center gap-2 px-3 py-1.5 bg-[#0f1629]/90 backdrop-blur border rounded-lg text-xs font-mono transition-all ${
+              showGrid ? 'border-[#06b6d4] text-[#06b6d4] shadow-[0_0_15px_rgba(6,182,212,0.3)]' : 'border-[#1e2d4d] text-[#6b82a8]'
+            }`}
+          >
+            <span className={`w-2 h-2 rounded-full ${showGrid ? 'bg-[#06b6d4] shadow-[0_0_8px_#06b6d4]' : 'bg-[#4b6082]'}`} />
+            ⬡ H3 Grid {showGrid ? 'ON' : 'OFF'}
+          </button>
+
+          {/* Current Disaster indicator */}
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-[#0f1629]/90 backdrop-blur border border-[#1e2d4d] rounded-lg">
+            <span className="w-1.5 h-1.5 rounded-full status-blink" style={{ background: currentDisaster?.color || '#f97316' }} />
+            <span className="text-[10px] font-mono text-[#c9d6f0] uppercase tracking-wider">
+              {disasterType} · SEV {severity}
+            </span>
+          </div>
         </div>
 
         {!geometry && (
           <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-[500]
                           px-4 py-2 bg-[#0f1629]/90 backdrop-blur border border-[#1e2d4d]
-                          rounded-full text-xs text-[#6b82a8] pointer-events-none">
+                          rounded-full text-xs text-[#6b82a8] pointer-events-none shadow-lg">
             ← Use the toolbar on the left to draw a disaster zone
           </div>
         )}
 
-        <MapView onShapeDrawn={handleShapeDrawn} />
+        <MapView onShapeDrawn={handleShapeDrawn} showGrid={showGrid} mapStyle={mapStyle} />
       </main>
     </div>
   )
