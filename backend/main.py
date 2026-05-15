@@ -1,16 +1,20 @@
 """
 Sentinel-City — FastAPI Backend
 ================================
-Handles authenticated disaster event ingestion and persists data to Supabase.
+Handles authenticated disaster event ingestion and persists data to Supabase
+via a direct PostgreSQL connection (DATABASE_URL).
 """
 
 import os
+import uuid
+import json
 import jwt
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, Depends, HTTPException, Header, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Any, Dict, Optional
-from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,9 +41,21 @@ app.add_middleware(
 # Environment variables
 # ---------------------------------------------------------------------------
 
-SUPABASE_URL: str = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY: str = os.environ["SUPABASE_SERVICE_KEY"]
+DATABASE_URL: str = os.environ["DATABASE_URL"]
 SUPABASE_JWT_SECRET: str = os.environ["SUPABASE_JWT_SECRET"]
+
+# ---------------------------------------------------------------------------
+# DB helper — one connection per request (simple & sufficient for hackathon)
+# ---------------------------------------------------------------------------
+
+
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -109,15 +125,6 @@ async def verify_user(authorization: Optional[str] = Header(None)) -> Dict[str, 
 
 
 # ---------------------------------------------------------------------------
-# Supabase admin client factory (service key bypasses RLS)
-# ---------------------------------------------------------------------------
-
-
-def get_supabase_admin() -> Client:
-    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
-
-# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -135,7 +142,7 @@ async def trigger_disaster(
 ):
     """
     Receive an authenticated disaster event from the frontend, persist it to
-    Supabase, and hand off to the AI orchestration layer.
+    the Supabase PostgreSQL database, and hand off to the AI orchestration layer.
 
     Requires: Authorization: Bearer <supabase_jwt>
     """
@@ -161,19 +168,31 @@ async def trigger_disaster(
     # ██████████████████████████████████████████████████████████████████
     # ------------------------------------------------------------------
 
-    supabase: Client = get_supabase_admin()
+    event_id = str(uuid.uuid4())
 
-    record = {
-        "triggered_by": user.get("sub"),          # Supabase user UUID
-        "disaster_type": payload.disaster_type,
-        "severity": payload.severity,
-        "area_geometry": payload.geometry,         # GeoJSON → PostGIS jsonb
-        "notes": payload.notes,
-        "status": "active",
-    }
+    insert_sql = """
+        INSERT INTO disaster_events
+            (id, triggered_by, disaster_type, severity, area_geometry, notes, status)
+        VALUES
+            (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id;
+    """
 
     try:
-        response = supabase.table("disaster_events").insert(record).execute()
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(insert_sql, (
+                    event_id,
+                    user.get("sub"),                        # Supabase user UUID
+                    payload.disaster_type,
+                    payload.severity,
+                    json.dumps(payload.geometry),           # GeoJSON → jsonb
+                    payload.notes,
+                    "active",
+                ))
+                returned_id = cur.fetchone()[0]
+        conn.close()
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -183,6 +202,6 @@ async def trigger_disaster(
     return {
         "success": True,
         "message": "Disaster event recorded. Sentinel agents activating.",
-        "event_id": response.data[0]["id"] if response.data else None,
+        "event_id": str(returned_id),
         "triggered_by": user.get("email"),
     }
