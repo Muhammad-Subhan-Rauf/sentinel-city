@@ -1,0 +1,100 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Base ──────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: #0a0e1a;
+  color: #c9d6f0;
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ─── Leaflet overrides ─────────────────────────────────────── */
+.leaflet-container {
+  width: 100%;
+  height: 100%;
+  background: #060c1a !important;
+}
+
+.leaflet-control-zoom a,
+.leaflet-bar a {
+  background: #0f1629 !important;
+  border-color: #1e2d4d !important;
+  color: #c9d6f0 !important;
+}
+
+.leaflet-control-zoom a:hover,
+.leaflet-bar a:hover {
+  background: #141d35 !important;
+  color: #f97316 !important;
+}
+
+/* Geoman toolbar */
+.leaflet-pm-toolbar .button-container button {
+  background: #0f1629 !important;
+  border-color: #1e2d4d !important;
+  color: #c9d6f0 !important;
+}
+
+.leaflet-pm-toolbar .button-container button:hover,
+.leaflet-pm-toolbar .button-container button.active {
+  background: #1e2d4d !important;
+  color: #f97316 !important;
+}
+
+/* ─── Scrollbar ─────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0a0e1a; }
+::-webkit-scrollbar-thumb { background: #1e2d4d; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #f97316; }
+
+/* ─── Custom slider thumb ───────────────────────────────────── */
+input[type='range'] { -webkit-appearance: none; appearance: none; }
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #f97316;
+  cursor: pointer;
+  border: 2px solid #0a0e1a;
+  box-shadow: 0 0 8px rgba(249,115,22,0.5);
+  transition: box-shadow 0.2s;
+}
+input[type='range']::-webkit-slider-thumb:hover {
+  box-shadow: 0 0 16px rgba(249,115,22,0.8);
+}
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to right, #f97316 var(--range-pct, 50%), #1e2d4d var(--range-pct, 50%));
+}
+
+/* ─── Animations ────────────────────────────────────────────── */
+@keyframes scanline {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+.scanline {
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: linear-gradient(transparent 50%, rgba(249,115,22,0.015) 50%);
+  background-size: 100% 4px;
+}
+
+.status-blink { animation: blink 1.2s ease-in-out infinite; }
