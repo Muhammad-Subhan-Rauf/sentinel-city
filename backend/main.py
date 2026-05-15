@@ -16,7 +16,7 @@ load_dotenv()
 
 app = FastAPI(
     title="Sentinel-City API",
-    description="Agentic disaster orchestration backend",
+    description="Municipal emergency orchestration backend",
     version="1.0.0",
 )
 
@@ -32,7 +32,7 @@ DATABASE_URL: str = os.environ["DATABASE_URL"]
 
 
 class DisasterPayload(BaseModel):
-    disaster_type: str = Field(..., examples=["Earthquake"])
+    disaster_type: str = Field(..., examples=["Flood"])
     severity: int = Field(..., ge=1, le=10)
     geometry: Dict[str, Any]
     notes: Optional[str] = None
@@ -46,7 +46,7 @@ async def health_check():
 @app.post("/api/trigger-disaster", tags=["Disasters"])
 async def trigger_disaster(payload: DisasterPayload):
     """
-    Accept a disaster event and persist it to Supabase PostgreSQL.
+    Accept a municipal emergency event and persist it to Supabase PostgreSQL.
     """
 
     # ------------------------------------------------------------------
@@ -54,7 +54,7 @@ async def trigger_disaster(payload: DisasterPayload):
     # [ANTIGRAVITY AI TRIGGER POINT]
     #
     # At this point you have:
-    #   - `payload.disaster_type` — e.g. "Earthquake"
+    #   - `payload.disaster_type` — e.g. "Flood", "Wildfire", "Power_Outage"
     #   - `payload.severity`      — 1–10
     #   - `payload.geometry`      — GeoJSON geometry dict
     #   - `payload.notes`         — optional operator notes
@@ -95,6 +95,6 @@ async def trigger_disaster(payload: DisasterPayload):
 
     return {
         "success": True,
-        "message": "Disaster event recorded. Sentinel agents activating.",
+        "message": "Emergency recorded. Sentinel units dispatched.",
         "event_id": str(returned_id),
     }
