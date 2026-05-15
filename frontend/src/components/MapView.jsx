@@ -1,5 +1,5 @@
 // ============================================================
-// MapView.jsx — Premium Fullscreen Map with Precise H3 Hex Grid
+// MapView.jsx — Premium Fullscreen Map with Fixed H3 Resolution Grid
 // ============================================================
 import { useEffect, useRef } from 'react'
 import { MapContainer, TileLayer, useMap } from 'react-leaflet'
@@ -7,9 +7,8 @@ import 'leaflet/dist/leaflet.css'
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css'
 import L from 'leaflet'
 import '@geoman-io/leaflet-geoman-free'
-import { latLngToCell, disk, cellToBoundary } from 'h3-js'
+import { latLngToCell, gridDisk, cellToBoundary } from 'h3-js'
 
-// Fix default marker icon paths
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
@@ -17,8 +16,8 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
 })
 
-// ── Precise H3 Hexagonal Grid (Centered around viewport) ─────
-function H3GridControls({ enabled }) {
+// ── Precise H3 Hexagonal Grid (Fixed Resolution) ─────────────
+function H3GridControls({ enabled, resolution }) {
   const map = useMap()
   const layerGroupRef = useRef(null)
 
@@ -44,38 +43,34 @@ function H3GridControls({ enabled }) {
       layerGroup.clearLayers()
 
       const zoom = map.getZoom()
-      // Scale H3 resolution smoothly with map zoom
-      let res = 2
-      let ringRadius = 5
-      if (zoom >= 16) { res = 9; ringRadius = 15 }
-      else if (zoom >= 14) { res = 8; ringRadius = 15 }
-      else if (zoom >= 12) { res = 7; ringRadius = 12 }
-      else if (zoom >= 10) { res = 6; ringRadius = 10 }
-      else if (zoom >= 8) { res = 5; ringRadius = 8 }
-      else if (zoom >= 6) { res = 4; ringRadius = 6 }
-      else if (zoom >= 4) { res = 3; ringRadius = 5 }
-
       const center = map.getCenter()
+
+      // Calculate the number of hex rings to fill the viewport based on zoom level & fixed resolution
+      // This ensures we always cover the screen without rendering too many off-screen hexes
+      let ringCount = 6
+      if (zoom <= 4) ringCount = Math.min(12, Math.max(4, 15 - resolution * 2))
+      else if (zoom <= 7) ringCount = Math.min(18, Math.max(6, 18 - resolution))
+      else if (zoom <= 10) ringCount = 14
+      else ringCount = 10
+
       try {
-        // Get the center H3 index
-        const centerHex = latLngToCell(center.lat, center.lng, res)
-        // Get a perfect grid disk of hexagons around the viewport center
-        const hexDisk = disk(centerHex, ringRadius)
+        const centerHex = latLngToCell(center.lat, center.lng, resolution)
+        const hexDisk = gridDisk(centerHex, ringCount)
 
         hexDisk.forEach(hex => {
           const boundary = cellToBoundary(hex)
           const hexLayer = L.polygon(boundary, {
             color: '#00f2fe',
             weight: 1.5,
-            opacity: 0.45,
+            opacity: 0.5,
             fillColor: '#00f2fe',
-            fillOpacity: 0.04,
+            fillOpacity: 0.05,
             interactive: false,
           })
           layerGroup.addLayer(hexLayer)
         })
       } catch (err) {
-        console.warn('H3 hex grid generation info:', err)
+        console.warn('H3 grid calculation info:', err)
       }
     }
 
@@ -88,12 +83,12 @@ function H3GridControls({ enabled }) {
       map.off('moveend', updateGrid)
       map.off('zoomend', updateGrid)
     }
-  }, [map, enabled])
+  }, [map, enabled, resolution])
 
   return null
 }
 
-// ── Geoman Controls (positioned perfectly away from UI) ──────
+// ── Geoman Controls ──────────────────────────────────────────
 function GeomanControls({ onShapeDrawn }) {
   const map = useMap()
   const drawnLayersRef = useRef([])
@@ -148,7 +143,7 @@ function GeomanControls({ onShapeDrawn }) {
 }
 
 // ── Main MapView Export ────────────────────────────────────────
-export default function MapView({ onShapeDrawn, showGrid = true, mapStyle = 'dark' }) {
+export default function MapView({ onShapeDrawn, showGrid = true, h3Resolution = 3, mapStyle = 'dark' }) {
   const tileUrls = {
     colored: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
     dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
@@ -171,7 +166,7 @@ export default function MapView({ onShapeDrawn, showGrid = true, mapStyle = 'dar
         maxZoom={20}
       />
 
-      <H3GridControls enabled={showGrid} />
+      <H3GridControls enabled={showGrid} resolution={h3Resolution} />
       <GeomanControls onShapeDrawn={onShapeDrawn} />
     </MapContainer>
   )

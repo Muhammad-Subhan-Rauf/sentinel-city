@@ -1,5 +1,5 @@
 // ============================================================
-// DisasterDashboard.jsx — Main command-center UI (Floating Glass Edition)
+// DisasterDashboard.jsx — Main command-center UI (Fixed H3 Res Edition)
 // ============================================================
 import { useState, useCallback, useEffect } from 'react'
 import MapView from './MapView'
@@ -28,6 +28,14 @@ const SEVERITY_COLORS = [
   '#facc15', '#fb923c', '#f97316', '#ef4444', '#dc2626', '#991b1b',
 ]
 
+const H3_RES_INFO = {
+  2: 'RES 2 (Regional)',
+  3: 'RES 3 (Metro)',
+  4: 'RES 4 (City)',
+  5: 'RES 5 (District)',
+  6: 'RES 6 (Precinct)',
+}
+
 function LogEntry({ entry }) {
   const icons = { success: '✓', error: '✗', info: '◆', pending: '◌' }
   const colors = {
@@ -50,11 +58,12 @@ export default function DisasterDashboard() {
   const [geometry, setGeometry] = useState(null)
   const [loading, setLoading] = useState(false)
   const [showGrid, setShowGrid] = useState(true)
-  const [mapStyle, setMapStyle] = useState('dark') // Default to tactical dark map for incredible contrast
+  const [h3Resolution, setH3Resolution] = useState(3)
+  const [mapStyle, setMapStyle] = useState('dark')
   const [stats, setStats] = useState({ latency: 14, activeAgents: 12 })
   const [log, setLog] = useState([
     { type: 'info', time: now(), message: 'Sentinel-City AI Core initialized. All sub-systems nominal.' },
-    { type: 'info', time: now(), message: 'H3 geospatial indexing engine synchronized.' },
+    { type: 'info', time: now(), message: 'H3 geospatial indexing engine synchronized at fixed resolution.' },
   ])
 
   function now() {
@@ -127,12 +136,12 @@ export default function DisasterDashboard() {
 
       {/* ─── FULLSCREEN BACKGROUND MAP ─────────────────────────────────────────── */}
       <div className="absolute inset-0 z-0">
-        <MapView onShapeDrawn={handleShapeDrawn} showGrid={showGrid} mapStyle={mapStyle} />
+        <MapView onShapeDrawn={handleShapeDrawn} showGrid={showGrid} h3Resolution={h3Resolution} mapStyle={mapStyle} />
       </div>
 
       {/* ─── FLOATING LEFT SIDEBAR (COMMAND CENTER) ─────────────────────────── */}
       <aside
-        className="absolute top-5 left-16 z-30 w-[380px] max-h-[calc(100vh-80px)] flex flex-col rounded-2xl overflow-hidden glass-panel-glow transition-all duration-300"
+        className="absolute top-5 left-16 z-30 w-[380px] max-h-[calc(100vh-80px)] flex flex-col rounded-2xl overflow-hidden glass-panel-glow transition-all duration-300 shadow-[0_20px_60px_rgba(0,0,0,0.8)]"
         style={{ '--glow-border': `${activeColor}66`, '--glow-shadow': `${activeColor}22` }}
       >
         {/* Banner */}
@@ -386,6 +395,29 @@ export default function DisasterDashboard() {
           </button>
         </div>
 
+        {/* H3 Resolution Configurator (Appears when Grid is ON) */}
+        {showGrid && (
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-[#0b1224]/90 backdrop-blur-xl border border-[#00f2fe]/40 rounded-xl shadow-[0_15px_35px_rgba(0,0,0,0.5)] text-xs font-mono">
+            <span className="text-[#00f2fe] font-bold">GRID RES:</span>
+            <div className="flex items-center gap-1 bg-black/40 p-1 rounded-lg border border-white/5 font-sans">
+              {[2, 3, 4, 5, 6].map(res => (
+                <button
+                  key={res}
+                  onClick={() => setH3Resolution(res)}
+                  className={`w-6 h-6 rounded flex items-center justify-center text-xs font-bold transition-all ${
+                    h3Resolution === res ? 'bg-[#00f2fe] text-black shadow-[0_0_12px_#00f2fe]' : 'text-[#6b82a8] hover:text-white'
+                  }`}
+                >
+                  {res}
+                </button>
+              ))}
+            </div>
+            <span className="text-[10px] text-[#6b82a8] ml-1 font-mono font-semibold hidden lg:inline">
+              {H3_RES_INFO[h3Resolution]}
+            </span>
+          </div>
+        )}
+
         {/* H3 Grid Toggle Pill */}
         <button
           onClick={() => setShowGrid(g => !g)}
@@ -394,7 +426,7 @@ export default function DisasterDashboard() {
           }`}
         >
           <span className={`w-2.5 h-2.5 rounded-full transition-all duration-300 ${showGrid ? 'bg-[#00f2fe] shadow-[0_0_12px_#00f2fe]' : 'bg-[#4b6082]'}`} />
-          H3-INDEX: {showGrid ? 'ACTIVE' : 'OFF'}
+          H3-INDEX: {showGrid ? 'ON' : 'OFF'}
         </button>
 
         {/* Active Vector Indicator Pill */}
