@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react'
 import MapView from './MapView'
+import CityPicker from './CityPicker'
 
 const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
@@ -53,8 +54,11 @@ export default function DisasterDashboard() {
   const [geometry, setGeometry] = useState(null)
   const [loading, setLoading] = useState(false)
   const [showGrid, setShowGrid] = useState(true)
+  const [showCameras, setShowCameras] = useState(false)
+  const [showIntersections, setShowIntersections] = useState(false)
   const [h3LevelIdx, setH3LevelIdx] = useState(2) // ~920m
   const [mapStyle, setMapStyle] = useState('dark')
+  const [city, setCity] = useState(null) // { id, name, shortName, polygon, bounds } | null
 
   const h3Level = H3_LEVELS[h3LevelIdx]
   const [logOpen, setLogOpen] = useState(true)
@@ -69,6 +73,19 @@ export default function DisasterDashboard() {
     setGeometry(geo)
     addLog('info', `Target zone defined (${geo.type}).`)
   }, [])
+
+  const handleCitySelect = (c) => {
+    setCity(c)
+    setGeometry(null)
+    addLog('info', `Operating area: ${c.shortName}`)
+  }
+
+  const handleCityClear = () => {
+    if (!city) return
+    addLog('info', 'Returned to world view')
+    setCity(null)
+    setGeometry(null)
+  }
 
   const currentDisaster = DISASTER_TYPES.find((d) => d.value === disasterType) || DISASTER_TYPES[0]
   const sev = severityColor(severity)
@@ -123,6 +140,21 @@ export default function DisasterDashboard() {
         </header>
 
         <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
+          {/* Operating area */}
+          <section>
+            <SectionLabel>Operating area</SectionLabel>
+            <CityPicker
+              value={city}
+              onSelect={handleCitySelect}
+              onClear={handleCityClear}
+            />
+            {!city && (
+              <p className="text-[11px] text-zinc-600 mt-1.5 leading-snug">
+                Optional — scope the map to a specific city, or leave empty for global view.
+              </p>
+            )}
+          </section>
+
           {/* Disaster type */}
           <section>
             <SectionLabel>Emergency classification</SectionLabel>
@@ -263,6 +295,8 @@ export default function DisasterDashboard() {
           showGrid={showGrid}
           h3Resolution={h3Level.res}
           mapStyle={mapStyle}
+          showCameras={showCameras}
+          showIntersections={showIntersections}
         />
 
         <div className="absolute top-4 right-4 z-30 flex flex-col items-end gap-2">
@@ -310,6 +344,50 @@ export default function DisasterDashboard() {
               </>
             )}
           </div>
+
+          <button
+            onClick={() => setShowCameras((c) => !c)}
+            disabled={!showGrid}
+            title={!showGrid ? 'Cameras require the grid to be on' : undefined}
+            className={[
+              'inline-flex items-center gap-1.5 bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md px-3 py-1.5 text-[12px] transition-colors',
+              !showGrid
+                ? 'text-zinc-600 cursor-not-allowed opacity-60'
+                : showCameras
+                  ? 'text-zinc-100 hover:border-zinc-700'
+                  : 'text-zinc-500 hover:text-zinc-300 hover:border-zinc-700',
+            ].join(' ')}
+          >
+            <span
+              className={[
+                'w-1.5 h-1.5 rounded-full',
+                showCameras && showGrid ? 'bg-amber-400' : 'bg-zinc-600',
+              ].join(' ')}
+            />
+            Cameras {showCameras ? 'on' : 'off'}
+          </button>
+
+          <button
+            onClick={() => setShowIntersections((v) => !v)}
+            disabled={!showGrid}
+            title={!showGrid ? 'Intersections require the grid to be on' : undefined}
+            className={[
+              'inline-flex items-center gap-1.5 bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md px-3 py-1.5 text-[12px] transition-colors',
+              !showGrid
+                ? 'text-zinc-600 cursor-not-allowed opacity-60'
+                : showIntersections
+                  ? 'text-zinc-100 hover:border-zinc-700'
+                  : 'text-zinc-500 hover:text-zinc-300 hover:border-zinc-700',
+            ].join(' ')}
+          >
+            <span
+              className={[
+                'w-1.5 h-1.5 rounded-full',
+                showIntersections && showGrid ? 'bg-sky-400' : 'bg-zinc-600',
+              ].join(' ')}
+            />
+            Intersections {showIntersections ? 'on' : 'off'}
+          </button>
         </div>
       </main>
     </div>

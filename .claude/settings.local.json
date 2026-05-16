@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npx vite *)"
+      "Bash(npx vite *)",
+      "Bash(curl -s -X POST -d '[out:json][timeout:25];\\(node[\"man_made\"=\"surveillance\"]\\(40.477,-74.259,40.918,-73.700\\);node[\"surveillance:type\"=\"camera\"]\\(40.477,-74.259,40.918,-73.700\\);\\);out count;' https://overpass-api.de/api/interpreter)",
+      "Bash(curl -s -X POST --data-urlencode 'data=[out:json][timeout:25];\\(node[\"man_made\"=\"surveillance\"]\\(40.477,-74.259,40.918,-73.700\\);node[\"surveillance:type\"=\"camera\"]\\(40.477,-74.259,40.918,-73.700\\);\\);out count;' https://overpass-api.de/api/interpreter)",
+      "Bash(curl -s -H \"Accept: application/json\" -H \"User-Agent: sentinel-city-test/1.0\" -X POST --data-urlencode 'data=[out:json][timeout:25];\\(node[\"man_made\"=\"surveillance\"]\\(40.477,-74.259,40.918,-73.700\\);node[\"surveillance:type\"=\"camera\"]\\(40.477,-74.259,40.918,-73.700\\);\\);out count;' https://overpass-api.de/api/interpreter)",
+      "Bash(curl -s -H \"Accept: application/json\" -H \"User-Agent: sentinel-city-test/1.0\" -X POST --data-urlencode 'data=[out:json][timeout:25];node[\"highway\"=\"traffic_signals\"]\\(40.477,-74.259,40.918,-73.700\\);out count;' https://overpass-api.de/api/interpreter)",
+      "Bash(curl -s -H \"Accept: application/json\" -H \"User-Agent: sentinel-city-test/1.0\" -X POST --data-urlencode 'data=[out:json][timeout:25];node[\"highway\"~\"^\\(traffic_signals|stop|crossing|give_way|mini_roundabout|turning_circle\\)$\"]\\(40.477,-74.259,40.918,-73.700\\);out count;' https://overpass-api.de/api/interpreter)"
     ]
   }
 }

@@ -93,6 +93,215 @@ function H3GridControls({ enabled, resolution, mapStyle }) {
   return null
 }
 
+// ── Surveillance Camera Overlay ──────────────────────────────
+// Queries OSM via Overpass for `man_made=surveillance` / `surveillance:type=camera`
+// nodes inside the current viewport. Only renders when the H3 grid is also
+// visible at the current zoom (same 24-px hex threshold).
+function CameraOverlay({ enabled, resolution }) {
+  const map = useMap()
+  const layerGroupRef = useRef(null)
+  const debounceRef = useRef(null)
+  const abortRef = useRef(null)
+
+  useEffect(() => {
+    if (!layerGroupRef.current) {
+      layerGroupRef.current = L.layerGroup()
+    }
+    const layerGroup = layerGroupRef.current
+
+    if (!enabled) {
+      if (map.hasLayer(layerGroup)) layerGroup.remove()
+      layerGroup.clearLayers()
+      return
+    }
+    if (!map.hasLayer(layerGroup)) layerGroup.addTo(map)
+
+    const fetchAndRender = async () => {
+      // Match the H3 grid's visibility gate
+      const hexEdgeM = getHexagonEdgeLengthAvg(resolution, UNITS.m)
+      const hexDiameterM = hexEdgeM * 2
+      const p1 = map.containerPointToLatLng([0, 0])
+      const p2 = map.containerPointToLatLng([1, 0])
+      const metersPerPixel = p1.distanceTo(p2)
+      if (!metersPerPixel || hexDiameterM / metersPerPixel < 24) {
+        layerGroup.clearLayers()
+        return
+      }
+
+      if (abortRef.current) abortRef.current.abort()
+      const ctrl = new AbortController()
+      abortRef.current = ctrl
+
+      const b = map.getBounds()
+      const bbox = `${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}`
+      const query =
+        `[out:json][timeout:10];` +
+        `(` +
+          `node["man_made"="surveillance"](${bbox});` +
+          `node["surveillance:type"="camera"](${bbox});` +
+        `);` +
+        `out tags geom;`
+
+      try {
+        const res = await fetch('https://overpass-api.de/api/interpreter', {
+          method: 'POST',
+          body: query,
+          signal: ctrl.signal,
+        })
+        if (!res.ok) throw new Error(`Overpass ${res.status}`)
+        const json = await res.json()
+        const elements = json.elements || []
+
+        layerGroup.clearLayers()
+        elements.forEach((el) => {
+          if (el.lat == null || el.lon == null) return
+          const tags = el.tags || {}
+          const camType = tags['camera:type'] || tags['surveillance:type'] || 'camera'
+          const operator = tags.operator || tags['surveillance:operator']
+          const direction = tags['camera:direction']
+
+          const marker = L.circleMarker([el.lat, el.lon], {
+            radius: 4,
+            color: '#fbbf24',
+            weight: 1.5,
+            opacity: 0.95,
+            fillColor: '#fbbf24',
+            fillOpacity: 0.55,
+          })
+
+          const tooltipParts = [camType]
+          if (direction) tooltipParts.push(`${direction}°`)
+          if (operator) tooltipParts.push(operator)
+          marker.bindTooltip(tooltipParts.join(' · '), {
+            direction: 'top',
+            offset: [0, -4],
+            opacity: 0.92,
+          })
+
+          layerGroup.addLayer(marker)
+        })
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          console.warn('Camera fetch failed:', err)
+        }
+      }
+    }
+
+    const schedule = () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+      debounceRef.current = setTimeout(fetchAndRender, 600)
+    }
+
+    fetchAndRender()
+    map.on('moveend', schedule)
+    map.on('zoomend', schedule)
+
+    return () => {
+      map.off('moveend', schedule)
+      map.off('zoomend', schedule)
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+      if (abortRef.current) abortRef.current.abort()
+    }
+  }, [map, enabled, resolution])
+
+  return null
+}
+
+// ── Road Intersections Overlay ───────────────────────────────
+// Renders OSM-tagged road junctions (signals, stops, crossings, etc.) inside
+// the current viewport. Same grid-visibility gate as the camera overlay.
+function IntersectionOverlay({ enabled, resolution }) {
+  const map = useMap()
+  const layerGroupRef = useRef(null)
+  const debounceRef = useRef(null)
+  const abortRef = useRef(null)
+
+  useEffect(() => {
+    if (!layerGroupRef.current) {
+      layerGroupRef.current = L.layerGroup()
+    }
+    const layerGroup = layerGroupRef.current
+
+    if (!enabled) {
+      if (map.hasLayer(layerGroup)) layerGroup.remove()
+      layerGroup.clearLayers()
+      return
+    }
+    if (!map.hasLayer(layerGroup)) layerGroup.addTo(map)
+
+    const fetchAndRender = async () => {
+      const hexEdgeM = getHexagonEdgeLengthAvg(resolution, UNITS.m)
+      const hexDiameterM = hexEdgeM * 2
+      const p1 = map.containerPointToLatLng([0, 0])
+      const p2 = map.containerPointToLatLng([1, 0])
+      const metersPerPixel = p1.distanceTo(p2)
+      if (!metersPerPixel || hexDiameterM / metersPerPixel < 24) {
+        layerGroup.clearLayers()
+        return
+      }
+
+      if (abortRef.current) abortRef.current.abort()
+      const ctrl = new AbortController()
+      abortRef.current = ctrl
+
+      const b = map.getBounds()
+      const bbox = `${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}`
+      const query =
+        `[out:json][timeout:10];` +
+        `node["highway"~"^(traffic_signals|stop|crossing|give_way|mini_roundabout|turning_circle)$"](${bbox});` +
+        `out geom;`
+
+      try {
+        const res = await fetch('https://overpass-api.de/api/interpreter', {
+          method: 'POST',
+          body: query,
+          signal: ctrl.signal,
+        })
+        if (!res.ok) throw new Error(`Overpass ${res.status}`)
+        const json = await res.json()
+        const elements = json.elements || []
+
+        layerGroup.clearLayers()
+        elements.forEach((el) => {
+          if (el.lat == null || el.lon == null) return
+          const marker = L.circleMarker([el.lat, el.lon], {
+            radius: 3,
+            color: '#38bdf8',
+            weight: 1.2,
+            opacity: 0.9,
+            fillColor: '#38bdf8',
+            fillOpacity: 0.4,
+            interactive: false,
+          })
+          layerGroup.addLayer(marker)
+        })
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          console.warn('Intersection fetch failed:', err)
+        }
+      }
+    }
+
+    const schedule = () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+      debounceRef.current = setTimeout(fetchAndRender, 600)
+    }
+
+    fetchAndRender()
+    map.on('moveend', schedule)
+    map.on('zoomend', schedule)
+
+    return () => {
+      map.off('moveend', schedule)
+      map.off('zoomend', schedule)
+      if (debounceRef.current) clearTimeout(debounceRef.current)
+      if (abortRef.current) abortRef.current.abort()
+    }
+  }, [map, enabled, resolution])
+
+  return null
+}
+
 // ── Geoman Controls ──────────────────────────────────────────
 function GeomanControls({ onShapeDrawn }) {
   const map = useMap()
@@ -148,7 +357,7 @@ function GeomanControls({ onShapeDrawn }) {
 }
 
 // ── Main MapView Export ────────────────────────────────────────
-export default function MapView({ onShapeDrawn, showGrid = true, h3Resolution = 3, mapStyle = 'dark' }) {
+export default function MapView({ onShapeDrawn, showGrid = true, h3Resolution = 3, mapStyle = 'dark', showCameras = false, showIntersections = false }) {
   const tileUrls = {
     colored: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
     dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
@@ -172,6 +381,8 @@ export default function MapView({ onShapeDrawn, showGrid = true, h3Resolution = 
       />
 
       <H3GridControls enabled={showGrid} resolution={h3Resolution} mapStyle={mapStyle} />
+      <CameraOverlay enabled={showGrid && showCameras} resolution={h3Resolution} />
+      <IntersectionOverlay enabled={showGrid && showIntersections} resolution={h3Resolution} />
       <GeomanControls onShapeDrawn={onShapeDrawn} />
     </MapContainer>
   )
