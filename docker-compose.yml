@@ -1,0 +1,69 @@
+name: sentinel-city
+
+services:
+  # ── Postgres ────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel_city
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel_city"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI backend ─────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://sentinel:sentinel@db:5432/sentinel_city
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  # ── Valhalla routing engine ─────────────────────────────────
+  # Place one or more .osm.pbf files in ./valhalla/data/ before first launch.
+  # The container detects new PBFs and rebuilds tiles on startup.
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    restart: unless-stopped
+    environment:
+      tile_urls: ""              # disable auto-download; we supply local PBFs
+      use_tiles_ignore_pbf: True # reuse tiles built from previously-seen PBFs
+      build_admins: True
+      build_elevation: False
+      build_time_zones: False
+      server_threads: 2
+    volumes:
+      - ./valhalla/data:/custom_files
+    ports:
+      - "8002:8002"
+
+  # ── Nginx-served React SPA ──────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_BACKEND_URL: ""
+        VITE_VALHALLA_URL: "/valhalla"
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - valhalla
+    ports:
+      - "8080:80"
+
+volumes:
+  db_data:

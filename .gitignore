@@ -43,4 +43,8 @@ Desktop.ini
 .idea/
 *.swp
 *.swo
-*claude*
+*claude/*
+settings.local.json
+valhalla/data/*
+!valhalla/data/.gitkeep
+.claude/

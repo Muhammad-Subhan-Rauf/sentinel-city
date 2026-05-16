@@ -93,6 +93,117 @@ function H3GridControls({ enabled, resolution, mapStyle }) {
   return null
 }
 
+// ── Route Layer ──────────────────────────────────────────────
+// Renders the routing polyline plus start/end markers.
+function RouteLayer({ route, waypoints }) {
+  const map = useMap()
+  const groupRef = useRef(null)
+
+  useEffect(() => {
+    if (groupRef.current) {
+      groupRef.current.remove()
+      groupRef.current = null
+    }
+
+    const start = waypoints?.start
+    const end = waypoints?.end
+    if (!start && !end && !route) return
+
+    const group = L.layerGroup()
+
+    if (route?.shape?.length) {
+      // Outer casing (darker) + inner stroke for legibility on any basemap.
+      L.polyline(route.shape, {
+        color: '#0a0a0a',
+        weight: 7,
+        opacity: 0.55,
+        interactive: false,
+      }).addTo(group)
+      L.polyline(route.shape, {
+        color: '#10b981',
+        weight: 4,
+        opacity: 0.95,
+        interactive: false,
+      }).addTo(group)
+    }
+
+    const waypointMarker = (latLng, color) =>
+      L.circleMarker(latLng, {
+        radius: 7,
+        color,
+        weight: 3,
+        fillColor: '#0a0a0a',
+        fillOpacity: 1,
+        interactive: false,
+      })
+
+    if (start) waypointMarker([start.lat, start.lng], '#10b981').addTo(group)
+    if (end) waypointMarker([end.lat, end.lng], '#ef4444').addTo(group)
+
+    group.addTo(map)
+    groupRef.current = group
+
+    return () => {
+      if (groupRef.current) {
+        groupRef.current.remove()
+        groupRef.current = null
+      }
+    }
+  }, [map, route, waypoints])
+
+  return null
+}
+
+// ── Waypoint Picker ──────────────────────────────────────────
+// When in pick mode, the next map click reports its lat/lng up via onPick.
+// Skips clicks that are part of an active Geoman draw/edit interaction.
+function WaypointPicker({ mode, onPick }) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (!mode) return
+
+    const container = map.getContainer()
+    const prevCursor = container.style.cursor
+    container.style.cursor = 'crosshair'
+
+    const onClick = (e) => {
+      if (
+        map.pm?.globalDrawModeEnabled?.() ||
+        map.pm?.globalEditModeEnabled?.() ||
+        map.pm?.globalRemovalModeEnabled?.() ||
+        map.pm?.globalDragModeEnabled?.()
+      ) {
+        return
+      }
+      onPick({ lat: e.latlng.lat, lng: e.latlng.lng })
+    }
+
+    map.on('click', onClick)
+    return () => {
+      map.off('click', onClick)
+      container.style.cursor = prevCursor
+    }
+  }, [map, mode, onPick])
+
+  return null
+}
+
+// ── City Bounds Controller ───────────────────────────────────
+// When a city is set, pan/zoom to fit its bounds. No pan or zoom locking —
+// the operator can move around freely afterwards.
+function CityBoundsController({ city }) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (city && city.bounds) {
+      map.fitBounds(L.latLngBounds(city.bounds), { animate: true })
+    }
+  }, [map, city])
+
+  return null
+}
+
 // ── Surveillance Camera Overlay ──────────────────────────────
 // Queries OSM via Overpass for `man_made=surveillance` / `surveillance:type=camera`
 // nodes inside the current viewport. Only renders when the H3 grid is also
@@ -303,10 +414,25 @@ function IntersectionOverlay({ enabled, resolution }) {
 }
 
 // ── Geoman Controls ──────────────────────────────────────────
-function GeomanControls({ onShapeDrawn }) {
-  const map = useMap()
-  const drawnLayersRef = useRef([])
+function getLayerGeometry(layer) {
+  if (layer instanceof L.Circle) {
+    const ll = layer.getLatLng()
+    const r = layer.getRadius()
+    return {
+      type: 'Point',
+      coordinates: [ll.lng, ll.lat],
+      radius_metres: r,
+      _circle: { center: [ll.lng, ll.lat], radius: r },
+    }
+  }
+  return layer.toGeoJSON().geometry
+}
 
+function GeomanControls({ zones, onZoneAdd, onZoneUpdate, onZoneRemove }) {
+  const map = useMap()
+  const layersRef = useRef(new Map()) // zoneId → leaflet layer
+
+  // Set up draw controls + global event handlers
   useEffect(() => {
     if (!map.pm) return
 
@@ -331,33 +457,65 @@ function GeomanControls({ onShapeDrawn }) {
     })
 
     const handleCreate = ({ layer }) => {
-      drawnLayersRef.current.push(layer)
-      const geojson = layer.toGeoJSON()
-      const geometry = geojson.geometry
+      const id =
+        typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `zone-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      layersRef.current.set(id, layer)
 
-      if (layer instanceof L.Circle) {
-        const latlng = layer.getLatLng()
-        const radius = layer.getRadius()
-        onShapeDrawn({
-          type: 'Point',
-          coordinates: [latlng.lng, latlng.lat],
-          radius_metres: radius,
-          _circle: { center: [latlng.lng, latlng.lat], radius },
-        })
-      } else {
-        onShapeDrawn(geometry)
+      const syncGeometry = () => onZoneUpdate(id, { geometry: getLayerGeometry(layer) })
+      layer.on('pm:edit', syncGeometry)
+      layer.on('pm:dragend', syncGeometry)
+
+      onZoneAdd({ id, geometry: getLayerGeometry(layer) })
+    }
+
+    const handleRemove = ({ layer }) => {
+      for (const [id, l] of layersRef.current.entries()) {
+        if (l === layer) {
+          layersRef.current.delete(id)
+          onZoneRemove(id)
+          break
+        }
       }
     }
 
     map.on('pm:create', handleCreate)
-    return () => map.off('pm:create', handleCreate)
-  }, [map, onShapeDrawn])
+    map.on('pm:remove', handleRemove)
+    return () => {
+      map.off('pm:create', handleCreate)
+      map.off('pm:remove', handleRemove)
+    }
+  }, [map, onZoneAdd, onZoneUpdate, onZoneRemove])
+
+  // Reconcile zones → layer styles + removal of orphan layers
+  useEffect(() => {
+    zones.forEach((z) => {
+      const layer = layersRef.current.get(z.id)
+      if (layer && layer.setStyle) {
+        layer.setStyle({
+          color: z.color,
+          fillColor: z.color,
+          fillOpacity: 0.18,
+          weight: 2,
+          opacity: 0.95,
+        })
+      }
+    })
+    const validIds = new Set(zones.map((z) => z.id))
+    for (const [id, layer] of [...layersRef.current.entries()]) {
+      if (!validIds.has(id)) {
+        if (map.hasLayer(layer)) map.removeLayer(layer)
+        layersRef.current.delete(id)
+      }
+    }
+  }, [zones, map])
 
   return null
 }
 
 // ── Main MapView Export ────────────────────────────────────────
-export default function MapView({ onShapeDrawn, showGrid = true, h3Resolution = 3, mapStyle = 'dark', showCameras = false, showIntersections = false }) {
+export default function MapView({ zones = [], onZoneAdd, onZoneUpdate, onZoneRemove, showGrid = true, h3Resolution = 3, mapStyle = 'dark', showCameras = false, showIntersections = false, city = null, route = null, waypoints = { start: null, end: null }, waypointMode = null, onWaypointPick }) {
   const tileUrls = {
     colored: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
     dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
@@ -366,8 +524,8 @@ export default function MapView({ onShapeDrawn, showGrid = true, h3Resolution = 
 
   return (
     <MapContainer
-      center={[35, -20]}
-      zoom={4}
+      center={[40.78, -73.97]}
+      zoom={12}
       minZoom={2}
       className="w-full h-full absolute inset-0 z-0"
       zoomControl={true}
@@ -380,10 +538,18 @@ export default function MapView({ onShapeDrawn, showGrid = true, h3Resolution = 
         maxZoom={20}
       />
 
+      <CityBoundsController city={city} />
       <H3GridControls enabled={showGrid} resolution={h3Resolution} mapStyle={mapStyle} />
       <CameraOverlay enabled={showGrid && showCameras} resolution={h3Resolution} />
       <IntersectionOverlay enabled={showGrid && showIntersections} resolution={h3Resolution} />
-      <GeomanControls onShapeDrawn={onShapeDrawn} />
+      <GeomanControls
+        zones={zones}
+        onZoneAdd={onZoneAdd}
+        onZoneUpdate={onZoneUpdate}
+        onZoneRemove={onZoneRemove}
+      />
+      <RouteLayer route={route} waypoints={waypoints} />
+      <WaypointPicker mode={waypointMode} onPick={onWaypointPick} />
     </MapContainer>
   )
 }
