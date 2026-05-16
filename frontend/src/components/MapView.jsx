@@ -7,7 +7,7 @@ import 'leaflet/dist/leaflet.css'
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css'
 import L from 'leaflet'
 import '@geoman-io/leaflet-geoman-free'
-import { latLngToCell, gridDisk, cellToBoundary } from 'h3-js'
+import { latLngToCell, gridDisk, cellToBoundary, getHexagonEdgeLengthAvg, UNITS } from 'h3-js'
 
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -17,7 +17,13 @@ L.Icon.Default.mergeOptions({
 })
 
 // ── Precise H3 Hexagonal Grid (Fixed Resolution) ─────────────
-function H3GridControls({ enabled, resolution }) {
+const GRID_STYLES = {
+  satellite: { color: '#fafafa', weight: 1.1, opacity: 0.85, fillColor: '#fafafa', fillOpacity: 0.06 },
+  dark:      { color: '#fafafa', weight: 1.1, opacity: 0.85, fillColor: '#fafafa', fillOpacity: 0.06 },
+  colored:   { color: '#3f3f46', weight: 0.6, opacity: 0.55, fillColor: '#3f3f46', fillOpacity: 0.05 },
+}
+
+function H3GridControls({ enabled, resolution, mapStyle }) {
   const map = useMap()
   const layerGroupRef = useRef(null)
 
@@ -42,31 +48,30 @@ function H3GridControls({ enabled, resolution }) {
       if (!enabled) return
       layerGroup.clearLayers()
 
-      const zoom = map.getZoom()
       const center = map.getCenter()
+      const bounds = map.getBounds()
+      const hexEdgeM = getHexagonEdgeLengthAvg(resolution, UNITS.m)
+      const hexDiameterM = hexEdgeM * 2
 
-      // Calculate the number of hex rings to fill the viewport based on zoom level & fixed resolution
-      // This ensures we always cover the screen without rendering too many off-screen hexes
-      let ringCount = 6
-      if (zoom <= 4) ringCount = Math.min(12, Math.max(4, 15 - resolution * 2))
-      else if (zoom <= 7) ringCount = Math.min(18, Math.max(6, 18 - resolution))
-      else if (zoom <= 10) ringCount = 14
-      else ringCount = 10
+      // Hide grid when each hex would project smaller than ~6 CSS pixels —
+      // at that point it's visual noise.
+      const p1 = map.containerPointToLatLng([0, 0])
+      const p2 = map.containerPointToLatLng([1, 0])
+      const metersPerPixel = p1.distanceTo(p2)
+      if (!metersPerPixel || hexDiameterM / metersPerPixel < 24) return
+
+      const viewportRadiusM = center.distanceTo(bounds.getNorthEast())
+      let ringCount = Math.ceil(viewportRadiusM / hexDiameterM) + 1
+      ringCount = Math.max(3, Math.min(ringCount, 28))
 
       try {
         const centerHex = latLngToCell(center.lat, center.lng, resolution)
         const hexDisk = gridDisk(centerHex, ringCount)
 
+        const style = GRID_STYLES[mapStyle] || GRID_STYLES.dark
         hexDisk.forEach(hex => {
           const boundary = cellToBoundary(hex)
-          const hexLayer = L.polygon(boundary, {
-            color: '#00f2fe',
-            weight: 1.5,
-            opacity: 0.5,
-            fillColor: '#00f2fe',
-            fillOpacity: 0.05,
-            interactive: false,
-          })
+          const hexLayer = L.polygon(boundary, { ...style, interactive: false })
           layerGroup.addLayer(hexLayer)
         })
       } catch (err) {
@@ -83,7 +88,7 @@ function H3GridControls({ enabled, resolution }) {
       map.off('moveend', updateGrid)
       map.off('zoomend', updateGrid)
     }
-  }, [map, enabled, resolution])
+  }, [map, enabled, resolution, mapStyle])
 
   return null
 }
@@ -166,7 +171,7 @@ export default function MapView({ onShapeDrawn, showGrid = true, h3Resolution = 
         maxZoom={20}
       />
 
-      <H3GridControls enabled={showGrid} resolution={h3Resolution} />
+      <H3GridControls enabled={showGrid} resolution={h3Resolution} mapStyle={mapStyle} />
       <GeomanControls onShapeDrawn={onShapeDrawn} />
     </MapContainer>
   )
