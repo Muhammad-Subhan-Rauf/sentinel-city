@@ -47,4 +47,5 @@ Desktop.ini
 settings.local.json
 valhalla/data/*
 !valhalla/data/.gitkeep
+valhalla.zip
 .claude/

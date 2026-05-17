@@ -1,5 +1,5 @@
 // ============================================================
-// MapView.jsx — Premium Fullscreen Map with Fixed H3 Resolution Grid
+// MapView.jsx — Fullscreen Map with disaster zones, routing, and overlays
 // ============================================================
 import { useEffect, useRef } from 'react'
 import { MapContainer, TileLayer, useMap } from 'react-leaflet'
@@ -7,7 +7,8 @@ import 'leaflet/dist/leaflet.css'
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css'
 import L from 'leaflet'
 import '@geoman-io/leaflet-geoman-free'
-import { latLngToCell, gridDisk, cellToBoundary, getHexagonEdgeLengthAvg, UNITS } from 'h3-js'
+import CitizenLayer from './CitizenLayer'
+import WaveLayer from './WaveLayer'
 
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -16,82 +17,9 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
 })
 
-// ── Precise H3 Hexagonal Grid (Fixed Resolution) ─────────────
-const GRID_STYLES = {
-  satellite: { color: '#fafafa', weight: 1.1, opacity: 0.85, fillColor: '#fafafa', fillOpacity: 0.06 },
-  dark:      { color: '#fafafa', weight: 1.1, opacity: 0.85, fillColor: '#fafafa', fillOpacity: 0.06 },
-  colored:   { color: '#3f3f46', weight: 0.6, opacity: 0.55, fillColor: '#3f3f46', fillOpacity: 0.05 },
-}
-
-function H3GridControls({ enabled, resolution, mapStyle }) {
-  const map = useMap()
-  const layerGroupRef = useRef(null)
-
-  useEffect(() => {
-    if (!layerGroupRef.current) {
-      layerGroupRef.current = L.layerGroup()
-    }
-    const layerGroup = layerGroupRef.current
-
-    if (enabled) {
-      if (!map.hasLayer(layerGroup)) {
-        layerGroup.addTo(map)
-      }
-    } else {
-      if (map.hasLayer(layerGroup)) {
-        layerGroup.remove()
-      }
-      return
-    }
-
-    const updateGrid = () => {
-      if (!enabled) return
-      layerGroup.clearLayers()
-
-      const center = map.getCenter()
-      const bounds = map.getBounds()
-      const hexEdgeM = getHexagonEdgeLengthAvg(resolution, UNITS.m)
-      const hexDiameterM = hexEdgeM * 2
-
-      // Hide grid when each hex would project smaller than ~6 CSS pixels —
-      // at that point it's visual noise.
-      const p1 = map.containerPointToLatLng([0, 0])
-      const p2 = map.containerPointToLatLng([1, 0])
-      const metersPerPixel = p1.distanceTo(p2)
-      if (!metersPerPixel || hexDiameterM / metersPerPixel < 24) return
-
-      const viewportRadiusM = center.distanceTo(bounds.getNorthEast())
-      let ringCount = Math.ceil(viewportRadiusM / hexDiameterM) + 1
-      ringCount = Math.max(3, Math.min(ringCount, 28))
-
-      try {
-        const centerHex = latLngToCell(center.lat, center.lng, resolution)
-        const hexDisk = gridDisk(centerHex, ringCount)
-
-        const style = GRID_STYLES[mapStyle] || GRID_STYLES.dark
-        hexDisk.forEach(hex => {
-          const boundary = cellToBoundary(hex)
-          const hexLayer = L.polygon(boundary, { ...style, interactive: false })
-          layerGroup.addLayer(hexLayer)
-        })
-      } catch (err) {
-        console.warn('H3 grid calculation info:', err)
-      }
-    }
-
-    updateGrid()
-
-    map.on('moveend', updateGrid)
-    map.on('zoomend', updateGrid)
-
-    return () => {
-      map.off('moveend', updateGrid)
-      map.off('zoomend', updateGrid)
-    }
-  }, [map, enabled, resolution, mapStyle])
-
-  return null
-}
+// Camera and intersection overlays only render at this zoom or deeper —
+// at lower zooms the markers crowd into illegible mush.
+const OVERLAY_MIN_ZOOM = 14
 
 // ── Route Layer ──────────────────────────────────────────────
 // Renders the routing polyline plus start/end markers.
@@ -204,11 +132,25 @@ function CityBoundsController({ city }) {
   return null
 }
 
+// ── Focus Controller ─────────────────────────────────────────
+// Pans the map to an arbitrary point when its `t` (timestamp) changes.
+// Used when the operator clicks a 911 report row in the calls drawer.
+function FocusController({ point }) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (!point) return
+    const targetZoom = Math.max(map.getZoom(), 16)
+    map.flyTo([point.lat, point.lng], targetZoom, { animate: true, duration: 0.6 })
+  }, [map, point?.t])
+
+  return null
+}
+
 // ── Surveillance Camera Overlay ──────────────────────────────
 // Queries OSM via Overpass for `man_made=surveillance` / `surveillance:type=camera`
-// nodes inside the current viewport. Only renders when the H3 grid is also
-// visible at the current zoom (same 24-px hex threshold).
-function CameraOverlay({ enabled, resolution }) {
+// nodes inside the current viewport. Suppressed at zoom < OVERLAY_MIN_ZOOM.
+function CameraOverlay({ enabled }) {
   const map = useMap()
   const layerGroupRef = useRef(null)
   const debounceRef = useRef(null)
@@ -228,13 +170,7 @@ function CameraOverlay({ enabled, resolution }) {
     if (!map.hasLayer(layerGroup)) layerGroup.addTo(map)
 
     const fetchAndRender = async () => {
-      // Match the H3 grid's visibility gate
-      const hexEdgeM = getHexagonEdgeLengthAvg(resolution, UNITS.m)
-      const hexDiameterM = hexEdgeM * 2
-      const p1 = map.containerPointToLatLng([0, 0])
-      const p2 = map.containerPointToLatLng([1, 0])
-      const metersPerPixel = p1.distanceTo(p2)
-      if (!metersPerPixel || hexDiameterM / metersPerPixel < 24) {
+      if (map.getZoom() < OVERLAY_MIN_ZOOM) {
         layerGroup.clearLayers()
         return
       }
@@ -313,15 +249,15 @@ function CameraOverlay({ enabled, resolution }) {
       if (debounceRef.current) clearTimeout(debounceRef.current)
       if (abortRef.current) abortRef.current.abort()
     }
-  }, [map, enabled, resolution])
+  }, [map, enabled])
 
   return null
 }
 
 // ── Road Intersections Overlay ───────────────────────────────
 // Renders OSM-tagged road junctions (signals, stops, crossings, etc.) inside
-// the current viewport. Same grid-visibility gate as the camera overlay.
-function IntersectionOverlay({ enabled, resolution }) {
+// the current viewport. Suppressed at zoom < OVERLAY_MIN_ZOOM.
+function IntersectionOverlay({ enabled }) {
   const map = useMap()
   const layerGroupRef = useRef(null)
   const debounceRef = useRef(null)
@@ -341,12 +277,7 @@ function IntersectionOverlay({ enabled, resolution }) {
     if (!map.hasLayer(layerGroup)) layerGroup.addTo(map)
 
     const fetchAndRender = async () => {
-      const hexEdgeM = getHexagonEdgeLengthAvg(resolution, UNITS.m)
-      const hexDiameterM = hexEdgeM * 2
-      const p1 = map.containerPointToLatLng([0, 0])
-      const p2 = map.containerPointToLatLng([1, 0])
-      const metersPerPixel = p1.distanceTo(p2)
-      if (!metersPerPixel || hexDiameterM / metersPerPixel < 24) {
+      if (map.getZoom() < OVERLAY_MIN_ZOOM) {
         layerGroup.clearLayers()
         return
       }
@@ -408,7 +339,7 @@ function IntersectionOverlay({ enabled, resolution }) {
       if (debounceRef.current) clearTimeout(debounceRef.current)
       if (abortRef.current) abortRef.current.abort()
     }
-  }, [map, enabled, resolution])
+  }, [map, enabled])
 
   return null
 }
@@ -428,22 +359,31 @@ function getLayerGeometry(layer) {
   return layer.toGeoJSON().geometry
 }
 
-function GeomanControls({ zones, onZoneAdd, onZoneUpdate, onZoneRemove }) {
+function GeomanControls({ zones, onZoneAdd, onZoneUpdate, onZoneRemove, drawingMode = 'area' }) {
   const map = useMap()
   const layersRef = useRef(new Map()) // zoneId → leaflet layer
 
-  // Set up draw controls + global event handlers
+  // Reconfigure draw tools when the operator picks a different disaster type.
+  // 'area'  → polygon + circle + rectangle (drawn shapes)
+  // 'point' → CircleMarker only (single click on the map)
+  // 'city'  → no draw tools; editing/removing remain available
   useEffect(() => {
     if (!map.pm) return
 
+    // Cancel any in-progress draft so type-switching doesn't orphan a half-drawn shape.
+    if (map.pm.globalDrawModeEnabled?.()) map.pm.disableDraw()
+
+    const isArea = drawingMode === 'area'
+    const isPoint = drawingMode === 'point'
+
     map.pm.addControls({
       position: 'topleft',
-      drawCircle: true,
-      drawCircleMarker: false,
+      drawCircle: isArea,
+      drawRectangle: isArea,
+      drawPolygon: isArea,
+      drawCircleMarker: isPoint,
       drawMarker: false,
       drawPolyline: false,
-      drawRectangle: true,
-      drawPolygon: true,
       editMode: true,
       dragMode: true,
       cutPolygon: false,
@@ -455,6 +395,11 @@ function GeomanControls({ zones, onZoneAdd, onZoneUpdate, onZoneRemove }) {
       snapDistance: 20,
       allowSelfIntersection: false,
     })
+  }, [map, drawingMode])
+
+  // pm:create / pm:remove wiring, independent of which tool is enabled.
+  useEffect(() => {
+    if (!map.pm) return
 
     const handleCreate = ({ layer }) => {
       const id =
@@ -515,7 +460,7 @@ function GeomanControls({ zones, onZoneAdd, onZoneUpdate, onZoneRemove }) {
 }
 
 // ── Main MapView Export ────────────────────────────────────────
-export default function MapView({ zones = [], onZoneAdd, onZoneUpdate, onZoneRemove, showGrid = true, h3Resolution = 3, mapStyle = 'dark', showCameras = false, showIntersections = false, city = null, route = null, waypoints = { start: null, end: null }, waypointMode = null, onWaypointPick }) {
+export default function MapView({ zones = [], onZoneAdd, onZoneUpdate, onZoneRemove, drawingMode = 'area', mapStyle = 'dark', showCameras = false, showIntersections = false, city = null, route = null, waypoints = { start: null, end: null }, waypointMode = null, onWaypointPick, citizenEngine = null, focusPoint = null, onCitizenClick }) {
   const tileUrls = {
     colored: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
     dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
@@ -536,17 +481,24 @@ export default function MapView({ zones = [], onZoneAdd, onZoneUpdate, onZoneRem
         attribution='&copy; OpenStreetMap &copy; CARTO'
         subdomains="abcd"
         maxZoom={20}
+        // Keep more tiles loaded outside the viewport so back-pans don't flash
+        // empty squares. Paired with the tile-cache service worker, subsequent
+        // sessions also load instantly from cache.
+        keepBuffer={8}
       />
 
       <CityBoundsController city={city} />
-      <H3GridControls enabled={showGrid} resolution={h3Resolution} mapStyle={mapStyle} />
-      <CameraOverlay enabled={showGrid && showCameras} resolution={h3Resolution} />
-      <IntersectionOverlay enabled={showGrid && showIntersections} resolution={h3Resolution} />
+      <FocusController point={focusPoint} />
+      <CameraOverlay enabled={showCameras} />
+      <IntersectionOverlay enabled={showIntersections} />
+      {citizenEngine && <WaveLayer engine={citizenEngine} />}
+      {citizenEngine && <CitizenLayer engine={citizenEngine} onCitizenClick={onCitizenClick} />}
       <GeomanControls
         zones={zones}
         onZoneAdd={onZoneAdd}
         onZoneUpdate={onZoneUpdate}
         onZoneRemove={onZoneRemove}
+        drawingMode={drawingMode}
       />
       <RouteLayer route={route} waypoints={waypoints} />
       <WaypointPicker mode={waypointMode} onPick={onWaypointPick} />

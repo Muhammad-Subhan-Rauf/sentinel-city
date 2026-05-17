@@ -2,6 +2,8 @@
 // Targets a local Valhalla server (defaults to http://localhost:8002).
 // Override via VITE_VALHALLA_URL in .env.
 
+import { getBlockingRadius } from './disasterProfiles'
+
 const VALHALLA_URL = import.meta.env.VITE_VALHALLA_URL ?? '/valhalla'
 
 // Decode a Valhalla polyline (precision 6 by default — Valhalla uses polyline6).
@@ -38,18 +40,15 @@ export function decodePolyline(encoded, precision = 6) {
   return coords
 }
 
-// Convert a circle zone (Point + radius) into a closed polygon ring of
-// [[lng, lat], ...] suitable for Valhalla's avoid_polygons.
-function circleZoneToRing(zone, segments = 36) {
-  const [lng, lat] = zone.geometry.coordinates
-  const radius = zone.geometry.radius_metres
+// Convert a point + radius into a closed polygon ring of [[lng, lat], ...].
+function pointToRing(lng, lat, radiusM, segments = 36) {
   const earthRadius = 6378137 // metres
-  const ring = []
   const latRad = (lat * Math.PI) / 180
+  const ring = []
   for (let i = 0; i <= segments; i++) {
     const angle = (i / segments) * 2 * Math.PI
-    const dLat = (radius * Math.cos(angle)) / earthRadius
-    const dLng = (radius * Math.sin(angle)) / (earthRadius * Math.cos(latRad))
+    const dLat = (radiusM * Math.cos(angle)) / earthRadius
+    const dLng = (radiusM * Math.sin(angle)) / (earthRadius * Math.cos(latRad))
     ring.push([
       lng + (dLng * 180) / Math.PI,
       lat + (dLat * 180) / Math.PI,
@@ -59,17 +58,42 @@ function circleZoneToRing(zone, segments = 36) {
 }
 
 // Build Valhalla's avoid_polygons payload from the dashboard's zones array.
-// Polygons contribute their outer ring; circles get tessellated.
+// The profile's `blockingRadius` is the source of truth:
+//   - `0`                     → event does not block traffic (Heatwave, Power_Outage, sev-1 Robbery, …)
+//   - `'use_drawn_geometry'`  → the operator-drawn polygon/circle is the block (Flood, Wildfire)
+//   - number                  → point event, buffer by N metres into a circular block (Accident, Gang_Violence, …)
+// Citywide events always return 0 by profile, so they're filtered here.
 export function zonesToAvoidPolygons(zones) {
   return zones
     .map((z) => {
-      if (!z?.geometry) return null
-      if (z.geometry.type === 'Polygon') {
-        return z.geometry.coordinates[0]
+      if (!z) return null
+      const blockSpec = getBlockingRadius(z.type, z.severity ?? 1)
+
+      // Profile explicitly says this event type doesn't block roads.
+      if (blockSpec === 0) return null
+
+      // Profile says: use whatever the operator drew.
+      if (blockSpec === 'use_drawn_geometry') {
+        if (!z.geometry) return null
+        if (z.geometry.type === 'Polygon') return z.geometry.coordinates[0]
+        if (z.geometry.type === 'Point' && z.geometry.radius_metres) {
+          const [lng, lat] = z.geometry.coordinates
+          return pointToRing(lng, lat, z.geometry.radius_metres)
+        }
+        return null
       }
-      if (z.geometry.type === 'Point' && z.geometry.radius_metres) {
-        return circleZoneToRing(z)
+
+      // Profile says: buffer a point by this radius (in metres).
+      if (typeof blockSpec === 'number' && blockSpec > 0) {
+        if (z.geometry?.type === 'Point') {
+          const [lng, lat] = z.geometry.coordinates
+          return pointToRing(lng, lat, blockSpec)
+        }
+        // Falls through if a non-point type somehow has a numeric block radius —
+        // shouldn't happen with current profiles, but be defensive.
+        return null
       }
+
       return null
     })
     .filter(Boolean)
