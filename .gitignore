@@ -49,3 +49,4 @@ valhalla/data/*
 !valhalla/data/.gitkeep
 valhalla.zip
 .claude/
+.playwright-mcp/

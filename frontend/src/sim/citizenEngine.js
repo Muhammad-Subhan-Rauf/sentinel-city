@@ -36,7 +36,7 @@ const SPEED_MPS = {
   shelter: 1.5,      // slow shuffle to shade
   // Fire-truck pseudo-states. State string is reused for SPEED_MPS lookup; the
   // truck's actual behaviour is driven by truckRole, not by `states[idx]`.
-  truck_driving: 18.0,
+  truck_driving: 20.0,
   truck_patrolling: 9.0,
   truck_extinguishing: 0.0,
 }
@@ -222,6 +222,16 @@ export function createCitizenEngine({
   const totalMovedM = new Float32Array(capacity)
   const retargetCount = new Uint32Array(capacity)
   const lastRetargetSimT = new Float32Array(capacity)
+  // Stuck-detection anchors. Periodically the engine checks each entity's
+  // displacement from its last anchor — if a moving entity hasn't translated
+  // far enough over the window, it's pinging back and forth on a tiny chunk
+  // of road graph (a dead-end branch that survived graph pruning) and gets
+  // forcibly respawned. Reset on respawn so consecutive checks don't fire.
+  const stuckAnchorLat = new Float32Array(capacity)
+  const stuckAnchorLng = new Float32Array(capacity)
+  const stuckAnchorSimT = new Float32Array(capacity)
+  const STUCK_WINDOW_S = 25
+  const STUCK_DISPLACEMENT_M = 35
 
   // Building_Fire evacuee bookkeeping.
   //   alive          — 1 = live slot, 0 = freed (despawned or never spawned)
@@ -244,7 +254,6 @@ export function createCitizenEngine({
 
   // Fire-truck bookkeeping.
   //   truckRole       — state-machine slot (see TRUCK_ROLE below)
-  //   truckTargetLat/Lng — the operator's "general area" target
   //   truckTargetZoneId  — the specific zone the truck is approaching /
   //                        extinguishing (set after perception scan)
   //   truckStationLat/Lng — where the truck returns to
@@ -252,20 +261,28 @@ export function createCitizenEngine({
   //   truckPatrolNextAt  — sim time at which the truck will pick a new patrol
   //                        target (avoids retargeting every tick)
   //   truckPerceptionNextAt — sim time at which the truck next scans for fires
+  //   truckSearchLat/Lng/RadiusM — operator-placed search circle. Trucks drive
+  //                        to its centre, then patrol uniformly inside it
+  //                        until they perceive smoke. Simulates an AI's
+  //                        triangulated guess at the fire's location.
+  //   truckPatrolStartedAt — sim time when the truck first entered PATROLLING.
+  //                        Used to auto-return after ~90 s of fruitless patrol.
   const TRUCK_ROLE_EN_ROUTE = 0
   const TRUCK_ROLE_PATROLLING = 1
   const TRUCK_ROLE_APPROACHING = 2
   const TRUCK_ROLE_EXTINGUISHING = 3
   const TRUCK_ROLE_RETURNING = 4
   const truckRole = new Uint8Array(capacity)
-  const truckTargetLat = new Float32Array(capacity)
-  const truckTargetLng = new Float32Array(capacity)
   const truckTargetZoneId = new Array(capacity).fill(null)
   const truckStationLat = new Float32Array(capacity)
   const truckStationLng = new Float32Array(capacity)
   const truckDispatchId = new Array(capacity).fill(null)
   const truckPatrolNextAt = new Float32Array(capacity)
   const truckPerceptionNextAt = new Float32Array(capacity)
+  const truckSearchLat = new Float32Array(capacity)
+  const truckSearchLng = new Float32Array(capacity)
+  const truckSearchRadiusM = new Float32Array(capacity)
+  const truckPatrolStartedAt = new Float32Array(capacity)
   // Capacity per truck — read by the fightRate accumulator. Mirrors
   // FIRE_TRUCK_CAPACITY from config; stored per-slot so future ambulance/
   // police kinds can vary without engine code changes.
@@ -350,6 +367,11 @@ export function createCitizenEngine({
     prevNode[idx] = null
     states[idx] = 'walking'
     stateExpiresAt[idx] = 0
+    // Reset stuck-check anchor for this slot so a fresh spawn doesn't
+    // inherit the previous occupant's history.
+    stuckAnchorLat[idx] = loc.lat
+    stuckAnchorLng[idx] = loc.lng
+    stuckAnchorSimT[idx] = simTimeS
     // Defensive: reset evacuee bookkeeping in case this slot is being reused
     // by an ambient respawn rather than a Building_Fire spawn.
     alive[idx] = 1
@@ -547,7 +569,11 @@ export function createCitizenEngine({
     }
 
     if (path[idx].length < 2) {
-      retargetForState(idx, zones)
+      // Same guard as the top of this function: trucks have their own
+      // path-exhaustion logic in tickFireTruck (each role re-targets to its
+      // own destination — search circle, fire, or station). Calling
+      // retargetForState here would dump them on a random city node.
+      if (kind[idx] !== 1) retargetForState(idx, zones)
     }
   }
 
@@ -1072,6 +1098,70 @@ export function createCitizenEngine({
       // Despawned (Building_Fire evacuee that walked home) — skip everything.
       if (!alive[i]) continue
 
+      // Stuck detection: if a moving entity hasn't displaced more than
+      // STUCK_DISPLACEMENT_M from its anchor over STUCK_WINDOW_S, it's
+      // ping-ponging on an isolated subgraph the polygon-clipping + dead-end
+      // trimming didn't catch. Forcibly respawn (citizens) or send home
+      // (trucks) to break the cycle. Skipped for stationary states (hiding,
+      // affected, fainted, shelter, extinguishing) and tethered evacuees
+      // (Building_Fire homeNode) which are *supposed* to stay near home.
+      if (simTimeS - stuckAnchorSimT[i] >= STUCK_WINDOW_S) {
+        const s = states[i]
+        const isMoving =
+          s === 'walking' || s === 'fleeing' || s === 'approaching' ||
+          s === 'truck_driving' || s === 'truck_patrolling'
+        const tethered = kind[i] === 0 && homeNode[i] != null
+        if (isMoving && !tethered) {
+          const d = distanceMeters(lats[i], lngs[i], stuckAnchorLat[i], stuckAnchorLng[i])
+          if (d < STUCK_DISPLACEMENT_M) {
+            // Reset anchor regardless so we don't fire every tick.
+            stuckAnchorLat[i] = lats[i]
+            stuckAnchorLng[i] = lngs[i]
+            stuckAnchorSimT[i] = simTimeS
+            if (kind[i] === 1) {
+              // Truck: send straight home rather than respawning mid-city.
+              truckRole[i] = TRUCK_ROLE_RETURNING
+              truckTargetZoneId[i] = null
+              states[i] = 'truck_driving'
+              const hid = roadGraph.findNearestNode(truckStationLat[i], truckStationLng[i])
+              if (hid != null) retarget(i, hid)
+            } else {
+              // Citizen: respawn at a random main-grid node and reset to walking.
+              const newStart = roadGraph.getRandomNode()
+              const newLoc = roadGraph.nodeLocation(newStart)
+              if (newLoc) {
+                lats[i] = newLoc.lat
+                lngs[i] = newLoc.lng
+                currentNode[i] = newStart
+                prevNode[i] = null
+                states[i] = 'walking'
+                stateExpiresAt[i] = 0
+                causeZoneId[i] = null
+                const nextId = pickRandomWalkNext(newStart, null)
+                if (nextId != null) {
+                  targetNode[i] = nextId
+                  path[i] = [newStart, nextId]
+                } else {
+                  targetNode[i] = newStart
+                  path[i] = [newStart]
+                }
+              }
+            }
+          } else {
+            // Made real progress — slide the anchor forward.
+            stuckAnchorLat[i] = lats[i]
+            stuckAnchorLng[i] = lngs[i]
+            stuckAnchorSimT[i] = simTimeS
+          }
+        } else {
+          // Stationary state or tethered — reset anchor so we don't false-positive
+          // when they later resume moving.
+          stuckAnchorLat[i] = lats[i]
+          stuckAnchorLng[i] = lngs[i]
+          stuckAnchorSimT[i] = simTimeS
+        }
+      }
+
       // Fire-truck branch: separate state machine; never falls through to the
       // citizen logic below.
       if (kind[i] === 1) {
@@ -1385,12 +1475,19 @@ export function createCitizenEngine({
     return -1
   }
 
-  function spawnFireTrucks(dispatchId, stationLoc, targetLoc, n, _stationId) {
-    if (!stationLoc || !targetLoc) return 0
+  // `targetArea` is the operator's search circle: { lat, lng, radius }. The
+  // truck drives toward the circle's centre, then patrols inside it scanning
+  // for smoke. A point-shaped {lat, lng} is accepted for back-compat and gets
+  // a default radius of TRUCK_PATROL_RADIUS_M.
+  function spawnFireTrucks(dispatchId, stationLoc, targetArea, n, _stationId) {
+    if (!stationLoc || !targetArea) return 0
     const stationNodeId = roadGraph.findNearestNode(stationLoc.lat, stationLoc.lng)
     const stationNode = stationNodeId != null ? roadGraph.nodeLocation(stationNodeId) : null
     if (!stationNode) return 0
-    const targetNodeId = roadGraph.findNearestNode(targetLoc.lat, targetLoc.lng)
+    const targetLat = targetArea.lat
+    const targetLng = targetArea.lng
+    const targetRadiusM = Math.max(50, +targetArea.radius || TRUCK_PATROL_RADIUS_M)
+    const targetNodeId = roadGraph.findNearestNode(targetLat, targetLng)
     if (targetNodeId == null) return 0
     let added = 0
     while (added < n) {
@@ -1416,15 +1513,22 @@ export function createCitizenEngine({
       states[idx] = 'truck_driving'
       stateExpiresAt[idx] = Infinity
       truckRole[idx] = TRUCK_ROLE_EN_ROUTE
-      truckTargetLat[idx] = targetLoc.lat
-      truckTargetLng[idx] = targetLoc.lng
       truckTargetZoneId[idx] = null
       truckStationLat[idx] = stationNode.lat
       truckStationLng[idx] = stationNode.lng
       truckDispatchId[idx] = dispatchId
       truckPatrolNextAt[idx] = 0
       truckPerceptionNextAt[idx] = 0
+      truckSearchLat[idx] = targetLat
+      truckSearchLng[idx] = targetLng
+      truckSearchRadiusM[idx] = targetRadiusM
+      truckPatrolStartedAt[idx] = 0
       truckCapacity[idx] = FIRE_TRUCK_CAPACITY
+      // Anchor stuck-check at the station so the first window doesn't
+      // mis-classify the departing truck as stuck.
+      stuckAnchorLat[idx] = stationNode.lat
+      stuckAnchorLng[idx] = stationNode.lng
+      stuckAnchorSimT[idx] = simTimeS
       alive[idx] = 1
       retarget(idx, targetNodeId)
       if (idx >= activeCount) activeCount = idx + 1
@@ -1466,8 +1570,11 @@ export function createCitizenEngine({
       const d = distanceMeters(myLat, myLng, center.lat, center.lng)
       const { visual, audible } = getPerception(zone.type, zone.severity ?? 1)
       // Trucks are trained to look — give them a generous floor (250 m) even
-      // when the type's nominal perception is small.
-      const reach = Math.max(visual, audible, 250)
+      // when the type's nominal perception is small. Spreading wildfires are
+      // visible from beyond their current perimeter (smoke plume), so widen
+      // the reach with the live wave radius too.
+      const waveR = zoneStates.get(zone.id)?.radius || 0
+      const reach = Math.max(visual, audible, 250, waveR + 200)
       if (d <= reach && d < bestD) { best = zone; bestD = d }
     }
     return best
@@ -1477,11 +1584,15 @@ export function createCitizenEngine({
     const role = truckRole[idx]
 
     if (role === TRUCK_ROLE_EN_ROUTE) {
-      const dToTarget = distanceMeters(lats[idx], lngs[idx], truckTargetLat[idx], truckTargetLng[idx])
-      if (dToTarget < 40 || (path[idx] && path[idx].length < 2)) {
+      // "Arrived" = inside the search circle (or path stalled). Trucks may
+      // cross the perimeter from any angle; once inside they start patrolling.
+      const dToCentre = distanceMeters(lats[idx], lngs[idx], truckSearchLat[idx], truckSearchLng[idx])
+      const arrived = dToCentre <= truckSearchRadiusM[idx] || (path[idx] && path[idx].length < 2)
+      if (arrived) {
         truckRole[idx] = TRUCK_ROLE_PATROLLING
         states[idx] = 'truck_patrolling'
         truckPatrolNextAt[idx] = simTimeS  // pick a target this tick
+        truckPatrolStartedAt[idx] = simTimeS
       } else {
         advanceAlongPath(idx, dtS, zones)
       }
@@ -1503,15 +1614,26 @@ export function createCitizenEngine({
           return
         }
       }
-      // Patrol — pick a new target near the dispatch centre every 6 sim-s,
-      // OR when the current path runs out.
+      // Auto-return safety net: if we've been patrolling for too long without
+      // perceiving any fire, the operator's circle is probably empty — head
+      // home rather than wandering forever.
+      if (simTimeS - truckPatrolStartedAt[idx] > 90) {
+        truckRole[idx] = TRUCK_ROLE_RETURNING
+        states[idx] = 'truck_driving'
+        const hid = roadGraph.findNearestNode(truckStationLat[idx], truckStationLng[idx])
+        if (hid != null) retarget(idx, hid)
+        return
+      }
+      // Patrol — pick a uniformly-random point inside the search circle every
+      // 6 sim-seconds, or when the current path runs out. `sqrt(rand) * R`
+      // gives a uniform area distribution (vs. clustering near the centre).
       if (simTimeS >= truckPatrolNextAt[idx] || !path[idx] || path[idx].length < 2) {
         truckPatrolNextAt[idx] = simTimeS + 6
         const angle = Math.random() * Math.PI * 2
-        const r = Math.random() * TRUCK_PATROL_RADIUS_M
+        const r = Math.sqrt(Math.random()) * truckSearchRadiusM[idx]
         const offLat = (Math.sin(angle) * r) / 111111
-        const offLng = (Math.cos(angle) * r) / (111111 * Math.cos((truckTargetLat[idx] * Math.PI) / 180))
-        const nid = roadGraph.findNearestNode(truckTargetLat[idx] + offLat, truckTargetLng[idx] + offLng)
+        const offLng = (Math.cos(angle) * r) / (111111 * Math.cos((truckSearchLat[idx] * Math.PI) / 180))
+        const nid = roadGraph.findNearestNode(truckSearchLat[idx] + offLat, truckSearchLng[idx] + offLng)
         if (nid != null) retarget(idx, nid)
       }
       advanceAlongPath(idx, dtS, zones)
@@ -1532,7 +1654,13 @@ export function createCitizenEngine({
       const c = eventCenter(tgt)
       if (c) {
         const d = distanceMeters(lats[idx], lngs[idx], c.lat, c.lng)
-        if (d <= TRUCK_EXTINGUISH_REACH_M) {
+        // Start fighting when the truck crosses the dashed wave perimeter
+        // (zoneStates radius is the same value WaveLayer draws). Building
+        // fires have no zoneStates entry, so reach falls back to the fixed
+        // 60 m close-approach distance.
+        const waveR = zoneStates.get(truckTargetZoneId[idx])?.radius || 0
+        const reach = Math.max(waveR, TRUCK_EXTINGUISH_REACH_M)
+        if (d <= reach) {
           truckRole[idx] = TRUCK_ROLE_EXTINGUISHING
           states[idx] = 'truck_extinguishing'
           return
@@ -1583,9 +1711,23 @@ export function createCitizenEngine({
     }
   }
 
+  // Set of dispatch ids with at least one alive truck. The dashboard polls
+  // this to prune the "Active dispatches" UI list when every truck in a
+  // dispatch has either despawned at home or been recalled — otherwise the
+  // entry sticks around forever even though the trucks are long gone.
+  function getActiveDispatchIds() {
+    const ids = new Set()
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i] || kind[i] !== 1) continue
+      const did = truckDispatchId[i]
+      if (did) ids.add(did)
+    }
+    return ids
+  }
+
   return {
     start, stop, setSpeed, tick, snapshot,
     getZoneWaves, getCitizenStats, getCurrentTime,
-    spawnFleeingCitizens, spawnFireTrucks, recallTrucks, subscribe,
+    spawnFleeingCitizens, spawnFireTrucks, recallTrucks, getActiveDispatchIds, subscribe,
   }
 }

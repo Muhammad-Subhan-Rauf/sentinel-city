@@ -280,8 +280,10 @@ class DispatchPayload(BaseModel):
     # 'firefighter' for now; 'ambulance' / 'police' follow the same skeleton.
     kind: Literal["firefighter"]
     trucks: int = Field(..., ge=1, le=20)
-    # {"lat": float, "lng": float} — the dispatch point. Trucks travel from
-    # the nearest station to here, then patrol the surrounding area.
+    # {"lat": float, "lng": float, "radius": float?} — the dispatch search
+    # area. `radius` (metres) is optional; when omitted the frontend engine
+    # falls back to its default patrol radius. Trucks travel from the nearest
+    # station to the circle centre, then patrol inside it scanning for smoke.
     target: Dict[str, Any]
 
 
@@ -701,19 +703,28 @@ def dispatch_units(payload: DispatchPayload):
     target = payload.target or {}
     lat = target.get("lat")
     lng = target.get("lng")
+    radius = target.get("radius")
     if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="target.lat and target.lng are required (numbers).",
         )
+    if radius is not None and (not isinstance(radius, (int, float)) or radius <= 0):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="target.radius must be a positive number when provided.",
+        )
     # The actual unit movement happens in the frontend citizen engine — this
     # endpoint just acknowledges the request and returns a correlation id.
+    echo_target = {"lat": lat, "lng": lng}
+    if radius is not None:
+        echo_target["radius"] = radius
     return {
         "success": True,
         "dispatch_id": str(uuid.uuid4()),
         "kind": payload.kind,
         "trucks": payload.trucks,
-        "target": {"lat": lat, "lng": lng},
+        "target": echo_target,
     }
 
 

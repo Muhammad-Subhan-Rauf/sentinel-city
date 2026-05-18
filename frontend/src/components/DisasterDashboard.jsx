@@ -130,8 +130,12 @@ export default function DisasterDashboard() {
   const [stationPlacementMode, setStationPlacementMode] = useState(false)
   const [pendingStationName, setPendingStationName] = useState(null)
   const [dispatchTrucks, setDispatchTrucks] = useState(3)
-  const [dispatchTarget, setDispatchTarget] = useState(null)  // { lat, lng } | null
+  // Dispatch target is a *search area* — operators click a centre, then a
+  // slider sets the radius. Simulates an AI's triangulated guess at the fire
+  // location from incoming citizen reports.
+  const [dispatchTarget, setDispatchTarget] = useState(null)  // { lat, lng, radius } | null
   const [dispatchTargetMode, setDispatchTargetMode] = useState(false)
+  const [dispatchRadius, setDispatchRadius] = useState(400)  // metres
   const [activeDispatches, setActiveDispatches] = useState([])  // [{ id, trucks, target }]
   const [notifications, setNotifications] = useState([])
   const [cordons, setCordons] = useState([])
@@ -209,6 +213,9 @@ export default function DisasterDashboard() {
           signal: ctrl.signal,
           polygon: DEFAULT_CITY.polygon,
           onProgress: (msg) => !cancelled && setSimStatus(msg),
+          // Pre-baked Manhattan graph — see frontend/scripts/bake-road-graph.mjs.
+          // Loader falls back to live Overpass automatically if this 404s.
+          bakedPath: '/road-graph-manhattan.json',
         })
         if (cancelled) return
         const CITIZEN_COUNT = 1500
@@ -416,6 +423,22 @@ export default function DisasterDashboard() {
     setActiveDispatches((prev) => prev.filter((d) => d.id !== dispatchId))
     addLog('info', `Trucks recalled.`)
   }, [engine]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Subscribe to engine ticks and prune any active-dispatch entry whose trucks
+  // have all despawned (returned home or recalled then despawned). Without
+  // this the panel keeps showing "7 from Station" even after every truck has
+  // made it back, which reads as "they're stuck somewhere".
+  useEffect(() => {
+    if (!engine?.subscribe || !engine.getActiveDispatchIds) return
+    const unsub = engine.subscribe(() => {
+      const live = engine.getActiveDispatchIds()
+      setActiveDispatches((prev) => {
+        const next = prev.filter((d) => live.has(d.id))
+        return next.length === prev.length ? prev : next
+      })
+    })
+    return unsub
+  }, [engine])
 
   // Notify / cordon polygon completion
   const handlePolygonDraw = useCallback(async (geometry) => {
@@ -1068,11 +1091,30 @@ export default function DisasterDashboard() {
               ].join(' ')}
             >
               {dispatchTargetMode
-                ? 'Click on map to set target…'
+                ? 'Click on map to set search-area centre…'
                 : dispatchTarget
-                  ? `Target: ${dispatchTarget.lat.toFixed(3)}, ${dispatchTarget.lng.toFixed(3)} (change)`
-                  : 'Pick target on map'}
+                  ? `Search area: ${dispatchTarget.lat.toFixed(3)}, ${dispatchTarget.lng.toFixed(3)} · ${Math.round(dispatchTarget.radius ?? dispatchRadius)} m (change)`
+                  : 'Pick search area on map'}
             </button>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-zinc-400 whitespace-nowrap">Search radius</span>
+              <input
+                type="range"
+                min={200}
+                max={1000}
+                step={50}
+                value={dispatchRadius}
+                onChange={(e) => {
+                  const r = +e.target.value
+                  setDispatchRadius(r)
+                  // Live-update the placed target so the on-map circle resizes
+                  // with the slider, and the engine receives the latest value.
+                  setDispatchTarget((t) => (t ? { ...t, radius: r } : t))
+                }}
+                className="flex-1"
+              />
+              <span className="text-[11px] text-zinc-400 tabular-nums w-12 text-right">{dispatchRadius}m</span>
+            </div>
             <button
               onClick={handleDispatch}
               disabled={!dispatchTarget || fireStations.length === 0}
@@ -1250,7 +1292,9 @@ export default function DisasterDashboard() {
           notifications={notifications}
           cordons={cordons}
           dispatchTargetMode={dispatchTargetMode}
-          onDispatchTargetPick={(p) => { setDispatchTarget(p); setDispatchTargetMode(false) }}
+          dispatchTarget={dispatchTarget}
+          activeDispatches={activeDispatches}
+          onDispatchTargetPick={(p) => { setDispatchTarget({ lat: p.lat, lng: p.lng, radius: dispatchRadius }); setDispatchTargetMode(false) }}
           polygonDrawKind={polygonDrawKind}
           onPolygonDraw={handlePolygonDraw}
         />

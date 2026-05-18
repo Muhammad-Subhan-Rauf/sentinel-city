@@ -84,21 +84,31 @@ export default function CitizenLayer({ engine, enabled = true, onCitizenClick })
       // Project once per citizen. layerPointToContainerPoint is fast, but we
       // can save a step by going lat/lng → containerPoint directly.
       const kinds = snap.kind
+      const states = snap.states
       for (let i = 0; i < snap.count; i++) {
-        const cp = map.latLngToContainerPoint([snap.lats[i], snap.lngs[i]])
+        const lat = snap.lats[i], lng = snap.lngs[i]
+        // Despawned slots get NaN positions — skip them or Leaflet throws and
+        // aborts the rest of the frame, freezing all later entities on screen.
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue
+        const cp = map.latLngToContainerPoint([lat, lng])
         // Skip off-screen dots — saves arc + fill work.
         if (cp.x < -8 || cp.y < -8 || cp.x > size.x + 8 || cp.y > size.y + 8) continue
-        // Fire trucks: red square with white outline so they pop against the
-        // ambient citizen pool.
+        // Fire trucks: coloured square keyed off the truck-pseudo-state so
+        // the operator can tell driving / patrolling / extinguishing apart at
+        // a glance.
         if (kinds && kinds[i] === 1) {
-          ctx.fillStyle = '#ef4444'
+          const ts = states[i]
+          ctx.fillStyle =
+            ts === 'truck_extinguishing' ? '#22c55e' :  // green — fighting
+            ts === 'truck_patrolling'    ? '#fbbf24' :  // amber — searching
+            '#ef4444'                                    // red — driving
           ctx.fillRect(cp.x - 4, cp.y - 4, 8, 8)
           ctx.lineWidth = 1
           ctx.strokeStyle = '#fff'
           ctx.strokeRect(cp.x - 4, cp.y - 4, 8, 8)
           continue
         }
-        const s = styleFor(snap.states[i])
+        const s = styleFor(states[i])
         ctx.beginPath()
         ctx.arc(cp.x, cp.y, s.radius, 0, Math.PI * 2)
         ctx.fillStyle = s.color
@@ -126,7 +136,9 @@ export default function CitizenLayer({ engine, enabled = true, onCitizenClick })
       let bestIdx = -1
       let bestDist2 = HIT_TOLERANCE * HIT_TOLERANCE
       for (let i = 0; i < snap.count; i++) {
-        const cp = map.latLngToContainerPoint([snap.lats[i], snap.lngs[i]])
+        const lat = snap.lats[i], lng = snap.lngs[i]
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue
+        const cp = map.latLngToContainerPoint([lat, lng])
         const dx = cp.x - cx, dy = cp.y - cy
         const d2 = dx * dx + dy * dy
         if (d2 < bestDist2) { bestDist2 = d2; bestIdx = i }

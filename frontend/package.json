@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "bake:manhattan": "node scripts/bake-road-graph.mjs manhattan"
   },
   "dependencies": {
     "@geoman-io/leaflet-geoman-free": "^2.19.3",

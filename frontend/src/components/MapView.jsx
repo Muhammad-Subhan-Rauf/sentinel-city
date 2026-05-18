@@ -138,6 +138,92 @@ function StationPlacer({ mode, onPlace }) {
   return null
 }
 
+// ── Dispatch Target Circle ───────────────────────────────────
+// Shows the operator's pending search-area circle (centre + radius) while
+// they're staging a dispatch. Trucks will drive to this circle and patrol
+// inside it scanning for smoke. Cleared once the dispatch is sent.
+function DispatchTargetCircle({ target }) {
+  const map = useMap()
+  const circleRef = useRef(null)
+  useEffect(() => {
+    if (!target) {
+      if (circleRef.current) {
+        map.removeLayer(circleRef.current)
+        circleRef.current = null
+      }
+      return
+    }
+    const style = {
+      color: '#fbbf24',
+      weight: 2,
+      dashArray: '6 6',
+      fillColor: '#fbbf24',
+      fillOpacity: 0.1,
+      interactive: false,
+    }
+    if (!circleRef.current) {
+      circleRef.current = L.circle([target.lat, target.lng], { ...style, radius: target.radius || 400 }).addTo(map)
+    } else {
+      circleRef.current.setLatLng([target.lat, target.lng])
+      circleRef.current.setRadius(target.radius || 400)
+      circleRef.current.setStyle(style)
+    }
+    return undefined
+  }, [map, target])
+  useEffect(() => () => {
+    if (circleRef.current) {
+      map.removeLayer(circleRef.current)
+      circleRef.current = null
+    }
+  }, [map])
+  return null
+}
+
+// ── Active Dispatch Circles ──────────────────────────────────
+// One translucent circle per in-flight dispatch — shows the operator where
+// trucks were sent and persists until the dispatch is recalled or its fire
+// is resolved. Renders dimmer than the pending pre-dispatch circle so they
+// read as "in progress" rather than "stage-and-send".
+function ActiveDispatchCircles({ dispatches }) {
+  const map = useMap()
+  const circlesRef = useRef(new Map())
+  useEffect(() => {
+    const live = new Set()
+    const style = {
+      color: '#fbbf24',
+      weight: 1.5,
+      dashArray: '2 6',
+      fillColor: '#fbbf24',
+      fillOpacity: 0.05,
+      interactive: false,
+    }
+    for (const d of dispatches) {
+      if (!d.target) continue
+      live.add(d.id)
+      let c = circlesRef.current.get(d.id)
+      if (!c) {
+        c = L.circle([d.target.lat, d.target.lng], { ...style, radius: d.target.radius || 400 }).addTo(map)
+        circlesRef.current.set(d.id, c)
+      } else {
+        c.setLatLng([d.target.lat, d.target.lng])
+        c.setRadius(d.target.radius || 400)
+        c.setStyle(style)
+      }
+    }
+    for (const [id, c] of [...circlesRef.current.entries()]) {
+      if (!live.has(id)) {
+        map.removeLayer(c)
+        circlesRef.current.delete(id)
+      }
+    }
+  }, [map, dispatches])
+  useEffect(() => () => {
+    for (const c of circlesRef.current.values()) map.removeLayer(c)
+    circlesRef.current.clear()
+  }, [map])
+  return null
+}
+
 // ── Notification & Cordon Polygon Layer ──────────────────────
 // Renders simple polygons with a translucent fill. Notifications are yellow,
 // cordons are amber striped. Read-only — no interaction.
@@ -582,6 +668,8 @@ export default function MapView({
   notifications = [],
   cordons = [],
   dispatchTargetMode = false,
+  dispatchTarget = null,
+  activeDispatches = [],
   onDispatchTargetPick,
   polygonDrawKind = null, // 'notification' | 'cordon' | null
   onPolygonDraw,
@@ -630,6 +718,8 @@ export default function MapView({
       <FireStationMarkers stations={fireStations} />
       <StationPlacer mode={stationPlacementMode} onPlace={onStationPlace} />
       <StationPlacer mode={dispatchTargetMode} onPlace={onDispatchTargetPick} />
+      <DispatchTargetCircle target={dispatchTarget} />
+      <ActiveDispatchCircles dispatches={activeDispatches} />
       <PolygonOverlay
         items={notifications}
         style={{ color: '#fbbf24', weight: 2, fillColor: '#fbbf24', fillOpacity: 0.15 }}

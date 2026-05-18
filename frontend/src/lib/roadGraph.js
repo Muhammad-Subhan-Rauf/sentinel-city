@@ -3,8 +3,8 @@
 // buildings and rivers. Cached in localStorage so the ~5–15 s Overpass round
 // trip only hits on first launch.
 
-const CACHE_KEY = 'sentinel-roadgraph-v4'
-const CACHE_VERSION = 4
+const CACHE_KEY = 'sentinel-roadgraph-v5'
+const CACHE_VERSION = 5
 // Anything walkable. Excludes motorways/trunks (no pedestrians) and footways
 // (we want street-edge density, not parks/trails).
 const HIGHWAY_TYPES = [
@@ -84,7 +84,7 @@ function pointInPolygon(lng, lat, polygon) {
 // If `polygon` is provided, nodes outside it (and edges that reference them)
 // are dropped — this is how we keep the citizen sim from spawning across the
 // Hudson into New Jersey or across the East River into Brooklyn.
-function buildGraph(elements, polygon) {
+export function buildGraph(elements, polygon) {
   const nodes = new Map()
   const edges = new Map()
 
@@ -135,6 +135,10 @@ function buildGraph(elements, polygon) {
   // whose only neighbors got clipped). Citizens spawned in those clusters
   // can't reach the main grid via BFS and end up oscillating in place.
   keepLargestComponent(nodes, edges)
+  // Then snip off short cul-de-sacs hanging off the main grid — they survive
+  // component pruning but the avoid-previous-node walk logic causes citizens
+  // to pendulum back and forth along them indefinitely.
+  trimShortDeadEnds(nodes, edges)
 
   // Trim isolated nodes (any edge endpoint should still be present).
   const nodeIds = [...nodes.keys()].filter((id) => (edges.get(id) || []).length > 0)
@@ -142,11 +146,33 @@ function buildGraph(elements, polygon) {
 }
 
 function keepLargestComponent(nodes, edges) {
+  // Build an UNDIRECTED adjacency for component detection. The previous
+  // version walked outgoing edges only, which had two problems:
+  //   1. A small bidirectional cluster connected to the main grid by a single
+  //      oneway edge OUT (cluster → main) would, when BFS happened to start
+  //      from the cluster, absorb the entire main grid into its component
+  //      (because A→M is a valid outgoing step). Iteration order then
+  //      determined whether the cluster survived as "largest". Citizens
+  //      spawned in such kept-but-trapping clusters can leave (cluster→main)
+  //      but never come back, while interior cluster nodes oscillate.
+  //   2. Even truly bidirectionally-isolated clusters got the visited set
+  //      polluted because the per-component check let already-visited nodes
+  //      drift across components.
+  // Treating edges as bidirectional for component-detection groups nodes
+  // by "is there ANY way to get between them" — which is what we actually
+  // mean by "same accessible cluster".
+  const adj = new Map()
+  for (const id of nodes.keys()) adj.set(id, new Set())
+  for (const [from, list] of edges) {
+    for (const e of list) {
+      adj.get(from)?.add(e.to)
+      adj.get(e.to)?.add(from)
+    }
+  }
   const visited = new Set()
   let largest = null
   for (const startId of nodes.keys()) {
     if (visited.has(startId)) continue
-    // BFS this component.
     const component = new Set()
     const queue = [startId]
     while (queue.length) {
@@ -154,8 +180,8 @@ function keepLargestComponent(nodes, edges) {
       if (component.has(cur)) continue
       component.add(cur)
       visited.add(cur)
-      for (const e of edges.get(cur) || []) {
-        if (!component.has(e.to)) queue.push(e.to)
+      for (const nb of adj.get(cur) || []) {
+        if (!component.has(nb)) queue.push(nb)
       }
     }
     if (!largest || component.size > largest.size) largest = component
@@ -170,6 +196,109 @@ function keepLargestComponent(nodes, edges) {
   for (const [id, list] of edges) {
     edges.set(id, list.filter((e) => largest.has(e.to)))
   }
+}
+
+// After keeping the main component, also trim "dead-end peninsulas" — short
+// linear branches that hang off the main grid via a single anchor node. These
+// are typically OSM service roads or driveway stubs clipped by the city
+// polygon: the branch is bidirectionally connected (so it survives component
+// pruning), but a citizen who wanders down it will pendulum back and forth
+// between the two end-stubs because at every interior node the avoid-prev
+// filter sends them onward, and at each end-stub there's only one neighbor
+// (the way they came), forcing a u-turn.
+//
+// We iteratively delete degree-1 nodes (in the undirected sense) whose
+// outgoing edges add up to less than `maxBranchLengthM`. This snips off
+// short cul-de-sacs that exist purely as OSM artifacts while preserving
+// legitimate residential dead-ends (which tend to be longer than ~80 m).
+function trimShortDeadEnds(nodes, edges, maxBranchLengthM = 80) {
+  // Build incoming adjacency once and maintain it as we delete.
+  const incoming = new Map()
+  for (const id of nodes.keys()) incoming.set(id, new Set())
+  for (const [from, list] of edges) {
+    for (const e of list) incoming.get(e.to)?.add(from)
+  }
+  const undirectedNeighbors = (id) => {
+    const s = new Set()
+    for (const e of edges.get(id) || []) s.add(e.to)
+    for (const v of incoming.get(id) || []) s.add(v)
+    s.delete(id)
+    return s
+  }
+  const edgeLength = (a, b) => {
+    const fwd = (edges.get(a) || []).find((e) => e.to === b)
+    if (fwd) return fwd.length_m
+    const bwd = (edges.get(b) || []).find((e) => e.to === a)
+    return bwd ? bwd.length_m : 0
+  }
+  const dropNode = (dropId) => {
+    // Remove inbound references from each predecessor's edge list.
+    for (const pred of incoming.get(dropId) || []) {
+      const list = edges.get(pred)
+      if (!list) continue
+      for (let i = list.length - 1; i >= 0; i--) if (list[i].to === dropId) list.splice(i, 1)
+    }
+    // Remove dropId from the incoming sets of each of its downstream nodes.
+    for (const e of edges.get(dropId) || []) incoming.get(e.to)?.delete(dropId)
+    nodes.delete(dropId)
+    edges.delete(dropId)
+    incoming.delete(dropId)
+  }
+
+  // Iteratively peel off short dead-end branches. A "branch" is a chain of
+  // degree-≤2 nodes ending in a degree-1 leaf, attached at its other end to
+  // a true intersection (degree ≥3). The anchor (intersection) itself is
+  // never deleted — only the branch nodes are.
+  let removed = 0
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const id of [...nodes.keys()]) {
+      if (!nodes.has(id)) continue
+      const nbs = undirectedNeighbors(id)
+      if (nbs.size !== 1) continue
+      // Walk inward from this leaf, accumulating chain length. Stop when we
+      // reach a node with branching (the anchor) — but don't include the
+      // anchor in the branch list.
+      const branch = [id]
+      let lengthM = 0
+      let cur = id
+      let prev = null
+      let aborted = false
+      while (true) {
+        const nset = undirectedNeighbors(cur)
+        if (prev != null) nset.delete(prev)
+        if (nset.size === 0) break          // closed dead-end chain, no anchor
+        if (nset.size > 1) break             // shouldn't happen — leaf had size 1
+        const [next] = nset
+        lengthM += edgeLength(cur, next)
+        if (lengthM > maxBranchLengthM) { aborted = true; break }
+        // Look ahead: is `next` an intersection (anchor)? If so, stop here.
+        const nextNs = undirectedNeighbors(next)
+        nextNs.delete(cur)
+        if (nextNs.size === 0) {
+          // `next` is itself a leaf — this is a closed two-node isolate.
+          // Should already have been removed by keepLargestComponent, but
+          // safe to drop here too.
+          branch.push(next)
+          break
+        }
+        if (nextNs.size > 1) {
+          // `next` is the anchor — don't add it to branch.
+          break
+        }
+        // Continue along the chain.
+        branch.push(next)
+        prev = cur
+        cur = next
+      }
+      if (aborted) continue
+      for (const dropId of branch) dropNode(dropId)
+      removed += branch.length
+      changed = true
+    }
+  }
+  return removed
 }
 
 function cacheSignature(bounds, polygon) {
@@ -358,11 +487,35 @@ export class RoadGraph {
 // while the fetch + parse runs (~5–15 s cold, instant warm).
 // If `polygon` is supplied, road-graph nodes outside it are dropped — used to
 // keep the citizen sim from spawning across rivers into neighboring areas.
-export async function loadRoadGraph(bounds, { signal, polygon = null, onProgress } = {}) {
+// If `bakedPath` is supplied (e.g. '/road-graph-manhattan.json'), the loader
+// tries to fetch a pre-baked static graph first. This eliminates the Overpass
+// dependency for cities we've pre-shipped, so a dead Overpass mirror can't
+// break the demo. Falls through to live Overpass on miss/error.
+export async function loadRoadGraph(bounds, { signal, polygon = null, onProgress, bakedPath = null } = {}) {
   const cached = readCache(bounds, polygon)
   if (cached) {
     onProgress?.('Restoring street network from cache…')
     return new RoadGraph(hydrateCache(cached))
+  }
+
+  if (bakedPath) {
+    try {
+      onProgress?.('Loading pre-baked street network…')
+      const res = await fetch(bakedPath, { signal })
+      if (res.ok) {
+        const parsed = await res.json()
+        const graph = { nodes: new Map(Object.entries(parsed.nodes)), edges: new Map(Object.entries(parsed.edges)), nodeIds: parsed.nodeIds }
+        // Write it into localStorage too so subsequent loads in this browser
+        // skip even the static-file fetch.
+        try { writeCache(bounds, polygon, graph) } catch { /* ignore */ }
+        onProgress?.(`Ready — ${graph.nodeIds.length} street nodes (baked).`)
+        return new RoadGraph(graph)
+      }
+      // 404 or other non-ok status: fall through to Overpass.
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err
+      // Network error: fall through to Overpass.
+    }
   }
 
   onProgress?.('Fetching street network from OpenStreetMap…')
