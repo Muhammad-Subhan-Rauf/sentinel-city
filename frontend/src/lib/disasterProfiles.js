@@ -157,6 +157,24 @@ export const DISASTER_PROFILES = {
       labels: ['Lane closure', 'Full road', 'Intersection blocked'],
     },
   },
+  Building_Fire: {
+    label: 'Building Fire',
+    icon: '🏢',
+    color: '#dc2626',
+    geometry: 'point',
+    reportingMode: 'observation',
+    perceptionRadius: { visual: 200, audible: 150 },
+    // Witnesses split 50/50 — half flee, half approach as gawkers/helpers.
+    // Resolved per citizen at observation time.
+    citizenResponse: () => (Math.random() < 0.5 ? 'approach' : 'flee'),
+    // The burning building itself blocks routing through a small radius.
+    blockingRadius: (sev) => 30 + sev * 20,
+    severity: {
+      min: 1,
+      max: 5,
+      labels: ['Small house', 'Townhouse', 'Apartment block', 'Office tower', 'High-rise inferno'],
+    },
+  },
   Infrastructure_Failure: {
     label: 'Infrastructure Failure',
     icon: '🏗️',

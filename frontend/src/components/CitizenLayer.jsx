@@ -83,10 +83,21 @@ export default function CitizenLayer({ engine, enabled = true, onCitizenClick })
 
       // Project once per citizen. layerPointToContainerPoint is fast, but we
       // can save a step by going lat/lng → containerPoint directly.
+      const kinds = snap.kind
       for (let i = 0; i < snap.count; i++) {
         const cp = map.latLngToContainerPoint([snap.lats[i], snap.lngs[i]])
         // Skip off-screen dots — saves arc + fill work.
         if (cp.x < -8 || cp.y < -8 || cp.x > size.x + 8 || cp.y > size.y + 8) continue
+        // Fire trucks: red square with white outline so they pop against the
+        // ambient citizen pool.
+        if (kinds && kinds[i] === 1) {
+          ctx.fillStyle = '#ef4444'
+          ctx.fillRect(cp.x - 4, cp.y - 4, 8, 8)
+          ctx.lineWidth = 1
+          ctx.strokeStyle = '#fff'
+          ctx.strokeRect(cp.x - 4, cp.y - 4, 8, 8)
+          continue
+        }
         const s = styleFor(snap.states[i])
         ctx.beginPath()
         ctx.arc(cp.x, cp.y, s.radius, 0, Math.PI * 2)

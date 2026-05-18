@@ -82,6 +82,114 @@ function RouteLayer({ route, waypoints }) {
   return null
 }
 
+// ── Fire Station Markers ─────────────────────────────────────
+// Plain Leaflet DivIcon markers showing 🚒 + station name. No interaction.
+function FireStationMarkers({ stations }) {
+  const map = useMap()
+  const layersRef = useRef([])
+
+  useEffect(() => {
+    // Tear down old markers
+    for (const m of layersRef.current) map.removeLayer(m)
+    layersRef.current = []
+    for (const s of stations) {
+      const icon = L.divIcon({
+        className: 'fire-station-marker',
+        html: `<div style="font-size:20px;line-height:20px;text-shadow:0 1px 2px #000;">🚒</div>`,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12],
+      })
+      const m = L.marker([s.lat, s.lng], { icon, interactive: false, keyboard: false }).addTo(map)
+      if (s.name) m.bindTooltip(s.name, { permanent: false, direction: 'top', offset: [0, -8] })
+      layersRef.current.push(m)
+    }
+    return () => {
+      for (const m of layersRef.current) map.removeLayer(m)
+      layersRef.current = []
+    }
+  }, [map, stations])
+  return null
+}
+
+// ── Station Placer ───────────────────────────────────────────
+// When `mode` is true, the next map click reports its lat/lng up via onPlace.
+function StationPlacer({ mode, onPlace }) {
+  const map = useMap()
+  useEffect(() => {
+    if (!mode) return
+    const container = map.getContainer()
+    const prev = container.style.cursor
+    container.style.cursor = 'crosshair'
+    const onClick = (e) => {
+      if (
+        map.pm?.globalDrawModeEnabled?.() ||
+        map.pm?.globalEditModeEnabled?.() ||
+        map.pm?.globalRemovalModeEnabled?.() ||
+        map.pm?.globalDragModeEnabled?.()
+      ) return
+      onPlace({ lat: e.latlng.lat, lng: e.latlng.lng })
+    }
+    map.on('click', onClick)
+    return () => {
+      map.off('click', onClick)
+      container.style.cursor = prev
+    }
+  }, [map, mode, onPlace])
+  return null
+}
+
+// ── Notification & Cordon Polygon Layer ──────────────────────
+// Renders simple polygons with a translucent fill. Notifications are yellow,
+// cordons are amber striped. Read-only — no interaction.
+function PolygonOverlay({ items, style }) {
+  const map = useMap()
+  const layersRef = useRef([])
+  useEffect(() => {
+    for (const l of layersRef.current) map.removeLayer(l)
+    layersRef.current = []
+    for (const it of items) {
+      const g = it.geometry
+      if (!g || g.type !== 'Polygon' || !Array.isArray(g.coordinates?.[0])) continue
+      const latlngs = g.coordinates[0].map(([lng, lat]) => [lat, lng])
+      const poly = L.polygon(latlngs, style).addTo(map)
+      if (it.reason) poly.bindTooltip(it.reason, { direction: 'center' })
+      layersRef.current.push(poly)
+    }
+    return () => {
+      for (const l of layersRef.current) map.removeLayer(l)
+      layersRef.current = []
+    }
+  }, [map, items, style])
+  return null
+}
+
+// ── Polygon Drawer (one-shot) ────────────────────────────────
+// When `mode` flips to true, enables Geoman polygon-draw mode. On completion,
+// fires onComplete(geojson) and exits draw mode.
+function PolygonDrawer({ mode, onComplete }) {
+  const map = useMap()
+  useEffect(() => {
+    if (!mode) return
+    map.pm?.enableDraw?.('Polygon', { snappable: false, finishOn: 'dblclick' })
+    const onCreate = (e) => {
+      const layer = e.layer
+      if (!layer) return
+      const gj = layer.toGeoJSON?.()
+      // Remove the just-drawn temp layer (the parent state will re-render it
+      // through the Notification/CordonLayer with proper styling).
+      map.removeLayer(layer)
+      map.pm?.disableDraw?.()
+      if (gj?.geometry) onComplete(gj.geometry)
+    }
+    map.on('pm:create', onCreate)
+    return () => {
+      map.off('pm:create', onCreate)
+      map.pm?.disableDraw?.()
+    }
+  }, [map, mode, onComplete])
+  return null
+}
+
 // ── Waypoint Picker ──────────────────────────────────────────
 // When in pick mode, the next map click reports its lat/lng up via onPick.
 // Skips clicks that are part of an active Geoman draw/edit interaction.
@@ -460,7 +568,24 @@ function GeomanControls({ zones, onZoneAdd, onZoneUpdate, onZoneRemove, drawingM
 }
 
 // ── Main MapView Export ────────────────────────────────────────
-export default function MapView({ zones = [], onZoneAdd, onZoneUpdate, onZoneRemove, drawingMode = 'area', mapStyle = 'dark', showCameras = false, showIntersections = false, city = null, route = null, waypoints = { start: null, end: null }, waypointMode = null, onWaypointPick, citizenEngine = null, focusPoint = null, onCitizenClick }) {
+export default function MapView({
+  zones = [], onZoneAdd, onZoneUpdate, onZoneRemove,
+  drawingMode = 'area', mapStyle = 'dark',
+  showCameras = false, showIntersections = false,
+  city = null, route = null,
+  waypoints = { start: null, end: null }, waypointMode = null, onWaypointPick,
+  citizenEngine = null, focusPoint = null, onCitizenClick,
+  // Emergency-services props
+  fireStations = [],
+  stationPlacementMode = false,
+  onStationPlace,
+  notifications = [],
+  cordons = [],
+  dispatchTargetMode = false,
+  onDispatchTargetPick,
+  polygonDrawKind = null, // 'notification' | 'cordon' | null
+  onPolygonDraw,
+}) {
   const tileUrls = {
     colored: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
     dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
@@ -502,6 +627,18 @@ export default function MapView({ zones = [], onZoneAdd, onZoneUpdate, onZoneRem
       />
       <RouteLayer route={route} waypoints={waypoints} />
       <WaypointPicker mode={waypointMode} onPick={onWaypointPick} />
+      <FireStationMarkers stations={fireStations} />
+      <StationPlacer mode={stationPlacementMode} onPlace={onStationPlace} />
+      <StationPlacer mode={dispatchTargetMode} onPlace={onDispatchTargetPick} />
+      <PolygonOverlay
+        items={notifications}
+        style={{ color: '#fbbf24', weight: 2, fillColor: '#fbbf24', fillOpacity: 0.15 }}
+      />
+      <PolygonOverlay
+        items={cordons}
+        style={{ color: '#f97316', weight: 2, dashArray: '4 6', fillColor: '#f97316', fillOpacity: 0.12 }}
+      />
+      <PolygonDrawer mode={!!polygonDrawKind} onComplete={onPolygonDraw} />
     </MapContainer>
   )
 }

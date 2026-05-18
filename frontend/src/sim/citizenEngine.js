@@ -15,6 +15,13 @@
 
 import { SpatialIndex } from './spatialIndex.js'
 import { getProfile, getPerception } from '../lib/disasterProfiles.js'
+import {
+  FIRE_TRUCK_CAPACITY,
+  EXTINGUISH_RATE_PER_FF_M_PER_S,
+  BUILDING_EXTINGUISH_RATE,
+  TRUCK_EXTINGUISH_REACH_M,
+  TRUCK_PATROL_RADIUS_M,
+} from '../lib/config.js'
 
 // Speeds are "demo-tuned" — faster than realistic pedestrian speeds so motion
 // is visible at typical map zoom levels. Real walking is ~1.4 m/s but that's
@@ -27,6 +34,11 @@ const SPEED_MPS = {
   affected: 0.0,
   fainted: 0.0,      // collapsed on the ground
   shelter: 1.5,      // slow shuffle to shade
+  // Fire-truck pseudo-states. State string is reused for SPEED_MPS lookup; the
+  // truck's actual behaviour is driven by truckRole, not by `states[idx]`.
+  truck_driving: 18.0,
+  truck_patrolling: 9.0,
+  truck_extinguishing: 0.0,
 }
 
 // How long (sim seconds) a citizen stays in a reactive state before returning
@@ -141,27 +153,56 @@ function maxRadiusFromCentroid(geometry, centroid) {
 export function createCitizenEngine({
   roadGraph,
   count = 400,
+  // Extra pre-allocated slots beyond the initial `count`, used by
+  // spawnFleeingCitizens (Building_Fire escapees) at runtime. Typed arrays
+  // can't grow, so we reserve capacity up front. Negligible memory cost.
+  reserve = 1000,
   getZones,
+  // Optional: provide active operator-issued notifications (evacuation alerts)
+  // and cordons (no-entry zones). Both expected to return arrays of
+  // { id, geometry, reason }. The engine treats notifications as flee triggers
+  // for citizens inside them, and cordons as soft no-go zones (citizens stop
+  // at the boundary; trucks ignore them).
+  getNotifications,
+  getCordons,
   onReport,
+  // Engine → app callbacks. onZoneResolved fires when extinguishing brings a
+  // fire's intensity / wave radius to zero. onScheduledSpread fires when a
+  // Building Fire's delayed-spread timer elapses and its (still-draft)
+  // children should be activated by the app.
+  onZoneResolved,
+  onScheduledSpread,
 }) {
+  // Capacity of every parallel array. Slots [count..capacity-1] start unused
+  // and become live when spawnFleeingCitizens fills them. Slots also become
+  // free again when Building_Fire evacuees despawn (see `alive` / `liveCount`).
+  const capacity = count + reserve
+  // High-water mark for the hot loops: 0..activeCount has at least once been a
+  // valid slot. We don't shrink activeCount on despawn — `alive[i] = 0` marks
+  // the gap and spawnFleeingCitizens reuses it before extending the watermark.
+  let activeCount = count
+  // Number of *currently alive* citizens. Drives snapshot.count + the dashboard
+  // pill. Incremented on spawn, decremented on despawn.
+  let liveCount = count
+
   // Per-citizen state, parallel arrays for hot loop access.
-  const lats = new Float32Array(count)
-  const lngs = new Float32Array(count)
-  const currentNode = new Array(count)
-  const targetNode = new Array(count)
-  const path = new Array(count)          // remaining node sequence
-  const states = new Array(count)
-  const stateExpiresAt = new Float32Array(count)
+  const lats = new Float32Array(capacity)
+  const lngs = new Float32Array(capacity)
+  const currentNode = new Array(capacity)
+  const targetNode = new Array(capacity)
+  const path = new Array(capacity)          // remaining node sequence
+  const states = new Array(capacity)
+  const stateExpiresAt = new Float32Array(capacity)
   // The zone id that put a citizen into their current reactive state.
   // Used to detect when the originating disaster is removed so we can
   // gradually return citizens to normal walking.
-  const causeZoneId = new Array(count).fill(null)
+  const causeZoneId = new Array(capacity).fill(null)
   // simTimeS at which an orphaned reactive citizen returns to walking.
   // 0 = not in recovery yet.
-  const recoveryAt = new Float32Array(count)
+  const recoveryAt = new Float32Array(capacity)
   // Last node the citizen passed through. Used by the random-walk picker so
   // calm walkers don't immediately reverse direction at every intersection.
-  const prevNode = new Array(count).fill(null)
+  const prevNode = new Array(capacity).fill(null)
   // Nodes that fall inside an active area hazard. Rebuilt each tick from the
   // current zone list. Walking citizens refuse to step onto these so they
   // don't wander back into a wildfire / flood polygon after their flee state
@@ -169,7 +210,7 @@ export function createCitizenEngine({
   // oscillating "leave then come back and hit the area" behaviour.
   const hazardNodeSet = new Set()
   // Map<eventId, lastReportT_seconds> per citizen
-  const reportLog = Array.from({ length: count }, () => new Map())
+  const reportLog = Array.from({ length: capacity }, () => new Map())
   // Per-zone time-based state for hazards with `spreads: true`. Populated
   // lazily the first time we see a zone; pruned when the zone disappears.
   //   zoneId → { startTime, centroid: { lat, lng }, maxRadius, spreadTime }
@@ -177,10 +218,79 @@ export function createCitizenEngine({
 
   // Debug telemetry: per-citizen movement & retarget counters so the click-
   // to-inspect overlay can answer "is this citizen actually moving?".
-  const lastMovedSimT = new Float32Array(count)
-  const totalMovedM = new Float32Array(count)
-  const retargetCount = new Uint32Array(count)
-  const lastRetargetSimT = new Float32Array(count)
+  const lastMovedSimT = new Float32Array(capacity)
+  const totalMovedM = new Float32Array(capacity)
+  const retargetCount = new Uint32Array(capacity)
+  const lastRetargetSimT = new Float32Array(capacity)
+
+  // Building_Fire evacuee bookkeeping.
+  //   alive          — 1 = live slot, 0 = freed (despawned or never spawned)
+  //   linkedZoneId   — string id of the Building_Fire that spawned this slot,
+  //                    or null for the ambient pool
+  //   homeNode       — road-graph node id where this evacuee returns before
+  //                    despawning
+  //   returningHome  — 1 once the linked zone is gone and the evacuee is en
+  //                    route home. Suppresses the leash so they BFS straight back.
+  const alive = new Uint8Array(capacity)
+  const linkedZoneId = new Array(capacity).fill(null)
+  const homeNode = new Array(capacity).fill(null)
+  const returningHome = new Uint8Array(capacity)
+
+  // Agent kind per slot.
+  //   0 = citizen (default — applies to the ambient pool and Building_Fire evacuees)
+  //   1 = fire_truck
+  // Reserved for ambulance/police later.
+  const kind = new Uint8Array(capacity)
+
+  // Fire-truck bookkeeping.
+  //   truckRole       — state-machine slot (see TRUCK_ROLE below)
+  //   truckTargetLat/Lng — the operator's "general area" target
+  //   truckTargetZoneId  — the specific zone the truck is approaching /
+  //                        extinguishing (set after perception scan)
+  //   truckStationLat/Lng — where the truck returns to
+  //   truckDispatchId    — correlation id, lets recall() find this truck's batch
+  //   truckPatrolNextAt  — sim time at which the truck will pick a new patrol
+  //                        target (avoids retargeting every tick)
+  //   truckPerceptionNextAt — sim time at which the truck next scans for fires
+  const TRUCK_ROLE_EN_ROUTE = 0
+  const TRUCK_ROLE_PATROLLING = 1
+  const TRUCK_ROLE_APPROACHING = 2
+  const TRUCK_ROLE_EXTINGUISHING = 3
+  const TRUCK_ROLE_RETURNING = 4
+  const truckRole = new Uint8Array(capacity)
+  const truckTargetLat = new Float32Array(capacity)
+  const truckTargetLng = new Float32Array(capacity)
+  const truckTargetZoneId = new Array(capacity).fill(null)
+  const truckStationLat = new Float32Array(capacity)
+  const truckStationLng = new Float32Array(capacity)
+  const truckDispatchId = new Array(capacity).fill(null)
+  const truckPatrolNextAt = new Float32Array(capacity)
+  const truckPerceptionNextAt = new Float32Array(capacity)
+  // Capacity per truck — read by the fightRate accumulator. Mirrors
+  // FIRE_TRUCK_CAPACITY from config; stored per-slot so future ambulance/
+  // police kinds can vary without engine code changes.
+  const truckCapacity = new Uint8Array(capacity)
+
+  // Per-tick aggregate of firefighters at each fire zone. Rebuilt each tick
+  // by tickFireTruck during the EXTINGUISHING state; consumed by the wave /
+  // building-fire integrator.
+  const fightRate = new Map()
+  // Per-fire intensity counter for Building_Fire zones (parallel to zoneStates
+  // but for non-spreading point fires). Map<zoneId, { intensity, spreadAt,
+  // childIds, hadFire }>. Created lazily when we first see an active
+  // Building_Fire row.
+  const buildingFireStates = new Map()
+
+  // Cordon node set (citizens-only no-entry). Trucks ignore it.
+  const cordonNodeSet = new Set()
+  // Cache: for each notification id, the last sim time each citizen was
+  // pushed out of it (avoids re-triggering on every tick).
+  const notifAppliedAt = new Map()
+
+  // Visual leash radius: a walking evacuee with homeNode set will reject
+  // candidate neighbours whose destination is farther than this from home,
+  // unless every option is outside (no-livelock fallback).
+  const EVACUEE_TETHER_M = 150
 
   let simTimeS = 0
   let tickHandle = null
@@ -192,7 +302,7 @@ export function createCitizenEngine({
   // place. Falls back gracefully if every neighbor is hazardous (e.g. a
   // citizen who was just released from fleeing while still surrounded by
   // hazard nodes).
-  function pickRandomWalkNext(currentId, avoidId) {
+  function pickRandomWalkNext(currentId, avoidId, tetherHomeId) {
     const ns = roadGraph.neighbors(currentId)
     if (ns.length === 0) return null
     let pool = ns
@@ -203,6 +313,30 @@ export function createCitizenEngine({
     if (avoidId != null && pool.length > 1) {
       const filtered = pool.filter((n) => n.to !== avoidId)
       if (filtered.length > 0) pool = filtered
+    }
+    // Citizen-only cordon avoidance: drop any candidate whose destination is
+    // inside an active cordon. If literally every option is cordoned (e.g. the
+    // citizen is already inside one), fall through — they stay put effectively
+    // because retargetForState will keep retrying.
+    if (cordonNodeSet.size > 0) {
+      const free = pool.filter((n) => !cordonNodeSet.has(n.to))
+      if (free.length > 0) pool = free
+      else return null  // surrounded by cordon → freeze (no walk this tick)
+    }
+    // Building_Fire evacuee leash: drop candidates that would carry the citizen
+    // farther than EVACUEE_TETHER_M from their home node. If no candidate
+    // qualifies (every neighbour is outside the tether — e.g. an evacuee
+    // already at the edge), fall through so they aren't frozen.
+    if (tetherHomeId != null) {
+      const homeLoc = roadGraph.nodeLocation(tetherHomeId)
+      if (homeLoc) {
+        const within = pool.filter((n) => {
+          const dest = roadGraph.nodeLocation(n.to)
+          if (!dest) return false
+          return distanceMeters(homeLoc.lat, homeLoc.lng, dest.lat, dest.lng) <= EVACUEE_TETHER_M
+        })
+        if (within.length > 0) pool = within
+      }
     }
     return pool[Math.floor(Math.random() * pool.length)].to
   }
@@ -216,6 +350,12 @@ export function createCitizenEngine({
     prevNode[idx] = null
     states[idx] = 'walking'
     stateExpiresAt[idx] = 0
+    // Defensive: reset evacuee bookkeeping in case this slot is being reused
+    // by an ambient respawn rather than a Building_Fire spawn.
+    alive[idx] = 1
+    linkedZoneId[idx] = null
+    homeNode[idx] = null
+    returningHome[idx] = 0
     // Walkers wander one block at a time; retargetForState supplies the next
     // hop each time they reach an intersection. BFS is reserved for citizens
     // who actually have a destination (fleeing/approaching a hazard).
@@ -346,7 +486,11 @@ export function createCitizenEngine({
       }
     }
     if (s === 'walking') {
-      const nextId = pickRandomWalkNext(currentNode[idx], prevNode[idx])
+      // Tether evacuees to their building (only while they're milling — once
+      // returningHome is set, the explicit BFS retarget below takes over and
+      // the leash mustn't interfere with the path home).
+      const tether = !returningHome[idx] ? homeNode[idx] : null
+      const nextId = pickRandomWalkNext(currentNode[idx], prevNode[idx], tether)
       if (nextId != null) {
         targetNode[idx] = nextId
         path[idx] = [currentNode[idx], nextId]
@@ -360,7 +504,9 @@ export function createCitizenEngine({
   function advanceAlongPath(idx, dtS, zones) {
     const p = path[idx]
     if (!p || p.length < 2) {
-      retargetForState(idx, zones)
+      // Trucks have their own retarget logic in tickFireTruck — calling
+      // retargetForState here would dump them on a random node.
+      if (kind[idx] !== 1) retargetForState(idx, zones)
       return
     }
     const speed = SPEED_MPS[states[idx]] ?? SPEED_MPS.walking
@@ -371,6 +517,11 @@ export function createCitizenEngine({
 
     let remaining = speed * dtS
     while (remaining > 0 && p.length >= 2) {
+      // Citizen cordon block: if the next hop along the path enters a
+      // cordoned node, freeze in place. Trucks ignore cordons.
+      if (kind[idx] === 0 && cordonNodeSet.has(p[1])) {
+        break
+      }
       const a = roadGraph.nodeLocation(p[0])
       const b = roadGraph.nodeLocation(p[1])
       const segLen = distanceMeters(lats[idx], lngs[idx], b.lat, b.lng)
@@ -412,6 +563,10 @@ export function createCitizenEngine({
     const citywide = []
     const areas = []
     for (const z of zones) {
+      // Untriggered (draft) zones are invisible to the citizen sim. They live
+      // in the local state only so the operator can compose a scenario; weather
+      // sees them via the backend but citizens don't react until Trigger.
+      if (z.triggeredAt == null) continue
       if (z.geometryKind === 'city') {
         citywide.push(z)
         continue
@@ -438,11 +593,24 @@ export function createCitizenEngine({
     const maxRadius = maxRadiusFromCentroid(zone.geometry, centroid)
     if (maxRadius <= 0) return null
     s = {
-      startTime: simTimeS,
+      // Wave clock anchored at the moment the zone was triggered (in sim
+      // seconds). Fallback to now for safety, though buildZoneIndex filters
+      // non-triggered zones out before we reach here.
+      startTime: zone.triggeredAt ?? simTimeS,
+      // Last sim time we integrated this zone's radius. Together with the
+      // running `radius` value below, this lets firefighter fightRate shrink
+      // the wave — we can't reconstruct that from a pure t = simTimeS - start
+      // formula because the effective spread rate varies per tick.
+      lastTickT: zone.triggeredAt ?? simTimeS,
+      // Running wave radius (metres). Integrated each tick by the pre-loop
+      // step in tick(); read by getZoneWaves and the per-citizen catch.
+      radius: 0,
       centroid,
       maxRadius,
       // Spread rate in sim-meters-per-sim-second.
       spreadRate: profile.spreadRateMps?.(zone.severity ?? 1) || 3,
+      // Per-zone multiplier from the operator's slider (default 1×).
+      spreadSpeed: zone.spreadSpeed ?? 1,
       color: profile.color || '#3b82f6',
       type: zone.type,
       severity: zone.severity ?? 1,
@@ -452,8 +620,8 @@ export function createCitizenEngine({
   }
 
   function currentWaveRadius(state) {
-    const elapsed = Math.max(0, simTimeS - state.startTime)
-    return Math.min(state.maxRadius, elapsed * state.spreadRate)
+    // Integration happens in tick(); this is now a simple read.
+    return state.radius
   }
 
   function reactToEvent(idx, zone, kind) {
@@ -463,7 +631,10 @@ export function createCitizenEngine({
     // meaningless — those response modes degrade to a neutral shelter state.
     const ec = eventCenter(zone)
 
-    const response = profile.citizenResponse
+    const response =
+      typeof profile.citizenResponse === 'function'
+        ? profile.citizenResponse(zone.severity ?? 1)
+        : profile.citizenResponse
     if (response === 'flee' && ec) {
       transition(idx, 'fleeing')
       retarget(idx, pickFleeTarget(idx, ec) || roadGraph.getRandomNode())
@@ -597,25 +768,32 @@ export function createCitizenEngine({
         continue
       }
 
-      // Observation area zones (Flood, Wildfire): citizens inside, OR within
-      // the perception buffer just outside the polygon, fire an observation
-      // report and transition to fleeing. For spreading hazards we extend the
-      // perception reach by the polygon's maxRadius so the centroid-distance
-      // check is effectively "distance to polygon edge ≤ visual perception"
-      // — without that, citizens at a polygon's edge wouldn't perceive it
-      // since they're maxRadius away from the centroid.
+      // Observation area zones. For spreading hazards (Flood, Wildfire) the
+      // observable region tracks the *current* wave front, not the polygon —
+      // citizens far ahead of the wave don't see it yet. For non-spreading
+      // observation-area zones (none today; defensive) fall back to the
+      // polygon-membership + perception buffer rule.
       const center = eventCenter(zone)
       if (!center) continue
-      const inside = isCitizenInsideZone(lats[idx], lngs[idx], zone)
-      const d = inside ? 0 : distanceMeters(lats[idx], lngs[idx], center.lat, center.lng)
       const { visual, audible } = getPerception(zone.type, zone.severity ?? 1)
-      let reach = Math.max(visual, audible)
-      if (profile.spreads && reach > 0) {
-        reach += maxRadiusFromCentroid(zone.geometry, center)
-      }
-      if (inside || (reach > 0 && d <= reach)) {
-        maybeReport(idx, zone, 'observation')
-        return
+      const perception = Math.max(visual, audible)
+
+      if (profile.spreads) {
+        const state = ensureZoneState(zone, profile)
+        if (!state) continue
+        const d = distanceMeters(lats[idx], lngs[idx], center.lat, center.lng)
+        const reach = currentWaveRadius(state) + perception
+        if (reach > 0 && d <= reach) {
+          maybeReport(idx, zone, 'observation')
+          return
+        }
+      } else {
+        const inside = isCitizenInsideZone(lats[idx], lngs[idx], zone)
+        const d = inside ? 0 : distanceMeters(lats[idx], lngs[idx], center.lat, center.lng)
+        if (inside || (perception > 0 && d <= perception)) {
+          maybeReport(idx, zone, 'observation')
+          return
+        }
       }
     }
 
@@ -650,7 +828,8 @@ export function createCitizenEngine({
   function buildFaintedList() {
     // Typically 0–10 fainted citizens at once; a flat array is fine.
     const out = []
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i]) continue
       if (states[i] === 'fainted') {
         out.push({ idx: i, lat: lats[i], lng: lngs[i], causeZoneId: causeZoneId[i] })
       }
@@ -684,6 +863,52 @@ export function createCitizenEngine({
       transcript: `Bystander reports an unconscious person near ${fainted.lat.toFixed(4)}, ${fainted.lng.toFixed(4)} — possible ${causeLabel} casualty.`,
       perceived_severity: causeZone.severity,
     })
+  }
+
+  // Same shape as rebuildHazardSet but for operator cordons. Citizens read
+  // this in pickRandomWalkNext + advanceAlongPath; trucks ignore it.
+  function rebuildCordonSet(cordons) {
+    cordonNodeSet.clear()
+    if (!cordons || cordons.length === 0) return
+    const bboxCandidates = []
+    for (const c of cordons) {
+      const g = c?.geometry
+      if (!g) continue
+      let latMin, latMax, lngMin, lngMax
+      if (g.type === 'Polygon' && Array.isArray(g.coordinates?.[0])) {
+        latMin = Infinity; latMax = -Infinity; lngMin = Infinity; lngMax = -Infinity
+        for (const [lng, lat] of g.coordinates[0]) {
+          if (lat < latMin) latMin = lat
+          if (lat > latMax) latMax = lat
+          if (lng < lngMin) lngMin = lng
+          if (lng > lngMax) lngMax = lng
+        }
+      } else {
+        continue
+      }
+      bboxCandidates.length = 0
+      roadGraph.nodeIdsInBbox(latMin, latMax, lngMin, lngMax, bboxCandidates)
+      for (const nodeId of bboxCandidates) {
+        if (cordonNodeSet.has(nodeId)) continue
+        const loc = roadGraph.nodeLocation(nodeId)
+        if (loc && pointInPolygon(loc.lat, loc.lng, g.coordinates[0])) {
+          cordonNodeSet.add(nodeId)
+        }
+      }
+    }
+  }
+
+  // Point-in-polygon test for [lng, lat] coordinate ring. Standard ray-casting.
+  function pointInPolygon(lat, lng, ring) {
+    let inside = false
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [xi, yi] = [ring[i][0], ring[i][1]]
+      const [xj, yj] = [ring[j][0], ring[j][1]]
+      const intersect = yi > lat !== yj > lat &&
+        lng < ((xj - xi) * (lat - yi)) / (yj - yi + 1e-12) + xi
+      if (intersect) inside = !inside
+    }
+    return inside
   }
 
   // Repopulate hazardNodeSet from current area-zone geometry. Cheap thanks
@@ -732,17 +957,151 @@ export function createCitizenEngine({
   function tick(dtS) {
     simTimeS += dtS
     const zones = getZones?.() || []
+    const notifications = getNotifications?.() || []
+    const cordons = getCordons?.() || []
     const zoneIndex = buildZoneIndex(zones)
     const activeIds = new Set(zones.map((z) => z.id))
     const fainted = buildFaintedList()
     rebuildHazardSet(zones)
+    rebuildCordonSet(cordons)
+    // Reset per-tick fight-rate accumulator. Trucks in EXTINGUISHING role
+    // contribute to this Map during their tick, then the wave/intensity
+    // integrators consume it (see further down).
+    fightRate.clear()
 
     // Drop wave state for zones that have been removed.
     for (const id of zoneStates.keys()) {
       if (!activeIds.has(id)) zoneStates.delete(id)
     }
+    // Same for Building_Fire intensity records.
+    for (const id of buildingFireStates.keys()) {
+      if (!activeIds.has(id)) buildingFireStates.delete(id)
+    }
 
-    for (let i = 0; i < count; i++) {
+    // Pre-warm wave state for every triggered spreading zone so the wave
+    // starts expanding from the moment of trigger, regardless of whether a
+    // citizen happens to be nearby. Without this, ensureZoneState only fires
+    // on first interaction; combined with `startTime = zone.triggeredAt`, the
+    // wave would snap forward by however much sim-time has elapsed since
+    // trigger — making remote second zones appear instantly mostly-finished.
+    for (const zone of zoneIndex.areas) {
+      if (zone.triggeredAt == null) continue
+      const profile = getProfile(zone.type)
+      if (profile?.spreads) ensureZoneState(zone, profile)
+    }
+
+    // Wave-radius integrator: state.radius += naturalGrowth - fightContribution.
+    // Naturally grows at spreadRate × spreadSpeed (matches the previous closed-
+    // form `elapsed * rate`); shrinks proportional to firefighters within reach.
+    // When radius hits 0 *while* being fought, the zone is resolved (DELETE +
+    // local removal in the dashboard via the onZoneResolved callback).
+    const resolvedThisTick = []
+    for (const [zoneId, state] of zoneStates) {
+      const dt = Math.max(0, simTimeS - state.lastTickT)
+      state.lastTickT = simTimeS
+      if (dt <= 0) continue
+      const ff = fightRate.get(zoneId) || 0
+      const grow = state.spreadRate * state.spreadSpeed * dt
+      const shrink = ff * EXTINGUISH_RATE_PER_FF_M_PER_S * dt
+      let r = state.radius + grow - shrink
+      if (r > state.maxRadius) r = state.maxRadius
+      if (r <= 0 && ff > 0) {
+        // Fully extinguished — schedule for resolution.
+        r = 0
+        resolvedThisTick.push(zoneId)
+      } else if (r < 0) {
+        r = 0
+      }
+      state.radius = r
+    }
+
+    // Building_Fire intensity integrator + delayed-spread scheduler.
+    for (const zone of zones) {
+      if (zone.type !== 'Building_Fire' || zone.status !== 'active') continue
+      let bf = buildingFireStates.get(zone.id)
+      if (!bf) {
+        bf = {
+          intensity: (zone.severity ?? 1) * 10,
+          spreadAt: zone.spreadInSeconds != null
+            ? (zone.triggeredAt ?? simTimeS) + zone.spreadInSeconds
+            : Infinity,
+          lastTickT: simTimeS,
+          spreadFired: false,
+        }
+        buildingFireStates.set(zone.id, bf)
+      }
+      const dt = Math.max(0, simTimeS - bf.lastTickT)
+      bf.lastTickT = simTimeS
+      if (dt <= 0) continue
+      const ff = fightRate.get(zone.id) || 0
+      // Building fires don't naturally grow; they just persist until put out
+      // or until the spread timer expires.
+      bf.intensity -= ff * BUILDING_EXTINGUISH_RATE * dt
+      if (bf.intensity <= 0 && ff > 0) {
+        resolvedThisTick.push(zone.id)
+        continue
+      }
+      // Delayed spread: when the timer expires and the parent isn't put out,
+      // ask the dashboard to activate any draft children.
+      if (!bf.spreadFired && simTimeS >= bf.spreadAt) {
+        bf.spreadFired = true
+        const childIds = zones.filter((z) => z.parent_id === zone.id || z.parentId === zone.id).map((z) => z.id)
+        if (childIds.length > 0 && onScheduledSpread) {
+          try { onScheduledSpread(zone.id, childIds) } catch { /* ignore */ }
+        }
+      }
+    }
+
+    for (const zid of resolvedThisTick) {
+      zoneStates.delete(zid)
+      buildingFireStates.delete(zid)
+      // Recall any trucks targeting this zone — they'll transition to RETURNING.
+      for (let i = 0; i < activeCount; i++) {
+        if (kind[i] === 1 && truckTargetZoneId[i] === zid) {
+          truckTargetZoneId[i] = null
+          truckRole[i] = TRUCK_ROLE_RETURNING
+          retarget(i, roadGraph.findNearestNode(truckStationLat[i], truckStationLng[i]) ?? roadGraph.getRandomNode())
+        }
+      }
+      if (onZoneResolved) {
+        try { onZoneResolved(zid) } catch { /* ignore */ }
+      }
+    }
+
+    for (let i = 0; i < activeCount; i++) {
+      // Despawned (Building_Fire evacuee that walked home) — skip everything.
+      if (!alive[i]) continue
+
+      // Fire-truck branch: separate state machine; never falls through to the
+      // citizen logic below.
+      if (kind[i] === 1) {
+        tickFireTruck(i, zoneIndex, zones, dtS)
+        continue
+      }
+
+      // Notification consumption: walking citizens inside an active alert
+      // polygon flee outward unless they're already mid-reaction.
+      if (states[i] === 'walking' && notifications.length > 0) {
+        for (const notif of notifications) {
+          if (notif.status && notif.status !== 'active') continue
+          const ring = notif.geometry?.coordinates?.[0]
+          if (!ring) continue
+          if (!pointInPolygon(lats[i], lngs[i], ring)) continue
+          const seenKey = `${notif.id}:${i}`
+          const last = notifAppliedAt.get(seenKey) ?? -Infinity
+          if (simTimeS - last < 30) break  // already-applied cooldown
+          notifAppliedAt.set(seenKey, simTimeS)
+          // Centroid of the notification ring — flee away from it.
+          let cLat = 0, cLng = 0
+          for (const [lng, lat] of ring) { cLat += lat; cLng += lng }
+          cLat /= ring.length; cLng /= ring.length
+          transition(i, 'fleeing')
+          retarget(i, pickFleeTarget(i, { lat: cLat, lng: cLng }) || roadGraph.getRandomNode())
+          causeZoneId[i] = null
+          break
+        }
+      }
+
       // 1. Natural expiry: reactive states with a fixed duration time out.
       if (
         states[i] !== 'walking' &&
@@ -767,6 +1126,30 @@ export function createCitizenEngine({
         } else {
           // Zone is back / still around — cancel any pending recovery.
           recoveryAt[i] = 0
+        }
+      }
+
+      // 3. Building_Fire evacuee return-home: once the parent fire is gone
+      //    and the citizen is back to walking, BFS them home and despawn on
+      //    arrival. If they're mid-reaction (fleeing/fainted/etc.) we let the
+      //    natural-expiry path bring them back to walking first. After a
+      //    reactive interrupt, retargetForState picks a random neighbour, so
+      //    we re-retarget to homeNode every tick the citizen isn't already
+      //    pointed at it.
+      if (linkedZoneId[i] != null && !activeIds.has(linkedZoneId[i]) && states[i] === 'walking') {
+        if (currentNode[i] === homeNode[i]) {
+          alive[i] = 0
+          lats[i] = NaN
+          lngs[i] = NaN
+          linkedZoneId[i] = null
+          homeNode[i] = null
+          returningHome[i] = 0
+          liveCount--
+          continue
+        }
+        returningHome[i] = 1
+        if (targetNode[i] !== homeNode[i]) {
+          retarget(i, homeNode[i])
         }
       }
 
@@ -844,7 +1227,12 @@ export function createCitizenEngine({
   }
 
   function snapshot() {
-    return { lats, lngs, states, count }
+    // count is the iteration bound (high-water mark of slot indices ever used).
+    // Dead slots in [0..count) have NaN lat/lng — renderers iterating up to
+    // count naturally draw nothing for them (Canvas / Leaflet skip NaN coords).
+    // liveCount is the displayed citizen total (alive only).
+    // kind lets the renderer pick the right style per slot (citizen vs truck).
+    return { lats, lngs, states, kind, count: activeCount, liveCount }
   }
 
   function pathRemainingMeters(idx) {
@@ -864,7 +1252,8 @@ export function createCitizenEngine({
   // Full per-citizen state dump for debugging. Used by the click-to-inspect
   // overlay so we can diagnose why a particular dot isn't behaving.
   function getCitizenStats(idx) {
-    if (idx < 0 || idx >= count) return null
+    if (idx < 0 || idx >= activeCount) return null
+    if (!alive[idx]) return null
     const p = path[idx] || []
     return {
       idx,
@@ -916,5 +1305,287 @@ export function createCitizenEngine({
     return () => listeners.delete(cb)
   }
 
-  return { start, stop, setSpeed, tick, snapshot, getZoneWaves, getCitizenStats, subscribe }
+  function getCurrentTime() {
+    return simTimeS
+  }
+
+  // Spawn `n` Building_Fire evacuees at the building location. Each spawned
+  // citizen:
+  //   - is anchored at the nearest road node (the building's "home node")
+  //   - starts in 'fleeing' state with a target ~100 m away in a random
+  //     outward direction (the visible emerge animation)
+  //   - is linked to `zoneId` so they can despawn when the fire is removed
+  // Returns the number actually spawned (capped by remaining capacity).
+  function spawnFleeingCitizens(zoneId, loc, n) {
+    if (!zoneId || !loc || typeof loc.lat !== 'number' || typeof loc.lng !== 'number') return 0
+    const homeNodeId = roadGraph.findNearestNode(loc.lat, loc.lng) ?? roadGraph.getRandomNode()
+    if (homeNodeId == null) return 0
+    const homeLoc = roadGraph.nodeLocation(homeNodeId)
+    if (!homeLoc) return 0
+    const M_PER_DEG_LAT = 111111
+    const M_PER_DEG_LNG = 111111 * Math.cos((homeLoc.lat * Math.PI) / 180)
+    const EMERGE_M = 100
+
+    let added = 0
+    while (added < n) {
+      // Reuse a despawned slot if one exists; otherwise extend the high-water
+      // mark up to capacity.
+      let idx = -1
+      for (let i = 0; i < activeCount; i++) {
+        if (!alive[i]) { idx = i; break }
+      }
+      if (idx < 0) {
+        if (activeCount >= capacity) break
+        idx = activeCount
+        activeCount++
+      }
+
+      lats[idx] = homeLoc.lat
+      lngs[idx] = homeLoc.lng
+      currentNode[idx] = homeNodeId
+      prevNode[idx] = null
+      causeZoneId[idx] = null
+      recoveryAt[idx] = 0
+      lastMovedSimT[idx] = simTimeS
+      totalMovedM[idx] = 0
+      retargetCount[idx] = 0
+      lastRetargetSimT[idx] = simTimeS
+      reportLog[idx].clear()
+      states[idx] = 'fleeing'
+      const dur = STATE_DURATION_S.fleeing ?? 0
+      stateExpiresAt[idx] = dur === Infinity ? Infinity : simTimeS + dur
+
+      // Pick a random outward bearing and project ~100 m, then snap to the
+      // nearest road node. This produces the "pouring out" effect — each
+      // evacuee runs in a slightly different direction.
+      const theta = Math.random() * Math.PI * 2
+      const outwardLat = homeLoc.lat + (Math.sin(theta) * EMERGE_M) / M_PER_DEG_LAT
+      const outwardLng = homeLoc.lng + (Math.cos(theta) * EMERGE_M) / M_PER_DEG_LNG
+      const targetId = roadGraph.findNearestNode(outwardLat, outwardLng) ?? roadGraph.getRandomNode()
+      retarget(idx, targetId)
+
+      alive[idx] = 1
+      linkedZoneId[idx] = zoneId
+      homeNode[idx] = homeNodeId
+      returningHome[idx] = 0
+      liveCount++
+      added++
+    }
+    return added
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Fire-truck spawn / tick / recall
+  // ──────────────────────────────────────────────────────────────────
+
+  function findFreeSlot() {
+    for (let i = 0; i < capacity; i++) {
+      if (!alive[i]) return i
+    }
+    return -1
+  }
+
+  function spawnFireTrucks(dispatchId, stationLoc, targetLoc, n, _stationId) {
+    if (!stationLoc || !targetLoc) return 0
+    const stationNodeId = roadGraph.findNearestNode(stationLoc.lat, stationLoc.lng)
+    const stationNode = stationNodeId != null ? roadGraph.nodeLocation(stationNodeId) : null
+    if (!stationNode) return 0
+    const targetNodeId = roadGraph.findNearestNode(targetLoc.lat, targetLoc.lng)
+    if (targetNodeId == null) return 0
+    let added = 0
+    while (added < n) {
+      const idx = findFreeSlot()
+      if (idx < 0) break
+      // Reset the slot.
+      lats[idx] = stationNode.lat
+      lngs[idx] = stationNode.lng
+      currentNode[idx] = stationNodeId
+      prevNode[idx] = null
+      causeZoneId[idx] = null
+      recoveryAt[idx] = 0
+      lastMovedSimT[idx] = simTimeS
+      totalMovedM[idx] = 0
+      retargetCount[idx] = 0
+      lastRetargetSimT[idx] = simTimeS
+      reportLog[idx].clear()
+      linkedZoneId[idx] = null
+      homeNode[idx] = null
+      returningHome[idx] = 0
+      // Truck-specific.
+      kind[idx] = 1
+      states[idx] = 'truck_driving'
+      stateExpiresAt[idx] = Infinity
+      truckRole[idx] = TRUCK_ROLE_EN_ROUTE
+      truckTargetLat[idx] = targetLoc.lat
+      truckTargetLng[idx] = targetLoc.lng
+      truckTargetZoneId[idx] = null
+      truckStationLat[idx] = stationNode.lat
+      truckStationLng[idx] = stationNode.lng
+      truckDispatchId[idx] = dispatchId
+      truckPatrolNextAt[idx] = 0
+      truckPerceptionNextAt[idx] = 0
+      truckCapacity[idx] = FIRE_TRUCK_CAPACITY
+      alive[idx] = 1
+      retarget(idx, targetNodeId)
+      if (idx >= activeCount) activeCount = idx + 1
+      liveCount++
+      added++
+    }
+    return added
+  }
+
+  function recallTrucks(dispatchId) {
+    let n = 0
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i]) continue
+      if (kind[i] !== 1) continue
+      if (truckDispatchId[i] !== dispatchId) continue
+      truckRole[i] = TRUCK_ROLE_RETURNING
+      truckTargetZoneId[i] = null
+      states[i] = 'truck_driving'
+      const homeId = roadGraph.findNearestNode(truckStationLat[i], truckStationLng[i])
+      if (homeId != null) retarget(i, homeId)
+      n++
+    }
+    return n
+  }
+
+  // Find the closest fire-zone the truck can see right now. Reuses citizen
+  // perception (visual + audible) scaled by severity. Returns the zone or null.
+  function findVisibleFire(idx, zones) {
+    let best = null
+    let bestD = Infinity
+    const myLat = lats[idx]
+    const myLng = lngs[idx]
+    for (const zone of zones) {
+      if (zone.status !== 'active') continue
+      if (zone.type !== 'Wildfire' && zone.type !== 'Building_Fire') continue
+      if (zone.triggeredAt == null) continue
+      const center = eventCenter(zone)
+      if (!center) continue
+      const d = distanceMeters(myLat, myLng, center.lat, center.lng)
+      const { visual, audible } = getPerception(zone.type, zone.severity ?? 1)
+      // Trucks are trained to look — give them a generous floor (250 m) even
+      // when the type's nominal perception is small.
+      const reach = Math.max(visual, audible, 250)
+      if (d <= reach && d < bestD) { best = zone; bestD = d }
+    }
+    return best
+  }
+
+  function tickFireTruck(idx, zoneIndex, zones, dtS) {
+    const role = truckRole[idx]
+
+    if (role === TRUCK_ROLE_EN_ROUTE) {
+      const dToTarget = distanceMeters(lats[idx], lngs[idx], truckTargetLat[idx], truckTargetLng[idx])
+      if (dToTarget < 40 || (path[idx] && path[idx].length < 2)) {
+        truckRole[idx] = TRUCK_ROLE_PATROLLING
+        states[idx] = 'truck_patrolling'
+        truckPatrolNextAt[idx] = simTimeS  // pick a target this tick
+      } else {
+        advanceAlongPath(idx, dtS, zones)
+      }
+      return
+    }
+
+    if (role === TRUCK_ROLE_PATROLLING) {
+      // Perception check first — if a fire is visible, switch to APPROACHING.
+      if (simTimeS >= truckPerceptionNextAt[idx]) {
+        truckPerceptionNextAt[idx] = simTimeS + 1.5
+        const fire = findVisibleFire(idx, zones)
+        if (fire) {
+          truckTargetZoneId[idx] = fire.id
+          truckRole[idx] = TRUCK_ROLE_APPROACHING
+          states[idx] = 'truck_driving'
+          const c = eventCenter(fire)
+          const nearId = c ? roadGraph.findNearestNode(c.lat, c.lng) : null
+          if (nearId != null) retarget(idx, nearId)
+          return
+        }
+      }
+      // Patrol — pick a new target near the dispatch centre every 6 sim-s,
+      // OR when the current path runs out.
+      if (simTimeS >= truckPatrolNextAt[idx] || !path[idx] || path[idx].length < 2) {
+        truckPatrolNextAt[idx] = simTimeS + 6
+        const angle = Math.random() * Math.PI * 2
+        const r = Math.random() * TRUCK_PATROL_RADIUS_M
+        const offLat = (Math.sin(angle) * r) / 111111
+        const offLng = (Math.cos(angle) * r) / (111111 * Math.cos((truckTargetLat[idx] * Math.PI) / 180))
+        const nid = roadGraph.findNearestNode(truckTargetLat[idx] + offLat, truckTargetLng[idx] + offLng)
+        if (nid != null) retarget(idx, nid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+
+    if (role === TRUCK_ROLE_APPROACHING) {
+      const tgt = zones.find((z) => z.id === truckTargetZoneId[idx])
+      if (!tgt) {
+        // Target vanished (extinguished elsewhere) — recall.
+        truckRole[idx] = TRUCK_ROLE_RETURNING
+        truckTargetZoneId[idx] = null
+        states[idx] = 'truck_driving'
+        const hid = roadGraph.findNearestNode(truckStationLat[idx], truckStationLng[idx])
+        if (hid != null) retarget(idx, hid)
+        return
+      }
+      const c = eventCenter(tgt)
+      if (c) {
+        const d = distanceMeters(lats[idx], lngs[idx], c.lat, c.lng)
+        if (d <= TRUCK_EXTINGUISH_REACH_M) {
+          truckRole[idx] = TRUCK_ROLE_EXTINGUISHING
+          states[idx] = 'truck_extinguishing'
+          return
+        }
+        // Re-target if our path ran out short of the fire (e.g. spawned in
+        // a node that didn't have a direct BFS, or the fire moved).
+        if (!path[idx] || path[idx].length < 2) {
+          const nid = roadGraph.findNearestNode(c.lat, c.lng)
+          if (nid != null) retarget(idx, nid)
+        }
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+
+    if (role === TRUCK_ROLE_EXTINGUISHING) {
+      // Contribute to fightRate. The wave / building integrator above this
+      // loop (next tick onward) reads it.
+      const zid = truckTargetZoneId[idx]
+      if (zid) {
+        fightRate.set(zid, (fightRate.get(zid) || 0) + truckCapacity[idx])
+      }
+      // No movement.
+      return
+    }
+
+    if (role === TRUCK_ROLE_RETURNING) {
+      const dToStation = distanceMeters(lats[idx], lngs[idx], truckStationLat[idx], truckStationLng[idx])
+      if (dToStation < 30) {
+        // Arrived — despawn the truck.
+        alive[idx] = 0
+        lats[idx] = NaN
+        lngs[idx] = NaN
+        kind[idx] = 0
+        truckRole[idx] = 0
+        truckTargetZoneId[idx] = null
+        truckDispatchId[idx] = null
+        liveCount--
+        return
+      }
+      // Ensure we have a path home; if BFS bailed earlier, re-try.
+      if (!path[idx] || path[idx].length < 2) {
+        const hid = roadGraph.findNearestNode(truckStationLat[idx], truckStationLng[idx])
+        if (hid != null) retarget(idx, hid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+  }
+
+  return {
+    start, stop, setSpeed, tick, snapshot,
+    getZoneWaves, getCitizenStats, getCurrentTime,
+    spawnFleeingCitizens, spawnFireTrucks, recallTrucks, subscribe,
+  }
 }
