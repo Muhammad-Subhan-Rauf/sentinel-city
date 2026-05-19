@@ -1,7 +1,7 @@
 // ============================================================
 // MapView.jsx — Fullscreen Map with disaster zones, routing, and overlays
 // ============================================================
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { MapContainer, TileLayer, useMap } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
 import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css'
@@ -108,6 +108,83 @@ function FireStationMarkers({ stations }) {
       layersRef.current = []
     }
   }, [map, stations])
+  return null
+}
+
+// ── Mobile Users Layer ───────────────────────────────────────
+// Renders citizens and emergency workers that signed in via the mobile app
+// (Expo app at /mobile). Self-fetches every 3s. Distinct highlight:
+//   - mobile citizens: cyan ring around a small dot, "📱 citizen" tooltip
+//   - mobile workers: hot-pink ring around a small dot, "📱 worker" tooltip
+// The ring intentionally clashes with the simulated-citizen palette so the
+// operator can tell at a glance which dots are real users.
+function MobileUsersLayer() {
+  const map = useMap()
+  const layersRef = useRef([])
+  const [citizens, setCitizens] = useState([])
+  const [workers, setWorkers] = useState([])
+  const backend = import.meta.env.VITE_BACKEND_URL || ''
+
+  useEffect(() => {
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const [cRes, wRes] = await Promise.all([
+          fetch(`${backend}/api/citizens`).then((r) => r.ok ? r.json() : { citizens: [] }),
+          fetch(`${backend}/api/workers`).then((r) => r.ok ? r.json() : { workers: [] }),
+        ])
+        if (cancelled) return
+        setCitizens(cRes.citizens || [])
+        setWorkers(wRes.workers || [])
+      } catch {
+        /* best-effort */
+      }
+    }
+    tick()
+    const handle = setInterval(tick, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(handle)
+    }
+  }, [backend])
+
+  useEffect(() => {
+    for (const l of layersRef.current) map.removeLayer(l)
+    layersRef.current = []
+
+    const render = (user, role) => {
+      const isCitizen = role === 'citizen'
+      const ringColor = isCitizen ? '#22d3ee' : '#f43f5e'    // cyan / hot pink
+      const ring = L.circleMarker([user.lat, user.lng], {
+        radius: 12,
+        color: ringColor,
+        weight: 3,
+        fillOpacity: 0,
+        interactive: false,
+      }).addTo(map)
+      const dot = L.circleMarker([user.lat, user.lng], {
+        radius: 5,
+        color: '#0b1220',
+        weight: 1,
+        fillColor: ringColor,
+        fillOpacity: 1,
+      }).addTo(map)
+      dot.bindTooltip(
+        `📱 ${user.name} · ${isCitizen ? user.status : `${user.role} · ${user.status}`}`,
+        { direction: 'top', offset: [0, -6] }
+      )
+      layersRef.current.push(ring, dot)
+    }
+
+    for (const c of citizens) render(c, 'citizen')
+    for (const w of workers) render(w, 'worker')
+
+    return () => {
+      for (const l of layersRef.current) map.removeLayer(l)
+      layersRef.current = []
+    }
+  }, [map, citizens, workers])
+
   return null
 }
 
@@ -716,6 +793,7 @@ export default function MapView({
       <RouteLayer route={route} waypoints={waypoints} />
       <WaypointPicker mode={waypointMode} onPick={onWaypointPick} />
       <FireStationMarkers stations={fireStations} />
+      <MobileUsersLayer />
       <StationPlacer mode={stationPlacementMode} onPlace={onStationPlace} />
       <StationPlacer mode={dispatchTargetMode} onPlace={onDispatchTargetPick} />
       <DispatchTargetCircle target={dispatchTarget} />
