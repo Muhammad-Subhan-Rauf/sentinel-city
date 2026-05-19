@@ -1,0 +1,52 @@
+{
+  "expo": {
+    "name": "Sentinel-City",
+    "slug": "sentinel-city",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./src/assets/icon.png",
+    "scheme": "sentinelcity",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./src/assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0b1220"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.sentinelcity.mobile",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Sentinel-City uses your location to warn you about nearby disasters and route you to safety."
+      }
+    },
+    "android": {
+      "package": "com.sentinelcity.mobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./src/assets/adaptive-icon.png",
+        "backgroundColor": "#0b1220"
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./src/assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Sentinel-City uses your location to warn you about nearby disasters."
+        }
+      ],
+      "expo-asset"
+    ],
+    "extra": {
+      "backendUrl": "http://localhost:8000",
+      "valhallaUrl": "http://localhost:8002"
+    }
+  }
+}
