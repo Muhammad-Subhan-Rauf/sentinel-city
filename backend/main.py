@@ -24,8 +24,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
+    # Web dev (Vite) + mobile dev. Expo Go and React Native debug clients fetch
+    # without an Origin header, so wildcard is required for those to work.
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -913,3 +915,294 @@ def clear_cordon(cordon_id: str):
             detail=f"Cordon clear failed: {exc}",
         )
     return {"success": True}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Mobile clients (Citizens & Emergency Workers) + Admin views
+#
+# These endpoints back the Expo mobile app (/mobile). They run on in-memory
+# state seeded at startup so they require no DB migrations and reset on a
+# server restart — which is the right behavior for the demo where mock-AI
+# agents will eventually drive these numbers.
+# ══════════════════════════════════════════════════════════════════════
+
+from threading import Lock as _MobileLock
+
+_mobile_lock = _MobileLock()
+
+# Default seed location: Manhattan (matches frontend default city).
+_DEFAULT_LAT = 40.7580
+_DEFAULT_LNG = -73.9855
+
+
+def _seed_citizen(idx: int, name: str, lat_offset: float, lng_offset: float) -> Dict[str, Any]:
+    return {
+        "id": f"citizen-{idx}",
+        "name": name,
+        "role": "citizen",
+        "lat": _DEFAULT_LAT + lat_offset,
+        "lng": _DEFAULT_LNG + lng_offset,
+        "status": "safe",  # safe | warned | evacuating | affected
+        "last_seen": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def _seed_worker(idx: int, name: str, role: str, lat_offset: float, lng_offset: float) -> Dict[str, Any]:
+    return {
+        "id": f"worker-{idx}",
+        "name": name,
+        "role": role,  # firefighter | paramedic | police
+        "lat": _DEFAULT_LAT + lat_offset,
+        "lng": _DEFAULT_LNG + lng_offset,
+        "status": "available",  # available | dispatched | on_scene | off_duty
+        "last_seen": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+# Hardcoded demo users — the mobile login screen lets you pick one of these.
+MOBILE_CITIZENS: Dict[str, Dict[str, Any]] = {
+    c["id"]: c for c in [
+        _seed_citizen(1, "Alex Rivera", 0.004, -0.003),
+        _seed_citizen(2, "Priya Shah", -0.002, 0.005),
+        _seed_citizen(3, "Marcus Lee", 0.006, 0.002),
+        _seed_citizen(4, "Jamie Chen", -0.005, -0.004),
+        _seed_citizen(5, "Sara Okafor", 0.001, 0.007),
+    ]
+}
+
+MOBILE_WORKERS: Dict[str, Dict[str, Any]] = {
+    w["id"]: w for w in [
+        _seed_worker(1, "Capt. Diaz", "firefighter", 0.003, -0.001),
+        _seed_worker(2, "Lt. Patel", "paramedic", -0.001, 0.003),
+        _seed_worker(3, "Off. Brennan", "police", 0.002, 0.004),
+    ]
+}
+
+
+class MobileUserUpdate(BaseModel):
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    status: Optional[str] = None
+
+
+# ────── Citizens ──────
+
+@app.get("/api/citizens", tags=["Mobile"])
+def list_citizens():
+    """Return the current roster of mobile-app citizen users."""
+    with _mobile_lock:
+        return {"citizens": list(MOBILE_CITIZENS.values())}
+
+
+@app.get("/api/citizens/{citizen_id}", tags=["Mobile"])
+def get_citizen(citizen_id: str):
+    with _mobile_lock:
+        citizen = MOBILE_CITIZENS.get(citizen_id)
+    if citizen is None:
+        raise HTTPException(status_code=404, detail="Citizen not found.")
+    return citizen
+
+
+@app.patch("/api/citizens/{citizen_id}", tags=["Mobile"])
+def update_citizen(citizen_id: str, update: MobileUserUpdate):
+    """Update a citizen's location (mock-location feature) or status."""
+    with _mobile_lock:
+        citizen = MOBILE_CITIZENS.get(citizen_id)
+        if citizen is None:
+            raise HTTPException(status_code=404, detail="Citizen not found.")
+        if update.lat is not None:
+            citizen["lat"] = update.lat
+        if update.lng is not None:
+            citizen["lng"] = update.lng
+        if update.status is not None:
+            citizen["status"] = update.status
+        citizen["last_seen"] = datetime.utcnow().isoformat() + "Z"
+        return citizen
+
+
+# ────── Emergency Workers ──────
+
+@app.get("/api/workers", tags=["Mobile"])
+def list_workers():
+    """Return the current roster of mobile-app emergency-worker users."""
+    with _mobile_lock:
+        return {"workers": list(MOBILE_WORKERS.values())}
+
+
+@app.get("/api/workers/{worker_id}", tags=["Mobile"])
+def get_worker(worker_id: str):
+    with _mobile_lock:
+        worker = MOBILE_WORKERS.get(worker_id)
+    if worker is None:
+        raise HTTPException(status_code=404, detail="Worker not found.")
+    return worker
+
+
+@app.patch("/api/workers/{worker_id}", tags=["Mobile"])
+def update_worker(worker_id: str, update: MobileUserUpdate):
+    with _mobile_lock:
+        worker = MOBILE_WORKERS.get(worker_id)
+        if worker is None:
+            raise HTTPException(status_code=404, detail="Worker not found.")
+        if update.lat is not None:
+            worker["lat"] = update.lat
+        if update.lng is not None:
+            worker["lng"] = update.lng
+        if update.status is not None:
+            worker["status"] = update.status
+        worker["last_seen"] = datetime.utcnow().isoformat() + "Z"
+        return worker
+
+
+# ════════════════════════════════════════════════════════════════════
+# Admin: dispatch roster + AI agents + savings summary
+# ════════════════════════════════════════════════════════════════════
+
+# Mock AI agent registry. Real models will replace this; the shape is
+# stable so the mobile admin screen doesn't need to change when they land.
+MOCK_AGENTS: List[Dict[str, Any]] = [
+    {
+        "id": "agent-routing",
+        "name": "Routing Sentinel",
+        "role": "Live re-routing around active disasters",
+        "model": "claude-opus-4-7",
+        "status": "online",
+        "last_action": "Rerouted 142 citizens away from Flood zone #f3a1",
+        "metrics": {"decisions_per_min": 320, "avg_latency_ms": 84},
+    },
+    {
+        "id": "agent-prediction",
+        "name": "Spread Forecaster",
+        "role": "Predicts wildfire / flood spread 5–60 minutes ahead",
+        "model": "claude-sonnet-4-6",
+        "status": "online",
+        "last_action": "Forecasted wildfire growth radius at 412m over next 10m",
+        "metrics": {"forecast_horizon_min": 60, "rmse_m": 38},
+    },
+    {
+        "id": "agent-triage",
+        "name": "911 Triage Agent",
+        "role": "Ranks citizen reports by urgency for dispatch",
+        "model": "claude-haiku-4-5",
+        "status": "online",
+        "last_action": "Escalated 7 reports to immediate dispatch",
+        "metrics": {"reports_handled": 1843, "false_negatives_pct": 0.4},
+    },
+    {
+        "id": "agent-dispatcher",
+        "name": "Dispatch Optimizer",
+        "role": "Allocates fire trucks / ambulances to incidents",
+        "model": "claude-opus-4-7",
+        "status": "online",
+        "last_action": "Re-balanced 3 trucks from Station #2 → Wildfire #c4d2",
+        "metrics": {"avg_response_min": 4.2, "utilization_pct": 73},
+    },
+]
+
+
+@app.get("/api/agents", tags=["Admin"])
+def list_agents():
+    """Mock AI agent roster. Will be replaced by live model status when
+    the real agents come online."""
+    return {"agents": MOCK_AGENTS}
+
+
+@app.get("/api/agents/{agent_id}", tags=["Admin"])
+def get_agent(agent_id: str):
+    for agent in MOCK_AGENTS:
+        if agent["id"] == agent_id:
+            return agent
+    raise HTTPException(status_code=404, detail="Agent not found.")
+
+
+# Live-evolving savings counters. Numbers nudge up slightly on each read
+# so the admin dashboard feels active during a demo. Production replaces
+# this with values aggregated from the prediction / dispatch agents.
+_SAVINGS_STATE: Dict[str, float] = {
+    "lives_saved": 1284,
+    "infrastructure_value_usd": 48_320_000,
+    "money_saved_usd": 12_750_000,
+    "last_tick": 0,
+}
+
+
+def _tick_savings() -> Dict[str, Any]:
+    with _mobile_lock:
+        _SAVINGS_STATE["lives_saved"] += 0.05
+        _SAVINGS_STATE["infrastructure_value_usd"] += 1200
+        _SAVINGS_STATE["money_saved_usd"] += 320
+        _SAVINGS_STATE["last_tick"] += 1
+        return {
+            "lives_saved": int(_SAVINGS_STATE["lives_saved"]),
+            "infrastructure_value_usd": int(_SAVINGS_STATE["infrastructure_value_usd"]),
+            "money_saved_usd": int(_SAVINGS_STATE["money_saved_usd"]),
+            "as_of": datetime.utcnow().isoformat() + "Z",
+        }
+
+
+@app.get("/api/savings-summary", tags=["Admin"])
+def savings_summary():
+    return _tick_savings()
+
+
+# Pre-written "AI insight" narratives. The real prediction agent will
+# replace these with generated text grounded in event history.
+_SAVINGS_INSIGHTS: Dict[str, Dict[str, Any]] = {
+    "lives": {
+        "title": "How Sentinel-City saved 1,284 lives this quarter",
+        "summary": (
+            "The Spread Forecaster identified high-risk evacuation corridors "
+            "an average of 14 minutes before flood crests, giving the Triage "
+            "Agent enough lead time to escalate 1,843 citizen reports for "
+            "early dispatch. Of those escalations, 1,284 ended in a citizen "
+            "being routed to safety before a wave reached their location."
+        ),
+        "highlights": [
+            "Median early-warning lead time: 14 min",
+            "Citizens auto-rerouted around active hazards: 12,402",
+            "Dispatches escalated by Triage Agent: 1,843",
+            "Lives confirmed safe via app handshake: 1,284",
+        ],
+    },
+    "infrastructure": {
+        "title": "$48.3M in infrastructure preserved by predictive dispatch",
+        "summary": (
+            "Dispatch Optimizer pre-positioned fire trucks an average of "
+            "4.2 minutes before ignition forecasts hit threshold, cutting "
+            "structure-loss radius by ~38% on contained wildfires. "
+            "Bridges and substations flagged by the Forecaster were "
+            "barricaded by Routing Sentinel cordons before water arrived."
+        ),
+        "highlights": [
+            "Structures protected from wildfire spread: 1,107",
+            "Substations cordoned before storm impact: 14",
+            "Avg. response time reduction: 3.8 min",
+            "Estimated avoided rebuild cost: $48.3M",
+        ],
+    },
+    "money": {
+        "title": "$12.75M in operational savings",
+        "summary": (
+            "By rebalancing trucks to where the Spread Forecaster predicted "
+            "they'd be needed, fleet utilization rose from 51% to 73%, "
+            "removing the need for two contingency units. Citizen "
+            "auto-rerouting also cut emergency overtime by 22%."
+        ),
+        "highlights": [
+            "Fleet utilization: 51% → 73%",
+            "Overtime spend reduced: 22%",
+            "Mutual-aid callouts avoided: 47",
+            "Total operational savings: $12.75M",
+        ],
+    },
+}
+
+
+@app.get("/api/savings-summary/insight", tags=["Admin"])
+def savings_insight(metric: Literal["lives", "infrastructure", "money"] = Query(...)):
+    """Return an AI-style narrative for a savings tile.
+    Will be swapped to live-generated text once the prediction agent ships."""
+    insight = _SAVINGS_INSIGHTS.get(metric)
+    if insight is None:
+        raise HTTPException(status_code=404, detail="Unknown metric.")
+    return insight
