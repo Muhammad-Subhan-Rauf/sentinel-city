@@ -21,6 +21,26 @@ import {
   BUILDING_EXTINGUISH_RATE,
   TRUCK_EXTINGUISH_REACH_M,
   TRUCK_PATROL_RADIUS_M,
+  HP_MAX,
+  HP_HEAL_THRESHOLD,
+  HP_DECAY_INSIDE_EVENT_PS,
+  HP_DECAY_OUTSIDE_EVENT_PS,
+  HP_DECAY_IN_AMBULANCE_PS,
+  HP_PASSIVE_HEAL_PS,
+  HP_FAINT_THRESHOLD,
+  DEAD_DESPAWN_AFTER_S,
+  AMBULANCE_PATIENT_CAPACITY,
+  AMBULANCE_SEARCH_RADIUS_M,
+  AMBULANCE_PERCEPTION_M,
+  AMBULANCE_PICKUP_REACH_M,
+  AMBULANCE_LOAD_SECONDS,
+  POLICE_PATROL_DEFAULT_RADIUS_M,
+  POLICE_INTERVENTION_RADIUS_M,
+  ROBBERY_VICTIM_RADIUS_M,
+  ROBBERY_L1_INJURE_CHANCE,
+  ROBBERY_L2_INJURE_CHANCE,
+  ROBBERY_L1_INITIAL_HP,
+  ROBBERY_L2_INITIAL_HP,
 } from '../lib/config.js'
 
 // Speeds are "demo-tuned" — faster than realistic pedestrian speeds so motion
@@ -33,12 +53,24 @@ const SPEED_MPS = {
   hiding: 0.0,
   affected: 0.0,
   fainted: 0.0,      // collapsed on the ground
+  dead: 0.0,         // gray X on the map; despawns after DEAD_DESPAWN_AFTER_S
+  arrested: 0.0,     // suspect caught by police; in custody, hidden during transport
   shelter: 1.5,      // slow shuffle to shade
   // Fire-truck pseudo-states. State string is reused for SPEED_MPS lookup; the
   // truck's actual behaviour is driven by truckRole, not by `states[idx]`.
   truck_driving: 20.0,
   truck_patrolling: 9.0,
   truck_extinguishing: 0.0,
+  // Ambulance pseudo-states (kind === 2).
+  amb_driving: 22.0,
+  amb_searching: 10.0,
+  amb_loading: 0.0,
+  amb_transporting: 22.0,
+  // Police pseudo-states (kind === 3).
+  police_driving: 18.0,
+  police_patrolling: 10.0,
+  police_responding: 18.0,    // driving to a reported crime scene
+  police_arresting: 18.0,     // driving a suspect back to home station
 }
 
 // How long (sim seconds) a citizen stays in a reactive state before returning
@@ -172,6 +204,15 @@ export function createCitizenEngine({
   // children should be activated by the app.
   onZoneResolved,
   onScheduledSpread,
+  // Fired when an emergency unit returns to its station. Used by the
+  // dashboard to POST .../return_ack so the station's *_dispatched counter
+  // stays accurate.
+  //   onUnitReturned({ kind: 'firefighter'|'ambulance'|'police',
+  //                     stationId, units, dispatchId })
+  onUnitReturned,
+  // Fired when a criminal is detained by police at robbery time. Lets the
+  // dashboard log the event.
+  onCriminalCaught,
 }) {
   // Capacity of every parallel array. Slots [count..capacity-1] start unused
   // and become live when spawnFleeingCitizens fills them. Slots also become
@@ -249,8 +290,109 @@ export function createCitizenEngine({
   // Agent kind per slot.
   //   0 = citizen (default — applies to the ambient pool and Building_Fire evacuees)
   //   1 = fire_truck
-  // Reserved for ambulance/police later.
+  //   2 = ambulance
+  //   3 = police
   const kind = new Uint8Array(capacity)
+
+  // ──────────────────────────────────────────────────────────────────
+  // Per-citizen health. Invisible HP bar 0..HP_MAX.
+  //   health           — current hit points
+  //   injuryZoneId     — the zone id (or 'crime:<idx>:<t>' string) that
+  //                      injured this citizen. Used to tell if they're still
+  //                      inside the active spreading event (= fast decay) or
+  //                      outside (= slow decay). null = uninjured.
+  //   inAmbulanceIdx   — slot index of the ambulance currently carrying this
+  //                      patient. -1 when not loaded.
+  //   hidden           — Uint8 flag. 1 = renderer should skip this slot
+  //                      (e.g. patient is loaded into an ambulance and the
+  //                      ambulance square is shown in their place).
+  //   deadSinceS       — sim time when a citizen entered 'dead'. The slot is
+  //                      freed DEAD_DESPAWN_AFTER_S after this.
+  // ──────────────────────────────────────────────────────────────────
+  const health = new Float32Array(capacity)
+  const injuryZoneId = new Array(capacity).fill(null)
+  const inAmbulanceIdx = new Int32Array(capacity)
+  const inPoliceCustody = new Int32Array(capacity)
+  const hidden = new Uint8Array(capacity)
+  const deadSinceS = new Float32Array(capacity)
+  for (let i = 0; i < capacity; i++) {
+    health[i] = HP_MAX
+    inAmbulanceIdx[i] = -1
+    inPoliceCustody[i] = -1
+  }
+
+  // Helper: reset a slot's HP fields. Called from every spawn site so a
+  // recycled slot doesn't inherit the previous occupant's injury state.
+  function resetHealth(idx) {
+    health[idx] = HP_MAX
+    injuryZoneId[idx] = null
+    inAmbulanceIdx[idx] = -1
+    inPoliceCustody[idx] = -1
+    hidden[idx] = 0
+    deadSinceS[idx] = 0
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Ambulance bookkeeping (kind === 2). Mirrors truck arrays.
+  //   ambRole           — 0 EN_ROUTE | 1 SEARCHING | 2 APPROACHING |
+  //                       3 LOADING | 4 TRANSPORTING | 5 RETURNING
+  //   ambPatients[idx]  — Array of citizen slot indices currently loaded.
+  // ──────────────────────────────────────────────────────────────────
+  const AMB_ROLE_EN_ROUTE = 0
+  const AMB_ROLE_SEARCHING = 1
+  const AMB_ROLE_APPROACHING = 2
+  const AMB_ROLE_LOADING = 3
+  const AMB_ROLE_TRANSPORTING = 4
+  const AMB_ROLE_RETURNING = 5
+  const ambRole = new Uint8Array(capacity)
+  const ambHomeLat = new Float32Array(capacity)
+  const ambHomeLng = new Float32Array(capacity)
+  const ambHomeId = new Array(capacity).fill(null)
+  const ambDispatchId = new Array(capacity).fill(null)
+  const ambSearchLat = new Float32Array(capacity)
+  const ambSearchLng = new Float32Array(capacity)
+  const ambSearchRadiusM = new Float32Array(capacity)
+  const ambPatrolNextAt = new Float32Array(capacity)
+  const ambPerceptionNextAt = new Float32Array(capacity)
+  const ambPatrolStartedAt = new Float32Array(capacity)
+  const ambCapacity = new Uint8Array(capacity)
+  const ambPatients = new Array(capacity)
+  for (let i = 0; i < capacity; i++) ambPatients[i] = []
+  const ambLoadStartedAt = new Float32Array(capacity)
+  const ambTargetVictim = new Int32Array(capacity)
+  for (let i = 0; i < capacity; i++) ambTargetVictim[i] = -1
+
+  // ──────────────────────────────────────────────────────────────────
+  // Police bookkeeping (kind === 3). Three roles only.
+  //   policeMode 'auto' | 'manual' — auto patrols are baseline ~50%; the
+  //   dispatch id is prefixed with 'auto-' / 'manual-' to distinguish.
+  // ──────────────────────────────────────────────────────────────────
+  const POLICE_ROLE_EN_ROUTE = 0
+  const POLICE_ROLE_PATROL = 1
+  const POLICE_ROLE_RETURNING = 2
+  // Heading to a reported crime scene to "talk to victims" (~10 s loiter
+  // on arrival, then back to patrol).
+  const POLICE_ROLE_RESPONDING = 3
+  // Transporting a caught suspect back to home station. On arrival the
+  // suspect despawns from the map.
+  const POLICE_ROLE_ARRESTING = 4
+  const policeRole = new Uint8Array(capacity)
+  const policeHomeLat = new Float32Array(capacity)
+  const policeHomeLng = new Float32Array(capacity)
+  const policeHomeId = new Array(capacity).fill(null)
+  const policeDispatchId = new Array(capacity).fill(null)
+  const policeSearchLat = new Float32Array(capacity)
+  const policeSearchLng = new Float32Array(capacity)
+  const policeSearchRadiusM = new Float32Array(capacity)
+  const policePatrolNextAt = new Float32Array(capacity)
+  // Scene the officer is responding to (RESPONDING role only).
+  const policeIncidentLat = new Float32Array(capacity)
+  const policeIncidentLng = new Float32Array(capacity)
+  const policeIncidentArrivedAt = new Float32Array(capacity)
+  // Citizen slot the officer is escorting back to the station for booking.
+  // -1 means "no suspect" (the common case).
+  const policeSuspectIdx = new Int32Array(capacity)
+  for (let i = 0; i < capacity; i++) policeSuspectIdx[i] = -1
 
   // Fire-truck bookkeeping.
   //   truckRole       — state-machine slot (see TRUCK_ROLE below)
@@ -276,6 +418,7 @@ export function createCitizenEngine({
   const truckTargetZoneId = new Array(capacity).fill(null)
   const truckStationLat = new Float32Array(capacity)
   const truckStationLng = new Float32Array(capacity)
+  const truckStationId = new Array(capacity).fill(null)
   const truckDispatchId = new Array(capacity).fill(null)
   const truckPatrolNextAt = new Float32Array(capacity)
   const truckPerceptionNextAt = new Float32Array(capacity)
@@ -378,6 +521,8 @@ export function createCitizenEngine({
     linkedZoneId[idx] = null
     homeNode[idx] = null
     returningHome[idx] = 0
+    kind[idx] = 0
+    resetHealth(idx)
     // Walkers wander one block at a time; retargetForState supplies the next
     // hop each time they reach an intersection. BFS is reserved for citizens
     // who actually have a destination (fleeing/approaching a hazard).
@@ -650,6 +795,42 @@ export function createCitizenEngine({
     return state.radius
   }
 
+  // Is this injured citizen still inside the ACTIVE spreading event that
+  // injured them (= fast HP decay), or have they escaped the wave front /
+  // is the zone gone (= slow outside-event decay)?
+  //
+  // Crime victims (injuryZoneId starts with 'crime:') always count as
+  // OUTSIDE so the operator has a longer rescue window per spec.
+  function isInsideActiveEvent(idx, zones, activeIds) {
+    const zid = injuryZoneId[idx]
+    if (!zid) return false
+    if (typeof zid === 'string' && zid.startsWith('crime:')) return false
+    if (!activeIds.has(zid)) return false
+    const zone = zones.find((z) => z.id === zid)
+    if (!zone) return false
+    if (zone.geometryKind === 'city') return true
+    const profile = getProfile(zone.type)
+    if (profile?.spreads) {
+      const state = zoneStates.get(zid)
+      if (!state) return false
+      const d = distanceMeters(lats[idx], lngs[idx], state.centroid.lat, state.centroid.lng)
+      return d <= currentWaveRadius(state)
+    }
+    if (zone.type === 'Building_Fire') {
+      const bf = buildingFireStates.get(zid)
+      if (!bf || bf.intensity <= 0) return false
+      const c = eventCenter(zone)
+      if (!c) return false
+      const d = distanceMeters(lats[idx], lngs[idx], c.lat, c.lng)
+      return d <= Math.max(TRUCK_EXTINGUISH_REACH_M, 60)
+    }
+    // Point events (e.g. Heatwave at a point, etc.) — within 30 m counts.
+    const c = eventCenter(zone)
+    if (!c) return false
+    const d = distanceMeters(lats[idx], lngs[idx], c.lat, c.lng)
+    return d <= 30
+  }
+
   function reactToEvent(idx, zone, kind) {
     const profile = getProfile(zone.type)
     if (!profile) return
@@ -718,12 +899,15 @@ export function createCitizenEngine({
     if (faintChance > 0 && Math.random() < faintChance) {
       transition(idx, 'fainted')
       causeZoneId[idx] = zone.id
+      injuryZoneId[idx] = zone.id
       recoveryAt[idx] = 0
       // No self-report: an unconscious person can't dial 911. A passing
       // witness will see them and emit the report.
       return
     }
     transition(idx, 'affected')
+    causeZoneId[idx] = zone.id
+    injuryZoneId[idx] = zone.id
     maybeReport(idx, zone, 'affected')
   }
 
@@ -990,10 +1174,19 @@ export function createCitizenEngine({
     const fainted = buildFaintedList()
     rebuildHazardSet(zones)
     rebuildCordonSet(cordons)
-    // Reset per-tick fight-rate accumulator. Trucks in EXTINGUISHING role
-    // contribute to this Map during their tick, then the wave/intensity
-    // integrators consume it (see further down).
+    // Reset per-tick fight-rate accumulator, then PRE-TALLY contributions
+    // from every truck currently in EXTINGUISHING state. The wave +
+    // building-fire integrators below read this Map; without the pre-tally
+    // they read zero (the per-citizen loop where trucks set fightRate runs
+    // AFTER the integrators, so contributions weren't being applied until
+    // the *next* tick — and after the next-tick clear they were lost).
     fightRate.clear()
+    for (let _ti = 0; _ti < activeCount; _ti++) {
+      if (!alive[_ti] || kind[_ti] !== 1) continue
+      if (truckRole[_ti] !== TRUCK_ROLE_EXTINGUISHING) continue
+      const _zid = truckTargetZoneId[_ti]
+      if (_zid) fightRate.set(_zid, (fightRate.get(_zid) || 0) + truckCapacity[_ti])
+    }
 
     // Drop wave state for zones that have been removed.
     for (const id of zoneStates.keys()) {
@@ -1094,9 +1287,105 @@ export function createCitizenEngine({
       }
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // HP integrator. Runs once per tick across all citizens.
+    //
+    // Priority of context (highest wins):
+    //   1. dead          → skip; despawn after grace period
+    //   2. in ambulance  → very slow decay (safety net)
+    //   3. inside event  → ALWAYS fast decay, regardless of current HP
+    //   4. outside event:
+    //        HP < heal threshold → slow decay (will die untreated)
+    //        HP ≥ heal threshold → slow self-heal
+    //
+    // The bug-fix here: "inside event" damage must apply even when HP is
+    // still high. Earlier the stable-branch healed wildfire victims at 100 HP
+    // before they could ever drop into the decay branch — so nobody ever died.
+    // ──────────────────────────────────────────────────────────────────
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i]) continue
+      if (kind[i] !== 0) continue
+      const s = states[i]
+      if (s === 'dead') {
+        if (simTimeS - deadSinceS[i] >= DEAD_DESPAWN_AFTER_S) {
+          alive[i] = 0
+          lats[i] = NaN
+          lngs[i] = NaN
+          liveCount--
+        }
+        continue
+      }
+      if (s === 'arrested') continue
+      const isInjuredState = s === 'affected' || s === 'fainted'
+      const inAmb = inAmbulanceIdx[i] >= 0
+      const inside = !inAmb && isInsideActiveEvent(i, zones, activeIds)
+      // Fast-skip the common case: full-HP citizen, not in any special state.
+      if (!inAmb && !inside && health[i] >= HP_MAX && !isInjuredState) continue
+
+      if (inAmb) {
+        health[i] = Math.max(0, health[i] - HP_DECAY_IN_AMBULANCE_PS * dtS)
+      } else if (inside) {
+        // Inside the active spreading event: always lose HP fast.
+        health[i] = Math.max(0, health[i] - HP_DECAY_INSIDE_EVENT_PS * dtS)
+      } else if (health[i] >= HP_HEAL_THRESHOLD) {
+        // Outside event and stable: slow self-heal back to full.
+        health[i] = Math.min(HP_MAX, health[i] + HP_PASSIVE_HEAL_PS * dtS)
+        if (health[i] >= HP_MAX && s === 'affected') {
+          transition(i, 'walking')
+          injuryZoneId[i] = null
+        }
+        continue
+      } else {
+        // Outside event but still injured (HP < 70): slow decay. Without
+        // ambulance intervention they will eventually die.
+        health[i] = Math.max(0, health[i] - HP_DECAY_OUTSIDE_EVENT_PS * dtS)
+      }
+
+      if (health[i] <= 0) {
+        health[i] = 0
+        states[i] = 'dead'
+        deadSinceS[i] = simTimeS
+        // If the patient was loaded in an ambulance and just died, release
+        // them so the ambulance can find another fare. The renderer keeps
+        // them hidden until despawn.
+        if (inAmbulanceIdx[i] >= 0) {
+          const amb = inAmbulanceIdx[i]
+          if (Array.isArray(ambPatients[amb])) {
+            const j = ambPatients[amb].indexOf(i)
+            if (j >= 0) ambPatients[amb].splice(j, 1)
+          }
+          inAmbulanceIdx[i] = -1
+        }
+        continue
+      }
+      // Walking → affected promotion if HP drops past the heal threshold
+      // while inside an event (e.g. they were caught uninjured by the wave
+      // and the disaster is now actively damaging them).
+      if (s === 'walking' && inside && health[i] < HP_HEAL_THRESHOLD) {
+        // Don't trigger a 911 self-report for this silent injury — the
+        // disaster zone already has its own reports flowing in.
+        transition(i, 'affected')
+        injuryZoneId[i] = injuryZoneId[i] || (() => {
+          // Tag with whatever zone is closest if we don't already have one.
+          for (const z of zones) {
+            if (z.status !== 'active' || z.geometryKind === 'city') continue
+            const c = eventCenter(z)
+            if (c && distanceMeters(lats[i], lngs[i], c.lat, c.lng) <= (zoneStates.get(z.id)?.radius || 0) + 60) return z.id
+          }
+          return null
+        })()
+      }
+      // Affected → fainted promotion when HP drops below the faint threshold.
+      if (s === 'affected' && health[i] < HP_FAINT_THRESHOLD) {
+        transition(i, 'fainted')
+      }
+    }
+
     for (let i = 0; i < activeCount; i++) {
       // Despawned (Building_Fire evacuee that walked home) — skip everything.
       if (!alive[i]) continue
+      // Dead — skip movement/perception; the HP integrator handles despawn.
+      if (states[i] === 'dead') continue
 
       // Stuck detection: if a moving entity hasn't displaced more than
       // STUCK_DISPLACEMENT_M from its anchor over STUCK_WINDOW_S, it's
@@ -1109,7 +1398,10 @@ export function createCitizenEngine({
         const s = states[i]
         const isMoving =
           s === 'walking' || s === 'fleeing' || s === 'approaching' ||
-          s === 'truck_driving' || s === 'truck_patrolling'
+          s === 'truck_driving' || s === 'truck_patrolling' ||
+          s === 'amb_driving' || s === 'amb_searching' || s === 'amb_transporting' ||
+          s === 'police_driving' || s === 'police_patrolling' ||
+          s === 'police_responding' || s === 'police_arresting'
         const tethered = kind[i] === 0 && homeNode[i] != null
         if (isMoving && !tethered) {
           const d = distanceMeters(lats[i], lngs[i], stuckAnchorLat[i], stuckAnchorLng[i])
@@ -1124,6 +1416,21 @@ export function createCitizenEngine({
               truckTargetZoneId[i] = null
               states[i] = 'truck_driving'
               const hid = roadGraph.findNearestNode(truckStationLat[i], truckStationLng[i])
+              if (hid != null) retarget(i, hid)
+            } else if (kind[i] === 2) {
+              ambRole[i] = AMB_ROLE_RETURNING
+              ambTargetVictim[i] = -1
+              states[i] = 'amb_driving'
+              const hid = roadGraph.findNearestNode(ambHomeLat[i], ambHomeLng[i])
+              if (hid != null) retarget(i, hid)
+            } else if (kind[i] === 3) {
+              // If carrying a suspect, keep ARRESTING role so the booking
+              // still completes; otherwise send them home off duty.
+              if (policeSuspectIdx[i] < 0) {
+                policeRole[i] = POLICE_ROLE_RETURNING
+                states[i] = 'police_driving'
+              }
+              const hid = roadGraph.findNearestNode(policeHomeLat[i], policeHomeLng[i])
               if (hid != null) retarget(i, hid)
             } else {
               // Citizen: respawn at a random main-grid node and reset to walking.
@@ -1162,10 +1469,18 @@ export function createCitizenEngine({
         }
       }
 
-      // Fire-truck branch: separate state machine; never falls through to the
-      // citizen logic below.
+      // Emergency-unit branches: separate state machines; never fall through
+      // to the citizen logic below.
       if (kind[i] === 1) {
         tickFireTruck(i, zoneIndex, zones, dtS)
+        continue
+      }
+      if (kind[i] === 2) {
+        tickAmbulance(i, zoneIndex, zones, dtS)
+        continue
+      }
+      if (kind[i] === 3) {
+        tickPolice(i, zoneIndex, zones, dtS)
         continue
       }
 
@@ -1204,17 +1519,21 @@ export function createCitizenEngine({
       // 2. Zone-removal recovery: if the disaster that put this citizen into
       //    a reactive state is no longer active, schedule a randomized return
       //    to walking so the population doesn't all snap back at once.
+      //    Gated on HP ≥ 90 — wounded citizens stay wounded until rescued, so
+      //    "the zone is gone" alone isn't enough to recover.
       if (states[i] !== 'walking' && causeZoneId[i] != null) {
         const stillActive = activeIds.has(causeZoneId[i])
-        if (!stillActive) {
+        if (!stillActive && health[i] >= 90) {
           if (recoveryAt[i] === 0) {
             // Stagger over 10–60 sim seconds for a believable "calm down".
             recoveryAt[i] = simTimeS + 10 + Math.random() * 50
           } else if (simTimeS >= recoveryAt[i]) {
             transition(i, 'walking')
+            injuryZoneId[i] = null
           }
         } else {
-          // Zone is back / still around — cancel any pending recovery.
+          // Zone is back / still around, or citizen is still wounded — cancel
+          // any pending recovery.
           recoveryAt[i] = 0
         }
       }
@@ -1322,7 +1641,9 @@ export function createCitizenEngine({
     // count naturally draw nothing for them (Canvas / Leaflet skip NaN coords).
     // liveCount is the displayed citizen total (alive only).
     // kind lets the renderer pick the right style per slot (citizen vs truck).
-    return { lats, lngs, states, kind, count: activeCount, liveCount }
+    // health/hidden expose the new HP system to the renderer for gradient
+    // colouring and to suppress drawing of patients loaded into ambulances.
+    return { lats, lngs, states, kind, health, hidden, count: activeCount, liveCount }
   }
 
   function pathRemainingMeters(idx) {
@@ -1458,6 +1779,8 @@ export function createCitizenEngine({
       linkedZoneId[idx] = zoneId
       homeNode[idx] = homeNodeId
       returningHome[idx] = 0
+      kind[idx] = 0
+      resetHealth(idx)
       liveCount++
       added++
     }
@@ -1510,12 +1833,14 @@ export function createCitizenEngine({
       returningHome[idx] = 0
       // Truck-specific.
       kind[idx] = 1
+      resetHealth(idx)
       states[idx] = 'truck_driving'
       stateExpiresAt[idx] = Infinity
       truckRole[idx] = TRUCK_ROLE_EN_ROUTE
       truckTargetZoneId[idx] = null
       truckStationLat[idx] = stationNode.lat
       truckStationLng[idx] = stationNode.lng
+      truckStationId[idx] = _stationId || null
       truckDispatchId[idx] = dispatchId
       truckPatrolNextAt[idx] = 0
       truckPerceptionNextAt[idx] = 0
@@ -1536,6 +1861,38 @@ export function createCitizenEngine({
       added++
     }
     return added
+  }
+
+  // Re-task up to `n` fire trucks that are currently in the RETURNING role
+  // (heading home empty-handed after patrol / extinguishing) to a fresh
+  // dispatch target. The trucks keep their home station so capacity
+  // bookkeeping stays consistent — re-tasking does NOT consume station
+  // capacity (those slots are already counted as dispatched).
+  function retaskReturningTrucks(newDispatchId, targetArea, n) {
+    if (!targetArea || n <= 0) return 0
+    const targetLat = targetArea.lat
+    const targetLng = targetArea.lng
+    const targetRadiusM = Math.max(50, +targetArea.radius || TRUCK_PATROL_RADIUS_M)
+    const targetNodeId = roadGraph.findNearestNode(targetLat, targetLng)
+    if (targetNodeId == null) return 0
+    let retasked = 0
+    for (let i = 0; i < activeCount && retasked < n; i++) {
+      if (!alive[i] || kind[i] !== 1) continue
+      if (truckRole[i] !== TRUCK_ROLE_RETURNING) continue
+      truckRole[i] = TRUCK_ROLE_EN_ROUTE
+      truckTargetZoneId[i] = null
+      truckDispatchId[i] = newDispatchId
+      truckSearchLat[i] = targetLat
+      truckSearchLng[i] = targetLng
+      truckSearchRadiusM[i] = targetRadiusM
+      truckPatrolNextAt[i] = 0
+      truckPerceptionNextAt[i] = 0
+      truckPatrolStartedAt[i] = 0
+      states[i] = 'truck_driving'
+      retarget(i, targetNodeId)
+      retasked++
+    }
+    return retasked
   }
 
   function recallTrucks(dispatchId) {
@@ -1677,20 +2034,18 @@ export function createCitizenEngine({
     }
 
     if (role === TRUCK_ROLE_EXTINGUISHING) {
-      // Contribute to fightRate. The wave / building integrator above this
-      // loop (next tick onward) reads it.
-      const zid = truckTargetZoneId[idx]
-      if (zid) {
-        fightRate.set(zid, (fightRate.get(zid) || 0) + truckCapacity[idx])
-      }
-      // No movement.
+      // fightRate is pre-tallied at the top of tick() before the wave +
+      // building integrators run. We just sit still here.
       return
     }
 
     if (role === TRUCK_ROLE_RETURNING) {
       const dToStation = distanceMeters(lats[idx], lngs[idx], truckStationLat[idx], truckStationLng[idx])
       if (dToStation < 30) {
-        // Arrived — despawn the truck.
+        // Arrived — despawn the truck and notify the dashboard so it can
+        // POST return_ack to the backend (decrement trucks_dispatched).
+        const stationId = truckStationId[idx]
+        const dispatchId = truckDispatchId[idx]
         alive[idx] = 0
         lats[idx] = NaN
         lngs[idx] = NaN
@@ -1698,7 +2053,12 @@ export function createCitizenEngine({
         truckRole[idx] = 0
         truckTargetZoneId[idx] = null
         truckDispatchId[idx] = null
+        truckStationId[idx] = null
         liveCount--
+        if (onUnitReturned && stationId) {
+          try { onUnitReturned({ kind: 'firefighter', stationId, units: 1, dispatchId }) }
+          catch { /* ignore */ }
+        }
         return
       }
       // Ensure we have a path home; if BFS bailed earlier, re-try.
@@ -1709,6 +2069,743 @@ export function createCitizenEngine({
       advanceAlongPath(idx, dtS, zones)
       return
     }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Ambulance spawn / tick / recall
+  // ──────────────────────────────────────────────────────────────────
+
+  function spawnAmbulances(dispatchId, hospitalLoc, targetArea, n, hospitalId) {
+    if (!hospitalLoc || !targetArea) return 0
+    const hospitalNodeId = roadGraph.findNearestNode(hospitalLoc.lat, hospitalLoc.lng)
+    const hospitalNode = hospitalNodeId != null ? roadGraph.nodeLocation(hospitalNodeId) : null
+    if (!hospitalNode) return 0
+    const targetLat = targetArea.lat
+    const targetLng = targetArea.lng
+    const targetRadiusM = Math.max(30, +targetArea.radius || AMBULANCE_SEARCH_RADIUS_M)
+    const targetNodeId = roadGraph.findNearestNode(targetLat, targetLng)
+    if (targetNodeId == null) return 0
+    let added = 0
+    while (added < n) {
+      const idx = findFreeSlot()
+      if (idx < 0) break
+      lats[idx] = hospitalNode.lat
+      lngs[idx] = hospitalNode.lng
+      currentNode[idx] = hospitalNodeId
+      prevNode[idx] = null
+      causeZoneId[idx] = null
+      recoveryAt[idx] = 0
+      lastMovedSimT[idx] = simTimeS
+      totalMovedM[idx] = 0
+      retargetCount[idx] = 0
+      lastRetargetSimT[idx] = simTimeS
+      reportLog[idx].clear()
+      linkedZoneId[idx] = null
+      homeNode[idx] = null
+      returningHome[idx] = 0
+      kind[idx] = 2
+      resetHealth(idx)
+      states[idx] = 'amb_driving'
+      stateExpiresAt[idx] = Infinity
+      ambRole[idx] = AMB_ROLE_EN_ROUTE
+      ambHomeLat[idx] = hospitalNode.lat
+      ambHomeLng[idx] = hospitalNode.lng
+      ambHomeId[idx] = hospitalId || null
+      ambDispatchId[idx] = dispatchId
+      ambSearchLat[idx] = targetLat
+      ambSearchLng[idx] = targetLng
+      ambSearchRadiusM[idx] = targetRadiusM
+      ambPatrolNextAt[idx] = 0
+      ambPerceptionNextAt[idx] = 0
+      ambPatrolStartedAt[idx] = 0
+      ambCapacity[idx] = AMBULANCE_PATIENT_CAPACITY
+      ambPatients[idx] = []
+      ambLoadStartedAt[idx] = 0
+      ambTargetVictim[idx] = -1
+      stuckAnchorLat[idx] = hospitalNode.lat
+      stuckAnchorLng[idx] = hospitalNode.lng
+      stuckAnchorSimT[idx] = simTimeS
+      alive[idx] = 1
+      retarget(idx, targetNodeId)
+      if (idx >= activeCount) activeCount = idx + 1
+      liveCount++
+      added++
+    }
+    return added
+  }
+
+  // Re-task RETURNING ambulances (empty-handed, heading home) to a new
+  // pickup target. Ambulances actively TRANSPORTING a patient are skipped —
+  // they must deliver first. Each keeps its home hospital.
+  function retaskReturningAmbulances(newDispatchId, targetArea, n) {
+    if (!targetArea || n <= 0) return 0
+    const targetLat = targetArea.lat
+    const targetLng = targetArea.lng
+    const targetRadiusM = Math.max(30, +targetArea.radius || AMBULANCE_SEARCH_RADIUS_M)
+    const targetNodeId = roadGraph.findNearestNode(targetLat, targetLng)
+    if (targetNodeId == null) return 0
+    let retasked = 0
+    for (let i = 0; i < activeCount && retasked < n; i++) {
+      if (!alive[i] || kind[i] !== 2) continue
+      if (ambRole[i] !== AMB_ROLE_RETURNING) continue
+      // Sanity: returning ambulances should never have patients, but guard
+      // anyway in case of a logic shift.
+      if (Array.isArray(ambPatients[i]) && ambPatients[i].length > 0) continue
+      ambRole[i] = AMB_ROLE_EN_ROUTE
+      ambDispatchId[i] = newDispatchId
+      ambSearchLat[i] = targetLat
+      ambSearchLng[i] = targetLng
+      ambSearchRadiusM[i] = targetRadiusM
+      ambPatrolNextAt[i] = 0
+      ambPerceptionNextAt[i] = 0
+      ambPatrolStartedAt[i] = 0
+      ambTargetVictim[i] = -1
+      states[i] = 'amb_driving'
+      retarget(i, targetNodeId)
+      retasked++
+    }
+    return retasked
+  }
+
+  function recallAmbulances(dispatchId) {
+    let n = 0
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i]) continue
+      if (kind[i] !== 2) continue
+      if (ambDispatchId[i] !== dispatchId) continue
+      // Drop any patients in place — operator's call to recall mid-transport
+      // has consequences. Patients keep their current injury.
+      for (const pIdx of ambPatients[i]) {
+        if (pIdx >= 0 && pIdx < capacity) {
+          inAmbulanceIdx[pIdx] = -1
+          hidden[pIdx] = 0
+          lats[pIdx] = lats[i]
+          lngs[pIdx] = lngs[i]
+        }
+      }
+      ambPatients[i] = []
+      ambRole[i] = AMB_ROLE_RETURNING
+      ambTargetVictim[i] = -1
+      states[i] = 'amb_driving'
+      const homeId = roadGraph.findNearestNode(ambHomeLat[i], ambHomeLng[i])
+      if (homeId != null) retarget(i, homeId)
+      n++
+    }
+    return n
+  }
+
+  // Find the nearest patient an ambulance should rescue, within
+  // AMBULANCE_PERCEPTION_M. Returns the citizen idx or -1.
+  //
+  // Rules:
+  //   * Fainted citizens always need pickup (unconscious; can't self-recover
+  //     while the disaster is active and will eventually die without help).
+  //   * Affected (still self-aware) citizens are picked up only if their HP
+  //     has dropped past the heal threshold — above that they self-stabilise
+  //     and an ambulance trip would be wasted.
+  function findVisiblePatient(idx) {
+    let best = -1
+    let bestD = AMBULANCE_PERCEPTION_M
+    const myLat = lats[idx]
+    const myLng = lngs[idx]
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i] || kind[i] !== 0) continue
+      if (states[i] === 'dead' || states[i] === 'arrested') continue
+      if (inAmbulanceIdx[i] >= 0) continue
+      const s = states[i]
+      if (s === 'fainted') {
+        // Always a candidate.
+      } else if (s === 'affected' && health[i] < HP_HEAL_THRESHOLD) {
+        // Only if injured beyond the stable threshold.
+      } else {
+        continue
+      }
+      const d = distanceMeters(myLat, myLng, lats[i], lngs[i])
+      if (d <= bestD) { bestD = d; best = i }
+    }
+    return best
+  }
+
+  function tickAmbulance(idx, zoneIndex, zones, dtS) {
+    const role = ambRole[idx]
+
+    if (role === AMB_ROLE_EN_ROUTE) {
+      const dToCentre = distanceMeters(lats[idx], lngs[idx], ambSearchLat[idx], ambSearchLng[idx])
+      const arrived = dToCentre <= ambSearchRadiusM[idx] || (path[idx] && path[idx].length < 2)
+      if (arrived) {
+        ambRole[idx] = AMB_ROLE_SEARCHING
+        states[idx] = 'amb_searching'
+        ambPatrolNextAt[idx] = simTimeS
+        ambPatrolStartedAt[idx] = simTimeS
+      } else {
+        advanceAlongPath(idx, dtS, zones)
+      }
+      return
+    }
+
+    if (role === AMB_ROLE_SEARCHING) {
+      if (simTimeS >= ambPerceptionNextAt[idx]) {
+        ambPerceptionNextAt[idx] = simTimeS + 1.5
+        const victim = findVisiblePatient(idx)
+        if (victim >= 0) {
+          ambTargetVictim[idx] = victim
+          ambRole[idx] = AMB_ROLE_APPROACHING
+          states[idx] = 'amb_driving'
+          const nid = roadGraph.findNearestNode(lats[victim], lngs[victim])
+          if (nid != null) retarget(idx, nid)
+          return
+        }
+      }
+      // Auto-return after 90 s of fruitless patrol.
+      if (simTimeS - ambPatrolStartedAt[idx] > 90) {
+        ambRole[idx] = AMB_ROLE_RETURNING
+        states[idx] = 'amb_driving'
+        const hid = roadGraph.findNearestNode(ambHomeLat[idx], ambHomeLng[idx])
+        if (hid != null) retarget(idx, hid)
+        return
+      }
+      if (simTimeS >= ambPatrolNextAt[idx] || !path[idx] || path[idx].length < 2) {
+        ambPatrolNextAt[idx] = simTimeS + 6
+        const angle = Math.random() * Math.PI * 2
+        const r = Math.sqrt(Math.random()) * ambSearchRadiusM[idx]
+        const offLat = (Math.sin(angle) * r) / 111111
+        const offLng = (Math.cos(angle) * r) / (111111 * Math.cos((ambSearchLat[idx] * Math.PI) / 180))
+        const nid = roadGraph.findNearestNode(ambSearchLat[idx] + offLat, ambSearchLng[idx] + offLng)
+        if (nid != null) retarget(idx, nid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+
+    if (role === AMB_ROLE_APPROACHING) {
+      const victim = ambTargetVictim[idx]
+      const victimOk =
+        victim >= 0 && victim < capacity && alive[victim] && kind[victim] === 0 &&
+        states[victim] !== 'dead' && inAmbulanceIdx[victim] === -1 &&
+        (states[victim] === 'affected' || states[victim] === 'fainted')
+      if (!victimOk) {
+        ambTargetVictim[idx] = -1
+        ambRole[idx] = AMB_ROLE_SEARCHING
+        states[idx] = 'amb_searching'
+        ambPatrolNextAt[idx] = simTimeS
+        return
+      }
+      const d = distanceMeters(lats[idx], lngs[idx], lats[victim], lngs[victim])
+      if (d <= AMBULANCE_PICKUP_REACH_M) {
+        ambRole[idx] = AMB_ROLE_LOADING
+        states[idx] = 'amb_loading'
+        ambLoadStartedAt[idx] = simTimeS
+        return
+      }
+      // Re-retarget if the victim moved or our path ran out.
+      if (!path[idx] || path[idx].length < 2) {
+        const nid = roadGraph.findNearestNode(lats[victim], lngs[victim])
+        if (nid != null) retarget(idx, nid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+
+    if (role === AMB_ROLE_LOADING) {
+      if (simTimeS - ambLoadStartedAt[idx] < AMBULANCE_LOAD_SECONDS) return
+      const victim = ambTargetVictim[idx]
+      const victimOk =
+        victim >= 0 && victim < capacity && alive[victim] && kind[victim] === 0 &&
+        states[victim] !== 'dead' && inAmbulanceIdx[victim] === -1
+      if (victimOk) {
+        inAmbulanceIdx[victim] = idx
+        hidden[victim] = 1
+        ambPatients[idx].push(victim)
+      }
+      ambTargetVictim[idx] = -1
+      // If capacity left and another patient is in reach, scan again.
+      if (ambPatients[idx].length < ambCapacity[idx]) {
+        const next = findVisiblePatient(idx)
+        if (next >= 0) {
+          const dNext = distanceMeters(lats[idx], lngs[idx], lats[next], lngs[next])
+          if (dNext <= AMBULANCE_PICKUP_REACH_M) {
+            ambTargetVictim[idx] = next
+            ambRole[idx] = AMB_ROLE_LOADING
+            ambLoadStartedAt[idx] = simTimeS
+            return
+          }
+          ambTargetVictim[idx] = next
+          ambRole[idx] = AMB_ROLE_APPROACHING
+          states[idx] = 'amb_driving'
+          const nid = roadGraph.findNearestNode(lats[next], lngs[next])
+          if (nid != null) retarget(idx, nid)
+          return
+        }
+      }
+      // Head to hospital with whoever we have.
+      ambRole[idx] = AMB_ROLE_TRANSPORTING
+      states[idx] = 'amb_transporting'
+      const hid = roadGraph.findNearestNode(ambHomeLat[idx], ambHomeLng[idx])
+      if (hid != null) retarget(idx, hid)
+      return
+    }
+
+    if (role === AMB_ROLE_TRANSPORTING) {
+      const d = distanceMeters(lats[idx], lngs[idx], ambHomeLat[idx], ambHomeLng[idx])
+      if (d < 30) {
+        // Heal everyone on board and teleport them to a node near the hospital.
+        const homeLat = ambHomeLat[idx]
+        const homeLng = ambHomeLng[idx]
+        const M_PER_DEG_LAT = 111111
+        const M_PER_DEG_LNG = 111111 * Math.cos((homeLat * Math.PI) / 180)
+        for (const p of ambPatients[idx]) {
+          if (p < 0 || p >= capacity) continue
+          const theta = Math.random() * Math.PI * 2
+          const r = 30 + Math.random() * 50
+          const tLat = homeLat + (Math.sin(theta) * r) / M_PER_DEG_LAT
+          const tLng = homeLng + (Math.cos(theta) * r) / M_PER_DEG_LNG
+          const nid = roadGraph.findNearestNode(tLat, tLng) ?? roadGraph.findNearestNode(homeLat, homeLng)
+          const loc = nid != null ? roadGraph.nodeLocation(nid) : null
+          if (loc) { lats[p] = loc.lat; lngs[p] = loc.lng; currentNode[p] = nid }
+          health[p] = HP_MAX
+          injuryZoneId[p] = null
+          inAmbulanceIdx[p] = -1
+          hidden[p] = 0
+          states[p] = 'walking'
+          stateExpiresAt[p] = 0
+          causeZoneId[p] = null
+          recoveryAt[p] = 0
+          const nextId = pickRandomWalkNext(currentNode[p], null)
+          if (nextId != null) { targetNode[p] = nextId; path[p] = [currentNode[p], nextId] }
+          else { targetNode[p] = currentNode[p]; path[p] = [currentNode[p]] }
+        }
+        ambPatients[idx] = []
+        // Despawn ambulance + ack the hospital.
+        const stationId = ambHomeId[idx]
+        const dispatchId = ambDispatchId[idx]
+        alive[idx] = 0
+        lats[idx] = NaN
+        lngs[idx] = NaN
+        kind[idx] = 0
+        ambRole[idx] = 0
+        ambDispatchId[idx] = null
+        ambHomeId[idx] = null
+        liveCount--
+        if (onUnitReturned && stationId) {
+          try { onUnitReturned({ kind: 'ambulance', stationId, units: 1, dispatchId }) }
+          catch { /* ignore */ }
+        }
+        return
+      }
+      if (!path[idx] || path[idx].length < 2) {
+        const hid = roadGraph.findNearestNode(ambHomeLat[idx], ambHomeLng[idx])
+        if (hid != null) retarget(idx, hid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+
+    if (role === AMB_ROLE_RETURNING) {
+      const d = distanceMeters(lats[idx], lngs[idx], ambHomeLat[idx], ambHomeLng[idx])
+      if (d < 30) {
+        const stationId = ambHomeId[idx]
+        const dispatchId = ambDispatchId[idx]
+        alive[idx] = 0
+        lats[idx] = NaN
+        lngs[idx] = NaN
+        kind[idx] = 0
+        ambRole[idx] = 0
+        ambDispatchId[idx] = null
+        ambHomeId[idx] = null
+        liveCount--
+        if (onUnitReturned && stationId) {
+          try { onUnitReturned({ kind: 'ambulance', stationId, units: 1, dispatchId }) }
+          catch { /* ignore */ }
+        }
+        return
+      }
+      if (!path[idx] || path[idx].length < 2) {
+        const hid = roadGraph.findNearestNode(ambHomeLat[idx], ambHomeLng[idx])
+        if (hid != null) retarget(idx, hid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Police spawn / tick / recall
+  // ──────────────────────────────────────────────────────────────────
+
+  function spawnPolice(dispatchId, stationLoc, targetArea, n, _stationId) {
+    if (!stationLoc || !targetArea) return 0
+    const stationNodeId = roadGraph.findNearestNode(stationLoc.lat, stationLoc.lng)
+    const stationNode = stationNodeId != null ? roadGraph.nodeLocation(stationNodeId) : null
+    if (!stationNode) return 0
+    const targetLat = targetArea.lat
+    const targetLng = targetArea.lng
+    const targetRadiusM = Math.max(50, +targetArea.radius || POLICE_PATROL_DEFAULT_RADIUS_M)
+    const targetNodeId = roadGraph.findNearestNode(targetLat, targetLng)
+    if (targetNodeId == null) return 0
+    let added = 0
+    while (added < n) {
+      const idx = findFreeSlot()
+      if (idx < 0) break
+      lats[idx] = stationNode.lat
+      lngs[idx] = stationNode.lng
+      currentNode[idx] = stationNodeId
+      prevNode[idx] = null
+      causeZoneId[idx] = null
+      recoveryAt[idx] = 0
+      lastMovedSimT[idx] = simTimeS
+      totalMovedM[idx] = 0
+      retargetCount[idx] = 0
+      lastRetargetSimT[idx] = simTimeS
+      reportLog[idx].clear()
+      linkedZoneId[idx] = null
+      homeNode[idx] = null
+      returningHome[idx] = 0
+      kind[idx] = 3
+      resetHealth(idx)
+      states[idx] = 'police_driving'
+      stateExpiresAt[idx] = Infinity
+      policeRole[idx] = POLICE_ROLE_EN_ROUTE
+      policeHomeLat[idx] = stationNode.lat
+      policeHomeLng[idx] = stationNode.lng
+      policeHomeId[idx] = _stationId || null
+      policeDispatchId[idx] = dispatchId
+      policeSearchLat[idx] = targetLat
+      policeSearchLng[idx] = targetLng
+      policeSearchRadiusM[idx] = targetRadiusM
+      policePatrolNextAt[idx] = 0
+      policeIncidentLat[idx] = 0
+      policeIncidentLng[idx] = 0
+      policeIncidentArrivedAt[idx] = 0
+      policeSuspectIdx[idx] = -1
+      stuckAnchorLat[idx] = stationNode.lat
+      stuckAnchorLng[idx] = stationNode.lng
+      stuckAnchorSimT[idx] = simTimeS
+      alive[idx] = 1
+      retarget(idx, targetNodeId)
+      if (idx >= activeCount) activeCount = idx + 1
+      liveCount++
+      added++
+    }
+    return added
+  }
+
+  // Re-task RETURNING police officers to a new patrol target. Skips any
+  // officer carrying an arrestee (they must complete booking first).
+  function retaskReturningPolice(newDispatchId, targetArea, n) {
+    if (!targetArea || n <= 0) return 0
+    const targetLat = targetArea.lat
+    const targetLng = targetArea.lng
+    const targetRadiusM = Math.max(50, +targetArea.radius || POLICE_PATROL_DEFAULT_RADIUS_M)
+    const targetNodeId = roadGraph.findNearestNode(targetLat, targetLng)
+    if (targetNodeId == null) return 0
+    let retasked = 0
+    for (let i = 0; i < activeCount && retasked < n; i++) {
+      if (!alive[i] || kind[i] !== 3) continue
+      if (policeRole[i] !== POLICE_ROLE_RETURNING) continue
+      if (policeSuspectIdx[i] >= 0) continue
+      policeRole[i] = POLICE_ROLE_EN_ROUTE
+      policeDispatchId[i] = newDispatchId
+      policeSearchLat[i] = targetLat
+      policeSearchLng[i] = targetLng
+      policeSearchRadiusM[i] = targetRadiusM
+      policePatrolNextAt[i] = 0
+      states[i] = 'police_driving'
+      retarget(i, targetNodeId)
+      retasked++
+    }
+    return retasked
+  }
+
+  function recallPolice(dispatchId) {
+    let n = 0
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i]) continue
+      if (kind[i] !== 3) continue
+      if (policeDispatchId[i] !== dispatchId) continue
+      // If recalled while booking a suspect, the cop continues home (still
+      // ARRESTING) — releasing the suspect mid-transport would undermine the
+      // catch. Otherwise just send them home.
+      if (policeSuspectIdx[i] < 0) {
+        policeRole[i] = POLICE_ROLE_RETURNING
+        states[i] = 'police_driving'
+        const homeId = roadGraph.findNearestNode(policeHomeLat[i], policeHomeLng[i])
+        if (homeId != null) retarget(i, homeId)
+      }
+      n++
+    }
+    return n
+  }
+
+  function tickPolice(idx, zoneIndex, zones, dtS) {
+    const role = policeRole[idx]
+
+    if (role === POLICE_ROLE_EN_ROUTE) {
+      const d = distanceMeters(lats[idx], lngs[idx], policeSearchLat[idx], policeSearchLng[idx])
+      const arrived = d <= policeSearchRadiusM[idx] || (path[idx] && path[idx].length < 2)
+      if (arrived) {
+        policeRole[idx] = POLICE_ROLE_PATROL
+        states[idx] = 'police_patrolling'
+        policePatrolNextAt[idx] = simTimeS
+      } else {
+        advanceAlongPath(idx, dtS, zones)
+      }
+      return
+    }
+
+    if (role === POLICE_ROLE_PATROL) {
+      if (simTimeS >= policePatrolNextAt[idx] || !path[idx] || path[idx].length < 2) {
+        policePatrolNextAt[idx] = simTimeS + 6
+        const angle = Math.random() * Math.PI * 2
+        const r = Math.sqrt(Math.random()) * policeSearchRadiusM[idx]
+        const offLat = (Math.sin(angle) * r) / 111111
+        const offLng = (Math.cos(angle) * r) / (111111 * Math.cos((policeSearchLat[idx] * Math.PI) / 180))
+        const nid = roadGraph.findNearestNode(policeSearchLat[idx] + offLat, policeSearchLng[idx] + offLng)
+        if (nid != null) retarget(idx, nid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+
+    if (role === POLICE_ROLE_RETURNING) {
+      const d = distanceMeters(lats[idx], lngs[idx], policeHomeLat[idx], policeHomeLng[idx])
+      if (d < 30) {
+        const stationId = policeHomeId[idx]
+        const dispatchId = policeDispatchId[idx]
+        alive[idx] = 0
+        lats[idx] = NaN
+        lngs[idx] = NaN
+        kind[idx] = 0
+        policeRole[idx] = 0
+        policeDispatchId[idx] = null
+        policeHomeId[idx] = null
+        liveCount--
+        if (onUnitReturned && stationId) {
+          try { onUnitReturned({ kind: 'police', stationId, units: 1, dispatchId }) }
+          catch { /* ignore */ }
+        }
+        return
+      }
+      if (!path[idx] || path[idx].length < 2) {
+        const hid = roadGraph.findNearestNode(policeHomeLat[idx], policeHomeLng[idx])
+        if (hid != null) retarget(idx, hid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+
+    if (role === POLICE_ROLE_RESPONDING) {
+      const d = distanceMeters(lats[idx], lngs[idx], policeIncidentLat[idx], policeIncidentLng[idx])
+      if (d <= 30) {
+        if (policeIncidentArrivedAt[idx] === 0) {
+          policeIncidentArrivedAt[idx] = simTimeS
+          states[idx] = 'police_patrolling'   // stationary "talking to victims"
+        }
+        // Loiter ~10 s on scene, then resume patrol.
+        if (simTimeS - policeIncidentArrivedAt[idx] >= 10) {
+          policeRole[idx] = POLICE_ROLE_PATROL
+          states[idx] = 'police_patrolling'
+          policePatrolNextAt[idx] = simTimeS
+          policeIncidentArrivedAt[idx] = 0
+        }
+        return
+      }
+      if (!path[idx] || path[idx].length < 2) {
+        const nid = roadGraph.findNearestNode(policeIncidentLat[idx], policeIncidentLng[idx])
+        if (nid != null) retarget(idx, nid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+
+    if (role === POLICE_ROLE_ARRESTING) {
+      const suspect = policeSuspectIdx[idx]
+      // Suspect vanished (despawned by some other path)? Drop role and patrol.
+      if (suspect < 0 || suspect >= capacity || !alive[suspect]) {
+        policeSuspectIdx[idx] = -1
+        policeRole[idx] = POLICE_ROLE_PATROL
+        states[idx] = 'police_patrolling'
+        policePatrolNextAt[idx] = simTimeS
+        return
+      }
+      const dToHome = distanceMeters(lats[idx], lngs[idx], policeHomeLat[idx], policeHomeLng[idx])
+      if (dToHome < 30) {
+        // Booked: despawn the suspect entirely.
+        alive[suspect] = 0
+        lats[suspect] = NaN
+        lngs[suspect] = NaN
+        hidden[suspect] = 0
+        inPoliceCustody[suspect] = -1
+        states[suspect] = 'arrested'
+        liveCount--
+        policeSuspectIdx[idx] = -1
+        // Cop returns to patrol; the auto-patrol effect handles capacity if
+        // this was an auto-deployed unit.
+        policeRole[idx] = POLICE_ROLE_PATROL
+        states[idx] = 'police_patrolling'
+        policePatrolNextAt[idx] = simTimeS
+        return
+      }
+      if (!path[idx] || path[idx].length < 2) {
+        const hid = roadGraph.findNearestNode(policeHomeLat[idx], policeHomeLng[idx])
+        if (hid != null) retarget(idx, hid)
+      }
+      advanceAlongPath(idx, dtS, zones)
+      return
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────
+  // Robbery trigger — operator right-clicks a citizen to commit a crime.
+  // ──────────────────────────────────────────────────────────────────
+
+  // Dispatch the single nearest available officer to a crime scene to
+  // "talk to victims". The officer drives there, loiters ~10 s, and
+  // returns to patrol. Returns the officer's slot index, or -1 if no
+  // officer was available.
+  function respondToCrime(sceneLat, sceneLng) {
+    let best = -1
+    let bestD = Infinity
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i] || kind[i] !== 3) continue
+      if (policeSuspectIdx[i] >= 0) continue                  // already booking a suspect
+      if (policeRole[i] === POLICE_ROLE_RETURNING) continue   // off duty
+      if (policeRole[i] === POLICE_ROLE_RESPONDING) continue  // on another call
+      if (policeRole[i] === POLICE_ROLE_ARRESTING) continue
+      const d = distanceMeters(sceneLat, sceneLng, lats[i], lngs[i])
+      if (d < bestD) { bestD = d; best = i }
+    }
+    if (best < 0) return -1
+    policeRole[best] = POLICE_ROLE_RESPONDING
+    policeIncidentLat[best] = sceneLat
+    policeIncidentLng[best] = sceneLng
+    policeIncidentArrivedAt[best] = 0
+    states[best] = 'police_responding'
+    const nid = roadGraph.findNearestNode(sceneLat, sceneLng)
+    if (nid != null) retarget(best, nid)
+    return best
+  }
+
+  function triggerRobbery(criminalIdx, level) {
+    if (criminalIdx < 0 || criminalIdx >= capacity) return { result: 'invalid' }
+    if (!alive[criminalIdx] || kind[criminalIdx] !== 0) return { result: 'invalid' }
+    if (states[criminalIdx] === 'affected' || states[criminalIdx] === 'fainted' ||
+        states[criminalIdx] === 'dead' || states[criminalIdx] === 'arrested') {
+      return { result: 'invalid' }
+    }
+    const cLat = lats[criminalIdx]
+    const cLng = lngs[criminalIdx]
+    const crimeId = `crime:${criminalIdx}:${Math.floor(simTimeS)}`
+
+    // ── Catch path ────────────────────────────────────────────────
+    // Any kind===3 within POLICE_INTERVENTION_RADIUS_M that isn't already
+    // booking a suspect catches this one. The cop hides the criminal and
+    // drives them home; on arrival at the station, the criminal despawns.
+    let nearestCop = -1
+    let nearestCopD = POLICE_INTERVENTION_RADIUS_M
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i] || kind[i] !== 3) continue
+      if (policeSuspectIdx[i] >= 0) continue
+      const d = distanceMeters(cLat, cLng, lats[i], lngs[i])
+      if (d <= nearestCopD) { nearestCopD = d; nearestCop = i }
+    }
+    if (nearestCop >= 0) {
+      states[criminalIdx] = 'arrested'
+      stateExpiresAt[criminalIdx] = Infinity
+      hidden[criminalIdx] = 1
+      inPoliceCustody[criminalIdx] = nearestCop
+      causeZoneId[criminalIdx] = null
+      injuryZoneId[criminalIdx] = null
+      policeSuspectIdx[nearestCop] = criminalIdx
+      policeRole[nearestCop] = POLICE_ROLE_ARRESTING
+      states[nearestCop] = 'police_arresting'
+      const hid = roadGraph.findNearestNode(policeHomeLat[nearestCop], policeHomeLng[nearestCop])
+      if (hid != null) retarget(nearestCop, hid)
+      if (onCriminalCaught) {
+        try { onCriminalCaught({ criminalIdx, policeIdx: nearestCop, level }) }
+        catch { /* ignore */ }
+      }
+      // No 911 call: the cop is already on the scene. The dashboard's
+      // onCriminalCaught hook handles operator-facing feedback.
+      return { result: 'caught', policeIdx: nearestCop, crimeId }
+    }
+
+    // ── Commit path ───────────────────────────────────────────────
+    // No police nearby — roll injury, then the victim or a witness calls 911.
+    const chance = level === 1 ? ROBBERY_L1_INJURE_CHANCE : ROBBERY_L2_INJURE_CHANCE
+    let victimIdx = -1
+    if (Math.random() < chance) {
+      let best = -1
+      let bestD = ROBBERY_VICTIM_RADIUS_M
+      for (let i = 0; i < activeCount; i++) {
+        if (i === criminalIdx) continue
+        if (!alive[i] || kind[i] !== 0) continue
+        if (states[i] === 'dead' || states[i] === 'arrested') continue
+        if (states[i] === 'affected' || states[i] === 'fainted') continue
+        const d = distanceMeters(cLat, cLng, lats[i], lngs[i])
+        if (d < bestD) { bestD = d; best = i }
+      }
+      if (best >= 0) {
+        victimIdx = best
+        if (level === 1) {
+          states[best] = 'affected'
+          health[best] = ROBBERY_L1_INITIAL_HP
+        } else {
+          states[best] = 'fainted'
+          health[best] = ROBBERY_L2_INITIAL_HP
+        }
+        stateExpiresAt[best] = Infinity
+        injuryZoneId[best] = crimeId
+        causeZoneId[best] = null
+      }
+    }
+    // Criminal flees briefly then resumes walking. They never report the
+    // crime themselves — that's what the victim or a witness is for.
+    states[criminalIdx] = 'fleeing'
+    stateExpiresAt[criminalIdx] = simTimeS + 3
+
+    // Pick the reporter:
+    //   * If a victim was hurt → they call it in (transcript reflects injury).
+    //   * Otherwise → find the nearest walking bystander within 80 m to witness.
+    //   * If neither exists → no 911 call (silent crime; rare).
+    let reporterIdx = -1
+    let transcript = null
+    let reportKind = 'observation'
+    if (victimIdx >= 0) {
+      reporterIdx = victimIdx
+      reportKind = level === 1 ? 'observation' : 'affected'
+      transcript = level === 1
+        ? `Help — I've just been pickpocketed near ${cLat.toFixed(4)}, ${cLng.toFixed(4)}.`
+        : `Help! I've been mugged near ${cLat.toFixed(4)}, ${cLng.toFixed(4)} — I'm hurt.`
+    } else {
+      let wBest = -1
+      let wD = 80
+      for (let i = 0; i < activeCount; i++) {
+        if (i === criminalIdx) continue
+        if (!alive[i] || kind[i] !== 0) continue
+        if (states[i] !== 'walking') continue
+        const d = distanceMeters(cLat, cLng, lats[i], lngs[i])
+        if (d < wD) { wD = d; wBest = i }
+      }
+      if (wBest >= 0) {
+        reporterIdx = wBest
+        reportKind = 'observation'
+        transcript = `Bystander reports a robbery near ${cLat.toFixed(4)}, ${cLng.toFixed(4)} — suspect fled the scene.`
+      }
+    }
+    if (reporterIdx >= 0) {
+      onReport?.({
+        event_id: crimeId,
+        citizen_idx: reporterIdx,
+        report_kind: reportKind,
+        location: { lat: lats[reporterIdx], lng: lngs[reporterIdx] },
+        transcript,
+        perceived_severity: level,
+      })
+    }
+
+    // Dispatch one officer to the scene to investigate.
+    const responder = respondToCrime(cLat, cLng)
+    return { result: 'committed', injuredIdx: victimIdx, crimeId, reporterIdx, responderIdx: responder }
   }
 
   // Set of dispatch ids with at least one alive truck. The dashboard polls
@@ -1725,9 +2822,50 @@ export function createCitizenEngine({
     return ids
   }
 
+  function getActiveAmbulanceDispatchIds() {
+    const ids = new Set()
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i] || kind[i] !== 2) continue
+      const did = ambDispatchId[i]
+      if (did) ids.add(did)
+    }
+    return ids
+  }
+
+  function getActivePoliceDispatchIds() {
+    const ids = new Set()
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i] || kind[i] !== 3) continue
+      const did = policeDispatchId[i]
+      if (did) ids.add(did)
+    }
+    return ids
+  }
+
+  // Per-station count of currently-deployed officers spawned with an `auto-`
+  // dispatch id prefix. Used by the dashboard's ~50% auto-patrol effect to
+  // decide whether to top up.
+  function getAutoPoliceCounts() {
+    const out = new Map()
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i] || kind[i] !== 3) continue
+      const did = policeDispatchId[i]
+      if (typeof did !== 'string' || !did.startsWith('auto-')) continue
+      const sid = policeHomeId[i]
+      if (!sid) continue
+      out.set(sid, (out.get(sid) || 0) + 1)
+    }
+    return out
+  }
+
   return {
     start, stop, setSpeed, tick, snapshot,
     getZoneWaves, getCitizenStats, getCurrentTime,
-    spawnFleeingCitizens, spawnFireTrucks, recallTrucks, getActiveDispatchIds, subscribe,
+    spawnFleeingCitizens,
+    spawnFireTrucks, recallTrucks, getActiveDispatchIds, retaskReturningTrucks,
+    spawnAmbulances, recallAmbulances, getActiveAmbulanceDispatchIds, retaskReturningAmbulances,
+    spawnPolice, recallPolice, getActivePoliceDispatchIds, getAutoPoliceCounts, retaskReturningPolice,
+    triggerRobbery, respondToCrime,
+    subscribe,
   }
 }

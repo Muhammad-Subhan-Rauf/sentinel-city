@@ -33,6 +33,7 @@ function formatUsd(n: number): string {
 
 export default function AdminSavingsScreen() {
   const [summary, setSummary] = useState<SavingsSummary | null>(null);
+  const [injured, setInjured] = useState<{ injured_estimate: number; contributing_events: number } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [activeMetric, setActiveMetric] = useState<Metric | null>(null);
   const [insight, setInsight] = useState<SavingsInsight | null>(null);
@@ -41,9 +42,12 @@ export default function AdminSavingsScreen() {
   const load = async () => {
     setRefreshing(true);
     try {
-      setSummary(await api.savingsSummary());
-    } catch {
-      /* ignore */
+      const [s, i] = await Promise.all([
+        api.savingsSummary().catch(() => null),
+        api.statsInjured().catch(() => null),
+      ]);
+      if (s) setSummary(s);
+      if (i) setInjured(i);
     } finally {
       setRefreshing(false);
     }
@@ -87,6 +91,18 @@ export default function AdminSavingsScreen() {
               label="Lives saved"
               value={summary.lives_saved.toLocaleString()}
               accent={METRIC_ACCENT.lives}
+              onPress={() => openInsight('lives')}
+            />
+            <StatCard
+              label="Injured (active events)"
+              value={
+                injured
+                  ? `${injured.injured_estimate.toLocaleString()}${
+                      injured.contributing_events > 0 ? ` · ${injured.contributing_events} event${injured.contributing_events === 1 ? '' : 's'}` : ''
+                    }`
+                  : '—'
+              }
+              accent={colors.danger}
               onPress={() => openInsight('lives')}
             />
             <StatCard

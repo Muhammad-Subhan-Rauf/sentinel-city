@@ -1,13 +1,13 @@
-// Shared map view used by Citizen and Worker screens. Renders:
+// Shared map view used by Citizen, Worker, and Admin Calls screens. Renders:
 //   - "me" marker (large, pulsing, role-coloured ring) so the user can find self
-//   - other mobile users (citizens only visible to workers/admin, not to citizens)
-//   - active disasters as coloured polygons / circles
-//   - active notifications & cordons as warning polygons
-//   - optional route polyline (citizen rerouting)
+//   - other mobile users (only when showOtherUsers is true)
+//   - active notifications & cordons as hazard polygons (yellow / orange)
+//   - optional destination + route polyline
+//   - optional report pins (admin Calls screen)
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { StyleSheet, View, Text } from 'react-native';
-import MapView, { Marker, Polygon, Polyline, Circle, PROVIDER_GOOGLE } from 'react-native-maps';
+import { Platform, StyleSheet, View, Text } from 'react-native';
+import MapView, { Marker, Polygon, Polyline, Circle, UrlTile } from 'react-native-maps';
 import type { Region } from 'react-native-maps';
 import { api, MobileCitizen, MobileWorker, Notification, Cordon, Route } from '@/lib/api';
 import { colors, roleAccent } from '@/lib/colors';
@@ -19,17 +19,33 @@ const MANHATTAN: Region = {
   longitudeDelta: 0.06,
 };
 
+const CARTODB_DARK_URL = 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png';
+
+export type DisasterMapPin = {
+  id: string;
+  lat: number;
+  lng: number;
+  label: string;
+};
+
 type Props = {
   myLocation: { lat: number; lng: number } | null;
-  myRole: 'citizen' | 'worker';
+  myRole: 'citizen' | 'worker' | 'admin';
   myUserId: string;
-  // When true (worker mode), other citizens & workers are drawn.
-  // When false (citizen mode), no other users are drawn — Google-Maps style.
   showOtherUsers: boolean;
-  // Optional destination + route to draw.
   destination?: { lat: number; lng: number } | null;
   route?: Route | null;
   onMapPress?: (lat: number, lng: number) => void;
+  onPolygonPress?: (eventId: string | null, label: string) => void;
+  pins?: DisasterMapPin[];
+};
+
+type PolygonItem = {
+  id: string;
+  coords: Array<{ latitude: number; longitude: number }>;
+  color: string;
+  label: string;
+  eventId: string | null;
 };
 
 function polygonToCoords(geometry: any): Array<{ latitude: number; longitude: number }> {
@@ -46,8 +62,9 @@ export function DisasterMap({
   destination,
   route,
   onMapPress,
+  onPolygonPress,
+  pins,
 }: Props) {
-  // Live data — polled every 3 s to match the web app's cadence.
   const [notifs, setNotifs] = useState<Notification[]>([]);
   const [cordons, setCordons] = useState<Cordon[]>([]);
   const [citizens, setCitizens] = useState<MobileCitizen[]>([]);
@@ -61,7 +78,7 @@ export function DisasterMap({
           api.listNotifications().catch(() => []),
           api.listCordons().catch(() => []),
           showOtherUsers ? api.listCitizens().catch(() => []) : Promise.resolve([]),
-          api.listWorkers().catch(() => []),
+          showOtherUsers ? api.listWorkers().catch(() => []) : Promise.resolve([]),
         ]);
         if (cancelled) return;
         setNotifs(notifs);
@@ -80,14 +97,18 @@ export function DisasterMap({
     };
   }, [showOtherUsers]);
 
-  // Disasters are currently not exposed via a list endpoint; they are
-  // observable via active notifications + cordons (which the web operator
-  // wraps around them). We render those as the disaster overlay.
-  const polygons = useMemo(() => {
-    const merged: Array<{ id: string; coords: any[]; color: string; label: string }> = [];
+  const polygons = useMemo<PolygonItem[]>(() => {
+    const merged: PolygonItem[] = [];
     for (const n of notifs) {
       const coords = polygonToCoords(n.geometry);
-      if (coords.length) merged.push({ id: `n-${n.id}`, coords, color: colors.danger, label: n.reason });
+      if (coords.length)
+        merged.push({
+          id: `n-${n.id}`,
+          coords,
+          color: colors.hazardNotification,
+          label: n.reason,
+          eventId: n.event_id ?? null,
+        });
     }
     for (const c of cordons) {
       const coords = polygonToCoords(c.geometry);
@@ -95,8 +116,9 @@ export function DisasterMap({
         merged.push({
           id: `c-${c.id}`,
           coords,
-          color: colors.warning,
+          color: colors.hazardCordon,
           label: c.reason ?? 'Cordon',
+          eventId: c.event_id ?? null,
         });
     }
     return merged;
@@ -106,19 +128,25 @@ export function DisasterMap({
     ? { latitude: myLocation.lat, longitude: myLocation.lng, latitudeDelta: 0.04, longitudeDelta: 0.04 }
     : MANHATTAN;
 
+  // On Android, suppress Google's default base so the CartoDB tile overlay
+  // becomes the only visible basemap. iOS handles this implicitly via Apple Maps.
+  const mapTypeProp = Platform.OS === 'android' ? { mapType: 'none' as const } : {};
+
   return (
     <View style={styles.container}>
       <MapView
         style={StyleSheet.absoluteFillObject}
-        provider={PROVIDER_GOOGLE}
         initialRegion={initialRegion}
         showsUserLocation={false}
         showsCompass
+        {...mapTypeProp}
         onPress={(e) => {
           const { latitude, longitude } = e.nativeEvent.coordinate;
           onMapPress?.(latitude, longitude);
         }}
       >
+        <UrlTile urlTemplate={CARTODB_DARK_URL} maximumZ={19} flipY={false} zIndex={-1} />
+
         {/* Hazard polygons (notifications + cordons) */}
         {polygons.map((p) => (
           <Polygon
@@ -127,6 +155,19 @@ export function DisasterMap({
             strokeColor={p.color}
             fillColor={`${p.color}33`}
             strokeWidth={2}
+            tappable
+            onPress={() => onPolygonPress?.(p.eventId, p.label)}
+          />
+        ))}
+
+        {/* Citizen-report pins (admin Calls screen) */}
+        {pins?.map((pin) => (
+          <Marker
+            key={pin.id}
+            coordinate={{ latitude: pin.lat, longitude: pin.lng }}
+            title="Citizen report"
+            description={pin.label}
+            pinColor={colors.info}
           />
         ))}
 
@@ -143,17 +184,18 @@ export function DisasterMap({
                 pinColor={colors.citizen}
               />
             ))}
-        {workers
-          .filter((w) => w.id !== myUserId)
-          .map((w) => (
-            <Marker
-              key={w.id}
-              coordinate={{ latitude: w.lat, longitude: w.lng }}
-              title={w.name}
-              description={`${w.role} · ${w.status}`}
-              pinColor={colors.worker}
-            />
-          ))}
+        {showOtherUsers &&
+          workers
+            .filter((w) => w.id !== myUserId)
+            .map((w) => (
+              <Marker
+                key={w.id}
+                coordinate={{ latitude: w.lat, longitude: w.lng }}
+                title={w.name}
+                description={`${w.role} · ${w.status}`}
+                pinColor={colors.worker}
+              />
+            ))}
 
         {/* Destination */}
         {destination && (
@@ -173,7 +215,7 @@ export function DisasterMap({
           />
         )}
 
-        {/* "Me" — large ring + dot so the user can spot themselves quickly */}
+        {/* "Me" */}
         {myLocation && (
           <>
             <Circle
@@ -186,7 +228,7 @@ export function DisasterMap({
             <Marker
               coordinate={{ latitude: myLocation.lat, longitude: myLocation.lng }}
               title="You"
-              description={myRole === 'citizen' ? 'Citizen' : 'Emergency Worker'}
+              description={myRole === 'citizen' ? 'Citizen' : myRole === 'worker' ? 'Emergency Worker' : 'Operator'}
               pinColor={roleAccent(myRole)}
             />
           </>

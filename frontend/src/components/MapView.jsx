@@ -82,9 +82,9 @@ function RouteLayer({ route, waypoints }) {
   return null
 }
 
-// ── Fire Station Markers ─────────────────────────────────────
-// Plain Leaflet DivIcon markers showing 🚒 + station name. No interaction.
-function FireStationMarkers({ stations }) {
+// ── Station Markers (fire / hospital / police) ───────────────
+// Plain Leaflet DivIcon markers showing an emoji + name. No interaction.
+function StationMarkers({ stations, emoji, className }) {
   const map = useMap()
   const layersRef = useRef([])
 
@@ -94,8 +94,8 @@ function FireStationMarkers({ stations }) {
     layersRef.current = []
     for (const s of stations) {
       const icon = L.divIcon({
-        className: 'fire-station-marker',
-        html: `<div style="font-size:20px;line-height:20px;text-shadow:0 1px 2px #000;">🚒</div>`,
+        className,
+        html: `<div style="font-size:20px;line-height:20px;text-shadow:0 1px 2px #000;">${emoji}</div>`,
         iconSize: [24, 24],
         iconAnchor: [12, 12],
       })
@@ -107,8 +107,18 @@ function FireStationMarkers({ stations }) {
       for (const m of layersRef.current) map.removeLayer(m)
       layersRef.current = []
     }
-  }, [map, stations])
+  }, [map, stations, emoji, className])
   return null
+}
+
+function FireStationMarkers({ stations }) {
+  return <StationMarkers stations={stations} emoji="🚒" className="fire-station-marker" />
+}
+function HospitalMarkers({ stations }) {
+  return <StationMarkers stations={stations} emoji="🏥" className="hospital-marker" />
+}
+function PoliceStationMarkers({ stations }) {
+  return <StationMarkers stations={stations} emoji="🚓" className="police-station-marker" />
 }
 
 // ── Mobile Users Layer ───────────────────────────────────────
@@ -219,7 +229,7 @@ function StationPlacer({ mode, onPlace }) {
 // Shows the operator's pending search-area circle (centre + radius) while
 // they're staging a dispatch. Trucks will drive to this circle and patrol
 // inside it scanning for smoke. Cleared once the dispatch is sent.
-function DispatchTargetCircle({ target }) {
+function DispatchTargetCircle({ target, color = '#fbbf24' }) {
   const map = useMap()
   const circleRef = useRef(null)
   useEffect(() => {
@@ -231,10 +241,10 @@ function DispatchTargetCircle({ target }) {
       return
     }
     const style = {
-      color: '#fbbf24',
+      color,
       weight: 2,
       dashArray: '6 6',
-      fillColor: '#fbbf24',
+      fillColor: color,
       fillOpacity: 0.1,
       interactive: false,
     }
@@ -246,7 +256,7 @@ function DispatchTargetCircle({ target }) {
       circleRef.current.setStyle(style)
     }
     return undefined
-  }, [map, target])
+  }, [map, target, color])
   useEffect(() => () => {
     if (circleRef.current) {
       map.removeLayer(circleRef.current)
@@ -261,16 +271,16 @@ function DispatchTargetCircle({ target }) {
 // trucks were sent and persists until the dispatch is recalled or its fire
 // is resolved. Renders dimmer than the pending pre-dispatch circle so they
 // read as "in progress" rather than "stage-and-send".
-function ActiveDispatchCircles({ dispatches }) {
+function ActiveDispatchCircles({ dispatches, color = '#fbbf24' }) {
   const map = useMap()
   const circlesRef = useRef(new Map())
   useEffect(() => {
     const live = new Set()
     const style = {
-      color: '#fbbf24',
+      color,
       weight: 1.5,
       dashArray: '2 6',
-      fillColor: '#fbbf24',
+      fillColor: color,
       fillOpacity: 0.05,
       interactive: false,
     }
@@ -293,7 +303,7 @@ function ActiveDispatchCircles({ dispatches }) {
         circlesRef.current.delete(id)
       }
     }
-  }, [map, dispatches])
+  }, [map, dispatches, color])
   useEffect(() => () => {
     for (const c of circlesRef.current.values()) map.removeLayer(c)
     circlesRef.current.clear()
@@ -737,17 +747,36 @@ export default function MapView({
   showCameras = false, showIntersections = false,
   city = null, route = null,
   waypoints = { start: null, end: null }, waypointMode = null, onWaypointPick,
-  citizenEngine = null, focusPoint = null, onCitizenClick,
-  // Emergency-services props
+  citizenEngine = null, focusPoint = null, onCitizenClick, onCitizenContextMenu,
+  // Emergency-services props — fire
   fireStations = [],
   stationPlacementMode = false,
   onStationPlace,
+  // Emergency-services props — medical
+  hospitals = [],
+  hospitalPlacementMode = false,
+  onHospitalPlace,
+  // Emergency-services props — police
+  policeStations = [],
+  policePlacementMode = false,
+  onPolicePlace,
   notifications = [],
   cordons = [],
+  // Fire-truck dispatch
   dispatchTargetMode = false,
   dispatchTarget = null,
   activeDispatches = [],
   onDispatchTargetPick,
+  // Ambulance dispatch
+  ambDispatchTargetMode = false,
+  ambDispatchTarget = null,
+  activeAmbulanceDispatches = [],
+  onAmbDispatchTargetPick,
+  // Police dispatch
+  policeDispatchTargetMode = false,
+  policeDispatchTarget = null,
+  activePoliceDispatches = [],
+  onPoliceDispatchTargetPick,
   polygonDrawKind = null, // 'notification' | 'cordon' | null
   onPolygonDraw,
 }) {
@@ -782,7 +811,13 @@ export default function MapView({
       <CameraOverlay enabled={showCameras} />
       <IntersectionOverlay enabled={showIntersections} />
       {citizenEngine && <WaveLayer engine={citizenEngine} />}
-      {citizenEngine && <CitizenLayer engine={citizenEngine} onCitizenClick={onCitizenClick} />}
+      {citizenEngine && (
+        <CitizenLayer
+          engine={citizenEngine}
+          onCitizenClick={onCitizenClick}
+          onCitizenContextMenu={onCitizenContextMenu}
+        />
+      )}
       <GeomanControls
         zones={zones}
         onZoneAdd={onZoneAdd}
@@ -793,11 +828,21 @@ export default function MapView({
       <RouteLayer route={route} waypoints={waypoints} />
       <WaypointPicker mode={waypointMode} onPick={onWaypointPick} />
       <FireStationMarkers stations={fireStations} />
+      <HospitalMarkers stations={hospitals} />
+      <PoliceStationMarkers stations={policeStations} />
       <MobileUsersLayer />
       <StationPlacer mode={stationPlacementMode} onPlace={onStationPlace} />
+      <StationPlacer mode={hospitalPlacementMode} onPlace={onHospitalPlace} />
+      <StationPlacer mode={policePlacementMode} onPlace={onPolicePlace} />
       <StationPlacer mode={dispatchTargetMode} onPlace={onDispatchTargetPick} />
+      <StationPlacer mode={ambDispatchTargetMode} onPlace={onAmbDispatchTargetPick} />
+      <StationPlacer mode={policeDispatchTargetMode} onPlace={onPoliceDispatchTargetPick} />
       <DispatchTargetCircle target={dispatchTarget} />
+      <DispatchTargetCircle target={ambDispatchTarget} color="#fb7185" />
+      <DispatchTargetCircle target={policeDispatchTarget} color="#3b82f6" />
       <ActiveDispatchCircles dispatches={activeDispatches} />
+      <ActiveDispatchCircles dispatches={activeAmbulanceDispatches} color="#fb7185" />
+      <ActiveDispatchCircles dispatches={activePoliceDispatches} color="#3b82f6" />
       <PolygonOverlay
         items={notifications}
         style={{ color: '#fbbf24', weight: 2, fillColor: '#fbbf24', fillOpacity: 0.15 }}

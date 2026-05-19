@@ -205,6 +205,42 @@ STEPS: list[tuple[str, str]] = [
         "Index citizen_reports.reported_at",
         "CREATE INDEX IF NOT EXISTS idx_citizen_reports_recent ON citizen_reports (reported_at DESC);",
     ),
+    (
+        "Add fire_stations.truck_count",
+        "ALTER TABLE fire_stations ADD COLUMN IF NOT EXISTS truck_count INTEGER NOT NULL DEFAULT 4;",
+    ),
+    (
+        "Add fire_stations.trucks_dispatched",
+        "ALTER TABLE fire_stations ADD COLUMN IF NOT EXISTS trucks_dispatched INTEGER NOT NULL DEFAULT 0;",
+    ),
+    (
+        "Create hospitals table",
+        """
+        CREATE TABLE IF NOT EXISTS hospitals (
+            id                    UUID PRIMARY KEY,
+            name                  TEXT,
+            lat                   DOUBLE PRECISION NOT NULL,
+            lng                   DOUBLE PRECISION NOT NULL,
+            ambulance_count       INTEGER NOT NULL DEFAULT 3,
+            ambulances_dispatched INTEGER NOT NULL DEFAULT 0,
+            created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """,
+    ),
+    (
+        "Create police_stations table",
+        """
+        CREATE TABLE IF NOT EXISTS police_stations (
+            id                UUID PRIMARY KEY,
+            name              TEXT,
+            lat               DOUBLE PRECISION NOT NULL,
+            lng               DOUBLE PRECISION NOT NULL,
+            police_count      INTEGER NOT NULL DEFAULT 10,
+            police_dispatched INTEGER NOT NULL DEFAULT 0,
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """,
+    ),
 ]
 
 

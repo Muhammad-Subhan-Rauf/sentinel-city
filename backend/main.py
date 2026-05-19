@@ -133,6 +133,10 @@ def _bootstrap_schema() -> None:
                     );
                 """)
                 cur.execute("""
+                    ALTER TABLE notifications
+                    ADD COLUMN IF NOT EXISTS event_id UUID;
+                """)
+                cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_notifications_active
                         ON notifications (status)
                         WHERE status = 'active';
@@ -147,9 +151,43 @@ def _bootstrap_schema() -> None:
                     );
                 """)
                 cur.execute("""
+                    ALTER TABLE cordons
+                    ADD COLUMN IF NOT EXISTS event_id UUID;
+                """)
+                cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_cordons_active
                         ON cordons (status)
                         WHERE status = 'active';
+                """)
+                cur.execute("""
+                    ALTER TABLE fire_stations
+                    ADD COLUMN IF NOT EXISTS truck_count INTEGER NOT NULL DEFAULT 4;
+                """)
+                cur.execute("""
+                    ALTER TABLE fire_stations
+                    ADD COLUMN IF NOT EXISTS trucks_dispatched INTEGER NOT NULL DEFAULT 0;
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS hospitals (
+                        id                    UUID PRIMARY KEY,
+                        name                  TEXT,
+                        lat                   DOUBLE PRECISION NOT NULL,
+                        lng                   DOUBLE PRECISION NOT NULL,
+                        ambulance_count       INTEGER NOT NULL DEFAULT 3,
+                        ambulances_dispatched INTEGER NOT NULL DEFAULT 0,
+                        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS police_stations (
+                        id                UUID PRIMARY KEY,
+                        name              TEXT,
+                        lat               DOUBLE PRECISION NOT NULL,
+                        lng               DOUBLE PRECISION NOT NULL,
+                        police_count      INTEGER NOT NULL DEFAULT 10,
+                        police_dispatched INTEGER NOT NULL DEFAULT 0,
+                        created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
                 """)
         conn.close()
         print("[schema] citizen_reports ready.")
@@ -276,27 +314,64 @@ class FireStationPayload(BaseModel):
     name: Optional[str] = None
     lat: float
     lng: float
+    truck_count: Optional[int] = Field(None, ge=0, le=50)
+
+
+class HospitalPayload(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    lat: float
+    lng: float
+    ambulance_count: Optional[int] = Field(None, ge=0, le=50)
+
+
+class PoliceStationPayload(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    lat: float
+    lng: float
+    police_count: Optional[int] = Field(None, ge=0, le=100)
+
+
+class StationCountUpdate(BaseModel):
+    # PATCH body to change a station's capacity cap.
+    count: int = Field(..., ge=0, le=100)
+
+
+class UnitAckPayload(BaseModel):
+    # Body for dispatch_ack / return_ack. The station_id is in the URL path.
+    units: int = Field(..., ge=1, le=50)
 
 
 class DispatchPayload(BaseModel):
-    # 'firefighter' for now; 'ambulance' / 'police' follow the same skeleton.
-    kind: Literal["firefighter"]
-    trucks: int = Field(..., ge=1, le=20)
+    # 'firefighter' is legacy; 'ambulance' / 'police' follow the same skeleton.
+    kind: Literal["firefighter", "ambulance", "police"]
+    # Generic count; 'trucks' is kept as a back-compat alias for firefighter.
+    units: Optional[int] = Field(None, ge=1, le=50)
+    trucks: Optional[int] = Field(None, ge=1, le=50)
     # {"lat": float, "lng": float, "radius": float?} — the dispatch search
     # area. `radius` (metres) is optional; when omitted the frontend engine
-    # falls back to its default patrol radius. Trucks travel from the nearest
-    # station to the circle centre, then patrol inside it scanning for smoke.
+    # falls back to its default patrol radius.
     target: Dict[str, Any]
+    # Optional station id the frontend picked. Useful for audit but not required.
+    station_id: Optional[str] = None
 
 
 class NotificationPayload(BaseModel):
     geometry: Dict[str, Any]
     reason: str
+    event_id: Optional[str] = None
 
 
 class CordonPayload(BaseModel):
     geometry: Dict[str, Any]
     reason: Optional[str] = None
+    event_id: Optional[str] = None
+
+
+class LoginPayload(BaseModel):
+    device_id: str
+    pin: str
 
 
 class CitizenReport(BaseModel):
@@ -408,12 +483,24 @@ def post_citizen_reports(batch: CitizenReportBatch):
     Batch-ingest 911 reports from the citizen simulation. Each report references
     an existing disaster_events.id; rows for unknown event_ids are dropped silently
     (the citizen sim may emit slightly stale references after a zone removal).
+
+    Rows whose event_id isn't a syntactically valid UUID are also dropped
+    silently — the engine emits synthetic ids like 'crime:<idx>:<t>' for
+    operator-triggered robberies which aren't real disaster rows. Dropping them
+    keeps the batch from failing on a Postgres UUID parse error.
     """
     if not batch.reports:
         return {"inserted": 0}
 
-    rows = [
-        (
+    rows = []
+    skipped = 0
+    for r in batch.reports:
+        try:
+            uuid.UUID(str(r.event_id))
+        except (ValueError, AttributeError, TypeError):
+            skipped += 1
+            continue
+        rows.append((
             str(uuid.uuid4()),
             r.event_id,
             r.citizen_idx,
@@ -421,9 +508,9 @@ def post_citizen_reports(batch: CitizenReportBatch):
             json.dumps(r.location),
             r.transcript,
             r.perceived_severity,
-        )
-        for r in batch.reports
-    ]
+        ))
+    if not rows:
+        return {"inserted": 0, "skipped": skipped}
 
     try:
         conn = psycopg2.connect(DATABASE_URL)
@@ -447,7 +534,7 @@ def post_citizen_reports(batch: CitizenReportBatch):
             detail=f"Citizen report write failed: {exc}",
         )
 
-    return {"inserted": inserted}
+    return {"inserted": inserted, "skipped": skipped}
 
 
 @app.get("/api/citizen-reports", tags=["Citizen Reports"])
@@ -620,6 +707,114 @@ def delete_disaster(event_id: str):
     return {"success": True}
 
 
+def _row_to_disaster(row) -> Dict[str, Any]:
+    return {
+        "id": str(row[0]),
+        "disaster_type": row[1],
+        "severity": row[2],
+        "area_geometry": row[3],
+        "geometry_kind": row[4],
+        "notes": row[5],
+        "status": row[6],
+        "cause": row[7],
+        "spread_speed": row[8],
+        "people_inside": row[9],
+        "safe_exit_pct": row[10],
+        "created_at": row[11].isoformat() if row[11] is not None else None,
+    }
+
+
+@app.get("/api/disasters", tags=["Disasters"])
+def list_disasters(status_filter: Optional[str] = Query(None, description="active|draft|cleared|all")):
+    where = ""
+    params: List[Any] = []
+    if status_filter and status_filter != "all":
+        where = "WHERE status = %s"
+        params.append(status_filter)
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, disaster_type, severity, area_geometry, geometry_kind,
+                           notes, status, cause, spread_speed, people_inside,
+                           safe_exit_pct, created_at
+                    FROM disaster_events
+                    {where}
+                    ORDER BY created_at DESC;
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Disaster read failed: {exc}",
+        )
+    return {"disasters": [_row_to_disaster(r) for r in rows]}
+
+
+@app.get("/api/disasters/{event_id}", tags=["Disasters"])
+def get_disaster(event_id: str):
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, disaster_type, severity, area_geometry, geometry_kind,
+                           notes, status, cause, spread_speed, people_inside,
+                           safe_exit_pct, created_at
+                    FROM disaster_events
+                    WHERE id = %s;
+                    """,
+                    (event_id,),
+                )
+                row = cur.fetchone()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Disaster read failed: {exc}",
+        )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Disaster not found.")
+    return _row_to_disaster(row)
+
+
+@app.get("/api/stats/injured", tags=["Admin"])
+def stats_injured():
+    """Sum people_inside * (1 - safe_exit_pct/100) across active events
+    where both fields are present. Returns injured_estimate + contributing_events."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT people_inside, safe_exit_pct
+                    FROM disaster_events
+                    WHERE status = 'active'
+                      AND people_inside IS NOT NULL
+                      AND safe_exit_pct IS NOT NULL;
+                """)
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Injured stat read failed: {exc}",
+        )
+    total = 0.0
+    for people_inside, safe_pct in rows:
+        total += float(people_inside) * (1.0 - float(safe_pct) / 100.0)
+    return {
+        "injured_estimate": int(round(total)),
+        "contributing_events": len(rows),
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Fire stations — operator-placed map objects. Trucks spawn from / return
 # to these. Persistent so the operator only places them once per deployment.
@@ -632,7 +827,7 @@ def list_fire_stations():
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT id, name, lat, lng, created_at
+                    SELECT id, name, lat, lng, created_at, truck_count, trucks_dispatched
                     FROM fire_stations
                     ORDER BY created_at ASC;
                 """)
@@ -645,7 +840,15 @@ def list_fire_stations():
         )
     return {
         "stations": [
-            {"id": str(r[0]), "name": r[1], "lat": r[2], "lng": r[3], "created_at": r[4].isoformat()}
+            {
+                "id": str(r[0]),
+                "name": r[1],
+                "lat": r[2],
+                "lng": r[3],
+                "created_at": r[4].isoformat(),
+                "truck_count": r[5],
+                "trucks_dispatched": r[6],
+            }
             for r in rows
         ]
     }
@@ -654,17 +857,18 @@ def list_fire_stations():
 @app.post("/api/fire-stations", tags=["Emergency Services"])
 def create_fire_station(payload: FireStationPayload):
     station_id = payload.id or str(uuid.uuid4())
+    truck_count = payload.truck_count if payload.truck_count is not None else 4
     try:
         conn = psycopg2.connect(DATABASE_URL)
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO fire_stations (id, name, lat, lng)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO fire_stations (id, name, lat, lng, truck_count)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
-                    (station_id, payload.name, payload.lat, payload.lng),
+                    (station_id, payload.name, payload.lat, payload.lng, truck_count),
                 )
                 returned_id = cur.fetchone()[0]
         conn.close()
@@ -693,6 +897,36 @@ def delete_fire_station(station_id: str):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Reset all *_dispatched counters across every station type. The engine is
+# the source of truth for what's currently deployed; the DB counters track
+# capacity allocation. When the frontend reloads, in-memory units are gone
+# but the DB counters persist — that drift can leave a station permanently
+# "at capacity" with zero actual units out. The dashboard calls this on
+# startup to keep the counters honest.
+# ──────────────────────────────────────────────────────────────────────
+
+@app.post("/api/reset-dispatched", tags=["Emergency Services"])
+def reset_dispatched_counters():
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE fire_stations SET trucks_dispatched = 0;")
+                fire = cur.rowcount
+                cur.execute("UPDATE hospitals SET ambulances_dispatched = 0;")
+                hosp = cur.rowcount
+                cur.execute("UPDATE police_stations SET police_dispatched = 0;")
+                pol = cur.rowcount
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Reset dispatched failed: {exc}",
+        )
+    return {"success": True, "fire_stations": fire, "hospitals": hosp, "police_stations": pol}
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Dispatch — operator (or future AI) requests emergency-services units to
 # travel from the nearest station to a target area. The dispatch itself is
 # ephemeral (lives in the engine); only the resulting truck movement is
@@ -716,6 +950,12 @@ def dispatch_units(payload: DispatchPayload):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="target.radius must be a positive number when provided.",
         )
+    units = payload.units if payload.units is not None else payload.trucks
+    if units is None or units < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="units (or trucks for firefighter) is required and must be >= 1.",
+        )
     # The actual unit movement happens in the frontend citizen engine — this
     # endpoint just acknowledges the request and returns a correlation id.
     echo_target = {"lat": lat, "lng": lng}
@@ -725,9 +965,345 @@ def dispatch_units(payload: DispatchPayload):
         "success": True,
         "dispatch_id": str(uuid.uuid4()),
         "kind": payload.kind,
-        "trucks": payload.trucks,
+        "units": units,
+        "trucks": units,  # back-compat
         "target": echo_target,
+        "station_id": payload.station_id,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Fire station capacity ack endpoints — engine notifies backend when units
+# leave / return so trucks_dispatched reflects reality.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _atomic_dispatch_ack(table: str, count_col: str, dispatched_col: str,
+                          station_id: str, units: int) -> bool:
+    """Increment dispatched_col atomically, refusing if it would exceed count_col.
+    Returns True on success, False if capacity would be exceeded or row missing."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {table}
+                    SET {dispatched_col} = {dispatched_col} + %s
+                    WHERE id = %s AND {dispatched_col} + %s <= {count_col}
+                    RETURNING id;
+                    """,
+                    (units, station_id, units),
+                )
+                row = cur.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{table} dispatch_ack failed: {exc}",
+        )
+
+
+def _atomic_return_ack(table: str, dispatched_col: str,
+                        station_id: str, units: int) -> bool:
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE {table}
+                    SET {dispatched_col} = GREATEST({dispatched_col} - %s, 0)
+                    WHERE id = %s
+                    RETURNING id;
+                    """,
+                    (units, station_id),
+                )
+                row = cur.fetchone()
+        conn.close()
+        return row is not None
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{table} return_ack failed: {exc}",
+        )
+
+
+@app.post("/api/fire-stations/{station_id}/dispatch_ack", tags=["Emergency Services"])
+def fire_station_dispatch_ack(station_id: str, payload: UnitAckPayload):
+    if not _atomic_dispatch_ack("fire_stations", "truck_count", "trucks_dispatched",
+                                 station_id, payload.units):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Station at capacity or not found.")
+    return {"success": True}
+
+
+@app.post("/api/fire-stations/{station_id}/return_ack", tags=["Emergency Services"])
+def fire_station_return_ack(station_id: str, payload: UnitAckPayload):
+    _atomic_return_ack("fire_stations", "trucks_dispatched", station_id, payload.units)
+    return {"success": True}
+
+
+@app.patch("/api/fire-stations/{station_id}", tags=["Emergency Services"])
+def patch_fire_station(station_id: str, payload: StationCountUpdate):
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE fire_stations SET truck_count = %s WHERE id = %s RETURNING id;",
+                    (payload.count, station_id),
+                )
+                row = cur.fetchone()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Fire station patch failed: {exc}",
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Station not found.")
+    return {"success": True}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Hospitals — operator-placed map objects. Ambulances spawn from / return to
+# these. On arrival at a hospital a transported patient is healed.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/hospitals", tags=["Emergency Services"])
+def list_hospitals():
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, name, lat, lng, created_at, ambulance_count, ambulances_dispatched
+                    FROM hospitals
+                    ORDER BY created_at ASC;
+                """)
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Hospital read failed: {exc}",
+        )
+    return {
+        "hospitals": [
+            {
+                "id": str(r[0]),
+                "name": r[1],
+                "lat": r[2],
+                "lng": r[3],
+                "created_at": r[4].isoformat(),
+                "ambulance_count": r[5],
+                "ambulances_dispatched": r[6],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/api/hospitals", tags=["Emergency Services"])
+def create_hospital(payload: HospitalPayload):
+    hospital_id = payload.id or str(uuid.uuid4())
+    ambulance_count = payload.ambulance_count if payload.ambulance_count is not None else 3
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO hospitals (id, name, lat, lng, ambulance_count)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (hospital_id, payload.name, payload.lat, payload.lng, ambulance_count),
+                )
+                returned_id = cur.fetchone()[0]
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Hospital create failed: {exc}",
+        )
+    return {"success": True, "id": str(returned_id)}
+
+
+@app.delete("/api/hospitals/{hospital_id}", tags=["Emergency Services"])
+def delete_hospital(hospital_id: str):
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM hospitals WHERE id = %s;", (hospital_id,))
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Hospital delete failed: {exc}",
+        )
+    return {"success": True}
+
+
+@app.patch("/api/hospitals/{hospital_id}", tags=["Emergency Services"])
+def patch_hospital(hospital_id: str, payload: StationCountUpdate):
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE hospitals SET ambulance_count = %s WHERE id = %s RETURNING id;",
+                    (payload.count, hospital_id),
+                )
+                row = cur.fetchone()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Hospital patch failed: {exc}",
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Hospital not found.")
+    return {"success": True}
+
+
+@app.post("/api/hospitals/{hospital_id}/dispatch_ack", tags=["Emergency Services"])
+def hospital_dispatch_ack(hospital_id: str, payload: UnitAckPayload):
+    if not _atomic_dispatch_ack("hospitals", "ambulance_count", "ambulances_dispatched",
+                                 hospital_id, payload.units):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Hospital at capacity or not found.")
+    return {"success": True}
+
+
+@app.post("/api/hospitals/{hospital_id}/return_ack", tags=["Emergency Services"])
+def hospital_return_ack(hospital_id: str, payload: UnitAckPayload):
+    _atomic_return_ack("hospitals", "ambulances_dispatched", hospital_id, payload.units)
+    return {"success": True}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Police stations — operator-placed map objects. ~50% of each station's
+# roster auto-patrols at all times; the operator can manually dispatch more
+# to specific circles for active incidents.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/police-stations", tags=["Emergency Services"])
+def list_police_stations():
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, name, lat, lng, created_at, police_count, police_dispatched
+                    FROM police_stations
+                    ORDER BY created_at ASC;
+                """)
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Police station read failed: {exc}",
+        )
+    return {
+        "stations": [
+            {
+                "id": str(r[0]),
+                "name": r[1],
+                "lat": r[2],
+                "lng": r[3],
+                "created_at": r[4].isoformat(),
+                "police_count": r[5],
+                "police_dispatched": r[6],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/api/police-stations", tags=["Emergency Services"])
+def create_police_station(payload: PoliceStationPayload):
+    station_id = payload.id or str(uuid.uuid4())
+    police_count = payload.police_count if payload.police_count is not None else 10
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO police_stations (id, name, lat, lng, police_count)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (station_id, payload.name, payload.lat, payload.lng, police_count),
+                )
+                returned_id = cur.fetchone()[0]
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Police station create failed: {exc}",
+        )
+    return {"success": True, "id": str(returned_id)}
+
+
+@app.delete("/api/police-stations/{station_id}", tags=["Emergency Services"])
+def delete_police_station(station_id: str):
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM police_stations WHERE id = %s;", (station_id,))
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Police station delete failed: {exc}",
+        )
+    return {"success": True}
+
+
+@app.patch("/api/police-stations/{station_id}", tags=["Emergency Services"])
+def patch_police_station(station_id: str, payload: StationCountUpdate):
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE police_stations SET police_count = %s WHERE id = %s RETURNING id;",
+                    (payload.count, station_id),
+                )
+                row = cur.fetchone()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Police station patch failed: {exc}",
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Station not found.")
+    return {"success": True}
+
+
+@app.post("/api/police-stations/{station_id}/dispatch_ack", tags=["Emergency Services"])
+def police_station_dispatch_ack(station_id: str, payload: UnitAckPayload):
+    if not _atomic_dispatch_ack("police_stations", "police_count", "police_dispatched",
+                                 station_id, payload.units):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Station at capacity or not found.")
+    return {"success": True}
+
+
+@app.post("/api/police-stations/{station_id}/return_ack", tags=["Emergency Services"])
+def police_station_return_ack(station_id: str, payload: UnitAckPayload):
+    _atomic_return_ack("police_stations", "police_dispatched", station_id, payload.units)
+    return {"success": True}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -749,11 +1325,11 @@ def create_notification(payload: NotificationPayload):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO notifications (id, geometry, reason, status)
-                    VALUES (%s, %s, %s, 'active')
+                    INSERT INTO notifications (id, geometry, reason, status, event_id)
+                    VALUES (%s, %s, %s, 'active', %s)
                     RETURNING id;
                     """,
-                    (notif_id, json.dumps(payload.geometry), payload.reason.strip()),
+                    (notif_id, json.dumps(payload.geometry), payload.reason.strip(), payload.event_id),
                 )
                 returned_id = cur.fetchone()[0]
         conn.close()
@@ -778,7 +1354,7 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT id, geometry, reason, status, created_at
+                    SELECT id, geometry, reason, status, created_at, event_id
                     FROM notifications
                     {where}
                     ORDER BY created_at DESC;
@@ -800,6 +1376,7 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
                 "reason": r[2],
                 "status": r[3],
                 "created_at": r[4].isoformat(),
+                "event_id": str(r[5]) if r[5] is not None else None,
             }
             for r in rows
         ]
@@ -841,11 +1418,11 @@ def create_cordon(payload: CordonPayload):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO cordons (id, geometry, reason, status)
-                    VALUES (%s, %s, %s, 'active')
+                    INSERT INTO cordons (id, geometry, reason, status, event_id)
+                    VALUES (%s, %s, %s, 'active', %s)
                     RETURNING id;
                     """,
-                    (cordon_id, json.dumps(payload.geometry), (payload.reason or "").strip() or None),
+                    (cordon_id, json.dumps(payload.geometry), (payload.reason or "").strip() or None, payload.event_id),
                 )
                 returned_id = cur.fetchone()[0]
         conn.close()
@@ -870,7 +1447,7 @@ def list_cordons(status_filter: Optional[str] = Query("active", description="act
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT id, geometry, reason, status, created_at
+                    SELECT id, geometry, reason, status, created_at, event_id
                     FROM cordons
                     {where}
                     ORDER BY created_at DESC;
@@ -892,6 +1469,7 @@ def list_cordons(status_filter: Optional[str] = Query("active", description="act
                 "reason": r[2],
                 "status": r[3],
                 "created_at": r[4].isoformat(),
+                "event_id": str(r[5]) if r[5] is not None else None,
             }
             for r in rows
         ]
@@ -959,23 +1537,30 @@ def _seed_worker(idx: int, name: str, role: str, lat_offset: float, lng_offset: 
     }
 
 
-# Hardcoded demo users — the mobile login screen lets you pick one of these.
-MOBILE_CITIZENS: Dict[str, Dict[str, Any]] = {
-    c["id"]: c for c in [
-        _seed_citizen(1, "Alex Rivera", 0.004, -0.003),
-        _seed_citizen(2, "Priya Shah", -0.002, 0.005),
-        _seed_citizen(3, "Marcus Lee", 0.006, 0.002),
-        _seed_citizen(4, "Jamie Chen", -0.005, -0.004),
-        _seed_citizen(5, "Sara Okafor", 0.001, 0.007),
-    ]
+# Mobile-app user rosters. Populated dynamically by the PIN login endpoint.
+# Reset on backend restart — acceptable for hackathon scope.
+MOBILE_CITIZENS: Dict[str, Dict[str, Any]] = {}
+MOBILE_WORKERS: Dict[str, Dict[str, Any]] = {}
+MOBILE_ADMINS: Dict[str, Dict[str, Any]] = {}
+
+
+# Pattern PIN → role mapping. The first/last digit identifies the role; middle
+# digits are free. This is hackathon-grade auth: anyone who knows the pattern
+# can assume any role.
+_PIN_ROLE_MAP: Dict[str, Dict[str, Any]] = {
+    "1": {"role": "citizen"},
+    "2": {"role": "worker", "sub_role": "firefighter"},
+    "3": {"role": "worker", "sub_role": "police"},
+    "4": {"role": "worker", "sub_role": "paramedic"},
+    "5": {"role": "admin"},
 }
 
-MOBILE_WORKERS: Dict[str, Dict[str, Any]] = {
-    w["id"]: w for w in [
-        _seed_worker(1, "Capt. Diaz", "firefighter", 0.003, -0.001),
-        _seed_worker(2, "Lt. Patel", "paramedic", -0.001, 0.003),
-        _seed_worker(3, "Off. Brennan", "police", 0.002, 0.004),
-    ]
+_NAME_PREFIX_BY_SLOT: Dict[str, str] = {
+    "citizen": "Citizen",
+    "firefighter": "FF",
+    "police": "PD",
+    "paramedic": "EMS",
+    "admin": "Operator",
 }
 
 
@@ -983,6 +1568,73 @@ class MobileUserUpdate(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
     status: Optional[str] = None
+
+
+@app.post("/api/auth/login", tags=["Mobile"])
+def auth_login(payload: LoginPayload):
+    """Pattern PIN login. Returns a session record, upserts the user into the
+    appropriate roster so the operator console can see them."""
+    pin = (payload.pin or "").strip()
+    device_id = (payload.device_id or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id is required.")
+    if len(pin) != 4 or not pin.isdigit():
+        raise HTTPException(status_code=401, detail="Invalid PIN")
+    if pin[0] != pin[3] or pin[0] not in _PIN_ROLE_MAP:
+        raise HTTPException(status_code=401, detail="Invalid PIN")
+    mapping = _PIN_ROLE_MAP[pin[0]]
+    role = mapping["role"]
+    sub_role = mapping.get("sub_role")
+    slot_key = sub_role if role == "worker" else role
+    name_prefix = _NAME_PREFIX_BY_SLOT[slot_key]
+    short_id = device_id.replace("-", "")[:4].upper() or "USER"
+    friendly_name = f"{name_prefix}-{short_id}"
+    now = datetime.utcnow().isoformat() + "Z"
+    with _mobile_lock:
+        # Deterministic small offset so multiple logins don't pile up at one point.
+        offset_seed = sum(ord(c) for c in device_id) % 100
+        lat_off = (offset_seed - 50) * 0.0001
+        lng_off = ((offset_seed * 7) % 100 - 50) * 0.0001
+        default_lat = _DEFAULT_LAT + lat_off
+        default_lng = _DEFAULT_LNG + lng_off
+        if role == "citizen":
+            existing = MOBILE_CITIZENS.get(device_id)
+            MOBILE_CITIZENS[device_id] = {
+                "id": device_id,
+                "name": friendly_name,
+                "role": "citizen",
+                "lat": existing["lat"] if existing else default_lat,
+                "lng": existing["lng"] if existing else default_lng,
+                "status": existing["status"] if existing else "safe",
+                "last_seen": now,
+            }
+        elif role == "worker":
+            existing = MOBILE_WORKERS.get(device_id)
+            MOBILE_WORKERS[device_id] = {
+                "id": device_id,
+                "name": friendly_name,
+                "role": sub_role,  # Keep field name 'role' for backward compat with frontend
+                "sub_role": sub_role,
+                "lat": existing["lat"] if existing else default_lat,
+                "lng": existing["lng"] if existing else default_lng,
+                "status": existing["status"] if existing else "available",
+                "last_seen": now,
+            }
+        else:  # admin
+            MOBILE_ADMINS[device_id] = {
+                "id": device_id,
+                "name": friendly_name,
+                "role": "admin",
+                "last_seen": now,
+            }
+    response: Dict[str, Any] = {
+        "user_id": device_id,
+        "role": role,
+        "name": friendly_name,
+    }
+    if sub_role:
+        response["sub_role"] = sub_role
+    return response
 
 
 # ────── Citizens ──────

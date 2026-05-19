@@ -4,18 +4,21 @@
 // A small "Sign out" header button is wired into every tab navigator.
 
 import React from 'react';
-import { Pressable, Text, StyleSheet } from 'react-native';
+import { Text, StyleSheet, View } from 'react-native';
 import { NavigationContainer, DefaultTheme } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { useAuth } from '@/lib/auth';
-import { colors, roleAccent } from '@/lib/colors';
+import { useGeofenceWatcher } from '@/lib/geofence';
+import { colors } from '@/lib/colors';
+import { InAppBanner } from '@/components/InAppBanner';
 
 import LoginScreen from '@/screens/LoginScreen';
 import CitizenMapScreen from '@/screens/citizen/CitizenMapScreen';
 import NotificationsScreen from '@/screens/citizen/NotificationsScreen';
-import MockLocationScreen from '@/screens/citizen/MockLocationScreen';
+import SettingsScreen from '@/screens/SettingsScreen';
 import WorkerMapScreen from '@/screens/worker/WorkerMapScreen';
 import AdminDispatchScreen from '@/screens/admin/AdminDispatchScreen';
+import AdminCallsScreen from '@/screens/admin/AdminCallsScreen';
 import AdminAgentsScreen from '@/screens/admin/AdminAgentsScreen';
 import AdminSavingsScreen from '@/screens/admin/AdminSavingsScreen';
 
@@ -35,16 +38,6 @@ const navTheme = {
   },
 };
 
-function SignOutButton() {
-  const { signOut, session } = useAuth();
-  if (!session) return null;
-  return (
-    <Pressable onPress={signOut} style={styles.signOut} hitSlop={10}>
-      <Text style={styles.signOutText}>Sign out</Text>
-    </Pressable>
-  );
-}
-
 function tabScreenOptions(activeColor: string) {
   return {
     tabBarActiveTintColor: activeColor,
@@ -55,7 +48,6 @@ function tabScreenOptions(activeColor: string) {
     },
     headerStyle: { backgroundColor: colors.surface },
     headerTitleStyle: { color: colors.textPrimary, fontWeight: '700' as const },
-    headerRight: () => <SignOutButton />,
   };
 }
 
@@ -77,9 +69,9 @@ function CitizenTabs() {
         options={{ tabBarIcon: emoji('🔔') }}
       />
       <Tab.Screen
-        name="Location"
-        component={MockLocationScreen}
-        options={{ tabBarIcon: emoji('📍') }}
+        name="Settings"
+        component={SettingsScreen}
+        options={{ tabBarIcon: emoji('⚙️') }}
       />
     </Tab.Navigator>
   );
@@ -98,17 +90,29 @@ function WorkerTabs() {
         component={NotificationsScreen}
         options={{ tabBarIcon: emoji('🔔') }}
       />
+      <Tab.Screen
+        name="Settings"
+        component={SettingsScreen}
+        options={{ tabBarIcon: emoji('⚙️') }}
+      />
     </Tab.Navigator>
   );
 }
 
 function AdminTabs() {
   return (
-    <Tab.Navigator screenOptions={tabScreenOptions(colors.admin)}>
+    <Tab.Navigator
+      screenOptions={{ ...tabScreenOptions(colors.admin), tabBarShowLabel: false }}
+    >
       <Tab.Screen
         name="Dispatch"
         component={AdminDispatchScreen}
         options={{ tabBarIcon: emoji('🚨') }}
+      />
+      <Tab.Screen
+        name="Calls"
+        component={AdminCallsScreen}
+        options={{ tabBarIcon: emoji('📞') }}
       />
       <Tab.Screen
         name="Agents"
@@ -120,39 +124,37 @@ function AdminTabs() {
         component={AdminSavingsScreen}
         options={{ tabBarIcon: emoji('📈') }}
       />
+      <Tab.Screen
+        name="Settings"
+        component={SettingsScreen}
+        options={{ tabBarIcon: emoji('⚙️') }}
+      />
     </Tab.Navigator>
   );
 }
 
 export default function RootNavigator() {
   const { session, loading } = useAuth();
+  const { toasts, dismiss } = useGeofenceWatcher(session);
 
   if (loading) return null;
 
   return (
-    <NavigationContainer theme={navTheme}>
-      {!session ? (
-        <LoginScreen />
-      ) : session.role === 'citizen' ? (
-        <CitizenTabs />
-      ) : session.role === 'worker' ? (
-        <WorkerTabs />
-      ) : (
-        <AdminTabs />
-      )}
-    </NavigationContainer>
+    <View style={{ flex: 1, backgroundColor: colors.bg }}>
+      <NavigationContainer theme={navTheme}>
+        {!session ? (
+          <LoginScreen />
+        ) : session.role === 'citizen' ? (
+          <CitizenTabs />
+        ) : session.role === 'worker' ? (
+          <WorkerTabs />
+        ) : (
+          <AdminTabs />
+        )}
+      </NavigationContainer>
+      <InAppBanner toasts={toasts} onDismiss={dismiss} />
+    </View>
   );
 }
 
-const styles = StyleSheet.create({
-  signOut: {
-    marginRight: 14,
-    paddingVertical: 4,
-    paddingHorizontal: 10,
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: 6,
-    borderColor: colors.border,
-    borderWidth: 1,
-  },
-  signOutText: { color: colors.textSecondary, fontSize: 12, fontWeight: '600' },
-});
+const styles = StyleSheet.create({});

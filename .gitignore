@@ -50,3 +50,9 @@ valhalla/data/*
 valhalla.zip
 .claude/
 .playwright-mcp/
+
+# ─── AI orchestration spec (working doc) ─────────────────────
+prompt.md
+
+# ─── Log files ────────────────────────────────────────────────
+*.log

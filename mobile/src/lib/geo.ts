@@ -21,6 +21,23 @@ export function isWithin(meters: number, of: LatLng, target: LatLng): boolean {
   return haversineMeters(of, target) <= meters;
 }
 
+// Ray-cast point-in-polygon. `ring` is a closed GeoJSON ring of [lng, lat] pairs.
+// Returns true if `point` is inside the polygon. Edge points are not guaranteed.
+export function pointInPolygon(point: LatLng, ring: Array<[number, number]>): boolean {
+  if (ring.length < 3) return false;
+  let inside = false;
+  const x = point.lng;
+  const y = point.lat;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    const intersect =
+      yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 // Approximate centroid of a GeoJSON geometry (Polygon | Point).
 export function geometryCentroid(geometry: any): LatLng | null {
   if (!geometry) return null;

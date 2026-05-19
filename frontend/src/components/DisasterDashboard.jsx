@@ -21,7 +21,9 @@ import {
   FIRE_TRUCK_CAPACITY,
   DISPATCH_MIN_TRUCKS,
   DISPATCH_MAX_TRUCKS,
+  POLICE_PATROL_DEFAULT_RADIUS_M,
 } from '../lib/config'
+import { isPersistableEventId } from '../lib/eventId'
 
 // Disaster types where the cause matters for weather. Other types ignore it.
 const CAUSE_AMBIGUOUS_TYPES = ['Flood', 'Power_Outage', 'Infrastructure_Failure']
@@ -127,8 +129,17 @@ export default function DisasterDashboard() {
   // Emergency-services state
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [fireStations, setFireStations] = useState([])
+  const [hospitals, setHospitals] = useState([])
+  const [policeStations, setPoliceStations] = useState([])
   const [stationPlacementMode, setStationPlacementMode] = useState(false)
+  const [hospitalPlacementMode, setHospitalPlacementMode] = useState(false)
+  const [policePlacementMode, setPolicePlacementMode] = useState(false)
   const [pendingStationName, setPendingStationName] = useState(null)
+  const [pendingStationCapacity, setPendingStationCapacity] = useState(4)
+  const [pendingHospitalName, setPendingHospitalName] = useState(null)
+  const [pendingHospitalCapacity, setPendingHospitalCapacity] = useState(3)
+  const [pendingPoliceName, setPendingPoliceName] = useState(null)
+  const [pendingPoliceCapacity, setPendingPoliceCapacity] = useState(10)
   const [dispatchTrucks, setDispatchTrucks] = useState(3)
   // Dispatch target is a *search area* — operators click a centre, then a
   // slider sets the radius. Simulates an AI's triangulated guess at the fire
@@ -137,6 +148,20 @@ export default function DisasterDashboard() {
   const [dispatchTargetMode, setDispatchTargetMode] = useState(false)
   const [dispatchRadius, setDispatchRadius] = useState(400)  // metres
   const [activeDispatches, setActiveDispatches] = useState([])  // [{ id, trucks, target }]
+  // Ambulance dispatch
+  const [ambDispatchUnits, setAmbDispatchUnits] = useState(2)
+  const [ambDispatchTarget, setAmbDispatchTarget] = useState(null)
+  const [ambDispatchTargetMode, setAmbDispatchTargetMode] = useState(false)
+  const [ambDispatchRadius, setAmbDispatchRadius] = useState(150)
+  const [activeAmbulanceDispatches, setActiveAmbulanceDispatches] = useState([])
+  // Police manual patrol
+  const [policeDispatchUnits, setPoliceDispatchUnits] = useState(3)
+  const [policeDispatchTarget, setPoliceDispatchTarget] = useState(null)
+  const [policeDispatchTargetMode, setPoliceDispatchTargetMode] = useState(false)
+  const [policeDispatchRadius, setPoliceDispatchRadius] = useState(400)
+  const [activePoliceDispatches, setActivePoliceDispatches] = useState([])
+  // Robbery context menu (right-click on a citizen)
+  const [crimeMenu, setCrimeMenu] = useState(null) // { citizenIdx, x, y } | null
   const [notifications, setNotifications] = useState([])
   const [cordons, setCordons] = useState([])
   const [notifReason, setNotifReason] = useState('')
@@ -252,10 +277,39 @@ export default function DisasterDashboard() {
               )
             }
           },
+          onUnitReturned: ({ kind, stationId, units }) => {
+            // Decrement the station's *_dispatched counter so the capacity
+            // badge reflects reality. Refresh that station's table only.
+            const path = kind === 'firefighter' ? 'fire-stations'
+                       : kind === 'ambulance' ? 'hospitals'
+                       : 'police-stations'
+            fetch(`${BACKEND_URL}/api/${path}/${stationId}/return_ack`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ units }),
+            }).then(async () => {
+              // Re-fetch the relevant station list so the badge updates.
+              const listRes = await fetch(`${BACKEND_URL}/api/${path}`)
+              if (!listRes.ok) return
+              const json = await listRes.json()
+              if (kind === 'firefighter') setFireStations(json.stations || [])
+              else if (kind === 'ambulance') setHospitals(json.hospitals || [])
+              else setPoliceStations(json.stations || [])
+            }).catch(() => {})
+          },
+          onCriminalCaught: ({ criminalIdx, policeIdx }) => {
+            addLog('success', `Officer detained suspect (citizen #${criminalIdx}).`)
+          },
         })
         localEngine.start()
         setEngine(localEngine)
         setSimReady(true)
+        // Zero out persisted *_dispatched counters: the engine just (re)started
+        // with no units alive, so any leftover values from a previous session
+        // would mark stations as "at capacity" forever and block auto-patrol.
+        try {
+          await fetch(`${BACKEND_URL}/api/reset-dispatched`, { method: 'POST' })
+        } catch { /* offline; counters may drift but it's not fatal */ }
         // Wire the citizen pill to the engine's live count. Fires every tick
         // (≤50 ms cadence at speed=1); React bails out when the value is
         // unchanged, so this is effectively free for steady-state ticks.
@@ -308,12 +362,17 @@ export default function DisasterDashboard() {
       })
 
       // Fire-and-forget POST. Failures are not fatal; reports remain in UI.
+      // Filter out reports whose event_id isn't a real disaster UUID — crime
+      // events use a synthetic 'crime:<idx>:<t>' id that doesn't (and shouldn't)
+      // exist in disaster_events, so the DB UUID column rejects it.
+      const persistable = batch.filter((r) => isPersistableEventId(r.event_id))
+      if (persistable.length === 0) return
       try {
         await fetch(`${BACKEND_URL}/api/citizen-report`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            reports: batch.map((r) => ({
+            reports: persistable.map((r) => ({
               event_id: r.event_id,
               citizen_idx: r.citizen_idx,
               report_kind: r.report_kind,
@@ -332,19 +391,24 @@ export default function DisasterDashboard() {
     return () => clearInterval(id)
   }, [])
 
-  // Initial fetch of fire stations + active notifications/cordons. These
-  // persist across reloads, unlike the in-flight dispatches.
+  // Initial fetch of fire stations, hospitals, police stations + active
+  // notifications/cordons. These persist across reloads, unlike the in-flight
+  // dispatches.
   useEffect(() => {
     let cancelled = false
     const fetchAll = async () => {
       try {
-        const [s, n, c] = await Promise.all([
+        const [s, h, p, n, c] = await Promise.all([
           fetch(`${BACKEND_URL}/api/fire-stations`).then((r) => r.ok ? r.json() : { stations: [] }),
+          fetch(`${BACKEND_URL}/api/hospitals`).then((r) => r.ok ? r.json() : { hospitals: [] }),
+          fetch(`${BACKEND_URL}/api/police-stations`).then((r) => r.ok ? r.json() : { stations: [] }),
           fetch(`${BACKEND_URL}/api/notifications`).then((r) => r.ok ? r.json() : { notifications: [] }),
           fetch(`${BACKEND_URL}/api/cordons`).then((r) => r.ok ? r.json() : { cordons: [] }),
         ])
         if (cancelled) return
         setFireStations(s.stations || [])
+        setHospitals(h.hospitals || [])
+        setPoliceStations(p.stations || [])
         setNotifications(n.notifications || [])
         setCordons(c.cordons || [])
       } catch { /* offline; stays empty */ }
@@ -359,26 +423,141 @@ export default function DisasterDashboard() {
       const res = await fetch(`${BACKEND_URL}/api/fire-stations`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lat, lng, name: pendingStationName }),
+        body: JSON.stringify({ lat, lng, name: pendingStationName, truck_count: pendingStationCapacity }),
       })
       if (res.ok) {
         const refreshed = await fetch(`${BACKEND_URL}/api/fire-stations`).then((r) => r.json())
         setFireStations(refreshed.stations || [])
+        addLog('success', `Fire station placed (${pendingStationCapacity} trucks).`)
+      } else {
+        addLog('error', `Fire station POST failed (${res.status}). Is the backend running with the latest code?`)
       }
-    } catch { /* offline */ }
+    } catch (e) {
+      addLog('error', `Fire station POST failed: ${e?.message || 'offline'}`)
+    }
     setStationPlacementMode(false)
     setPendingStationName(null)
-  }, [pendingStationName])
+  }, [pendingStationName, pendingStationCapacity]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleStationRemove = useCallback(async (id) => {
     setFireStations((prev) => prev.filter((s) => s.id !== id))
     fetch(`${BACKEND_URL}/api/fire-stations/${id}`, { method: 'DELETE' }).catch(() => {})
   }, [])
 
-  // Dispatch handler — picks the nearest station and tells the engine to
-  // spawn N fire trucks. Backend dispatch endpoint is fire-and-forget for
-  // logging / future AI consumers; the real work happens in the engine.
-  const handleDispatch = useCallback(() => {
+  // Update an existing station's capacity in-place.
+  const handleStationCapacityChange = useCallback(async (id, count) => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/fire-stations/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count }),
+      })
+      if (res.ok) {
+        const refreshed = await fetch(`${BACKEND_URL}/api/fire-stations`).then((r) => r.json())
+        setFireStations(refreshed.stations || [])
+      } else {
+        addLog('error', `Fire station PATCH failed (${res.status}).`)
+      }
+    } catch (e) {
+      addLog('error', `Fire station PATCH failed: ${e?.message || 'offline'}`)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Hospital placement handlers (mirror fire station)
+  const handleHospitalPlace = useCallback(async ({ lat, lng }) => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/hospitals`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lat, lng, name: pendingHospitalName, ambulance_count: pendingHospitalCapacity }),
+      })
+      if (res.ok) {
+        const refreshed = await fetch(`${BACKEND_URL}/api/hospitals`).then((r) => r.json())
+        setHospitals(refreshed.hospitals || [])
+        addLog('success', `Hospital placed (${pendingHospitalCapacity} ambulances).`)
+      } else {
+        addLog('error', `Hospital POST failed (${res.status}). Restart the backend to pick up new endpoints.`)
+      }
+    } catch (e) {
+      addLog('error', `Hospital POST failed: ${e?.message || 'offline'}`)
+    }
+    setHospitalPlacementMode(false)
+    setPendingHospitalName(null)
+  }, [pendingHospitalName, pendingHospitalCapacity]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleHospitalRemove = useCallback(async (id) => {
+    setHospitals((prev) => prev.filter((h) => h.id !== id))
+    fetch(`${BACKEND_URL}/api/hospitals/${id}`, { method: 'DELETE' }).catch(() => {})
+  }, [])
+
+  const handleHospitalCapacityChange = useCallback(async (id, count) => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/hospitals/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count }),
+      })
+      if (res.ok) {
+        const refreshed = await fetch(`${BACKEND_URL}/api/hospitals`).then((r) => r.json())
+        setHospitals(refreshed.hospitals || [])
+      } else {
+        addLog('error', `Hospital PATCH failed (${res.status}).`)
+      }
+    } catch (e) {
+      addLog('error', `Hospital PATCH failed: ${e?.message || 'offline'}`)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Police station placement handlers (mirror fire station)
+  const handlePolicePlace = useCallback(async ({ lat, lng }) => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/police-stations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lat, lng, name: pendingPoliceName, police_count: pendingPoliceCapacity }),
+      })
+      if (res.ok) {
+        const refreshed = await fetch(`${BACKEND_URL}/api/police-stations`).then((r) => r.json())
+        setPoliceStations(refreshed.stations || [])
+        addLog('success', `Police station placed (${pendingPoliceCapacity} officers).`)
+      } else {
+        addLog('error', `Police station POST failed (${res.status}). Restart the backend to pick up new endpoints.`)
+      }
+    } catch (e) {
+      addLog('error', `Police station POST failed: ${e?.message || 'offline'}`)
+    }
+    setPolicePlacementMode(false)
+    setPendingPoliceName(null)
+  }, [pendingPoliceName, pendingPoliceCapacity]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handlePoliceRemove = useCallback(async (id) => {
+    setPoliceStations((prev) => prev.filter((p) => p.id !== id))
+    fetch(`${BACKEND_URL}/api/police-stations/${id}`, { method: 'DELETE' }).catch(() => {})
+  }, [])
+
+  const handlePoliceCapacityChange = useCallback(async (id, count) => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/police-stations/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count }),
+      })
+      if (res.ok) {
+        const refreshed = await fetch(`${BACKEND_URL}/api/police-stations`).then((r) => r.json())
+        setPoliceStations(refreshed.stations || [])
+      } else {
+        addLog('error', `Police station PATCH failed (${res.status}).`)
+      }
+    } catch (e) {
+      addLog('error', `Police station PATCH failed: ${e?.message || 'offline'}`)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Multi-station dispatch. Sorts stations by distance to the target and
+  // pulls trucks from each in turn until the request is fulfilled or every
+  // station is dry. Each station's ack is atomic so capacity caps are
+  // honoured even if multiple operators race.
+  const handleDispatch = useCallback(async () => {
     if (!dispatchTarget || !engine) {
       addLog('error', 'Place a target on the map first.')
       return
@@ -387,34 +566,72 @@ export default function DisasterDashboard() {
       addLog('error', 'No fire stations configured. Open Settings (⚙) to add one.')
       return
     }
-    // Pick the closest station (as-the-crow-flies).
-    const closest = fireStations.reduce((best, s) => {
-      const d = Math.hypot(s.lat - dispatchTarget.lat, s.lng - dispatchTarget.lng)
-      return !best || d < best.d ? { s, d } : best
-    }, null)
-    const station = closest.s
-    fetch(`${BACKEND_URL}/api/dispatch`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'firefighter', trucks: dispatchTrucks, target: dispatchTarget }),
-    }).catch(() => {})
-    if (engine.spawnFireTrucks) {
-      const dispatchId = `disp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-      const actual = engine.spawnFireTrucks(
-        dispatchId,
-        { lat: station.lat, lng: station.lng },
-        dispatchTarget,
-        dispatchTrucks,
-        station.id,
-      )
-      if (actual > 0) {
-        setActiveDispatches((prev) => [
-          ...prev,
-          { id: dispatchId, trucks: actual, target: dispatchTarget, stationName: station.name || 'Station' },
-        ])
-        addLog('success', `Dispatched ${actual} truck${actual === 1 ? '' : 's'} from ${station.name || 'Station'}.`)
+    const sorted = fireStations
+      .map((s) => ({ s, d: Math.hypot(s.lat - dispatchTarget.lat, s.lng - dispatchTarget.lng) }))
+      .sort((a, b) => a.d - b.d)
+    let remaining = dispatchTrucks
+    const newDispatches = []
+    // First, re-task any RETURNING trucks so they don't waste the round trip
+    // home before being useful. Re-tasked trucks keep their original
+    // capacity allocation — no ack needed.
+    if (engine.retaskReturningTrucks && remaining > 0) {
+      const retaskId = `retask-${Date.now()}-${Math.random().toString(36).slice(2, 4)}`
+      const retasked = engine.retaskReturningTrucks(retaskId, dispatchTarget, remaining)
+      if (retasked > 0) {
+        newDispatches.push({ id: retaskId, trucks: retasked, target: dispatchTarget, stationName: 'returning crews' })
+        remaining -= retasked
       }
     }
+    for (const { s } of sorted) {
+      if (remaining <= 0) break
+      const available = (s.truck_count ?? 0) - (s.trucks_dispatched ?? 0)
+      if (available <= 0) continue
+      const toTake = Math.min(remaining, available)
+      let ackOk = false
+      try {
+        const ack = await fetch(`${BACKEND_URL}/api/fire-stations/${s.id}/dispatch_ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: toTake }),
+        })
+        ackOk = ack.ok
+      } catch { /* offline */ }
+      if (!ackOk) continue
+      fetch(`${BACKEND_URL}/api/dispatch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'firefighter', trucks: toTake, target: dispatchTarget, station_id: s.id }),
+      }).catch(() => {})
+      const dispatchId = `disp-${Date.now()}-${s.id.slice(0, 4)}-${Math.random().toString(36).slice(2, 4)}`
+      const spawned = engine.spawnFireTrucks
+        ? engine.spawnFireTrucks(dispatchId, { lat: s.lat, lng: s.lng }, dispatchTarget, toTake, s.id)
+        : 0
+      // Refund any shortfall so the counter doesn't drift.
+      const shortfall = toTake - spawned
+      if (shortfall > 0) {
+        fetch(`${BACKEND_URL}/api/fire-stations/${s.id}/return_ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: shortfall }),
+        }).catch(() => {})
+      }
+      if (spawned > 0) {
+        newDispatches.push({ id: dispatchId, trucks: spawned, target: dispatchTarget, stationName: s.name || 'Station' })
+        remaining -= spawned
+      }
+    }
+    if (newDispatches.length > 0) {
+      setActiveDispatches((prev) => [...prev, ...newDispatches])
+      const total = newDispatches.reduce((n, d) => n + d.trucks, 0)
+      const names = newDispatches.map((d) => `${d.trucks}× ${d.stationName}`).join(', ')
+      addLog('success', `Dispatched ${total} truck${total === 1 ? '' : 's'} (${names}).`)
+    }
+    if (remaining > 0) {
+      addLog('error', `Short ${remaining} truck${remaining === 1 ? '' : 's'} — every station is at capacity.`)
+    }
+    fetch(`${BACKEND_URL}/api/fire-stations`).then((r) => r.ok ? r.json() : null).then((j) => {
+      if (j) setFireStations(j.stations || [])
+    }).catch(() => {})
     setDispatchTarget(null)
   }, [dispatchTarget, dispatchTrucks, fireStations, engine]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -424,18 +641,292 @@ export default function DisasterDashboard() {
     addLog('info', `Trucks recalled.`)
   }, [engine]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Subscribe to engine ticks and prune any active-dispatch entry whose trucks
-  // have all despawned (returned home or recalled then despawned). Without
-  // this the panel keeps showing "7 from Station" even after every truck has
-  // made it back, which reads as "they're stuck somewhere".
+  // Multi-hospital ambulance dispatch — same fan-out pattern as firefighters.
+  const handleAmbulanceDispatch = useCallback(async () => {
+    if (!ambDispatchTarget || !engine) {
+      addLog('error', 'Place an ambulance target on the map first.')
+      return
+    }
+    if (hospitals.length === 0) {
+      addLog('error', 'No hospitals configured. Open Settings (⚙) to add one.')
+      return
+    }
+    const sorted = hospitals
+      .map((h) => ({ h, d: Math.hypot(h.lat - ambDispatchTarget.lat, h.lng - ambDispatchTarget.lng) }))
+      .sort((a, b) => a.d - b.d)
+    let remaining = ambDispatchUnits
+    const newDispatches = []
+    if (engine.retaskReturningAmbulances && remaining > 0) {
+      const retaskId = `retask-amb-${Date.now()}-${Math.random().toString(36).slice(2, 4)}`
+      const retasked = engine.retaskReturningAmbulances(retaskId, ambDispatchTarget, remaining)
+      if (retasked > 0) {
+        newDispatches.push({ id: retaskId, units: retasked, target: ambDispatchTarget, stationName: 'returning crews' })
+        remaining -= retasked
+      }
+    }
+    for (const { h } of sorted) {
+      if (remaining <= 0) break
+      const available = (h.ambulance_count ?? 0) - (h.ambulances_dispatched ?? 0)
+      if (available <= 0) continue
+      const toTake = Math.min(remaining, available)
+      let ackOk = false
+      try {
+        const ack = await fetch(`${BACKEND_URL}/api/hospitals/${h.id}/dispatch_ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: toTake }),
+        })
+        ackOk = ack.ok
+      } catch { /* offline */ }
+      if (!ackOk) continue
+      fetch(`${BACKEND_URL}/api/dispatch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'ambulance', units: toTake, target: ambDispatchTarget, station_id: h.id }),
+      }).catch(() => {})
+      const dispatchId = `amb-${Date.now()}-${h.id.slice(0, 4)}-${Math.random().toString(36).slice(2, 4)}`
+      const spawned = engine.spawnAmbulances
+        ? engine.spawnAmbulances(dispatchId, { lat: h.lat, lng: h.lng }, ambDispatchTarget, toTake, h.id)
+        : 0
+      const shortfall = toTake - spawned
+      if (shortfall > 0) {
+        fetch(`${BACKEND_URL}/api/hospitals/${h.id}/return_ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: shortfall }),
+        }).catch(() => {})
+      }
+      if (spawned > 0) {
+        newDispatches.push({ id: dispatchId, units: spawned, target: ambDispatchTarget, stationName: h.name || 'Hospital' })
+        remaining -= spawned
+      }
+    }
+    if (newDispatches.length > 0) {
+      setActiveAmbulanceDispatches((prev) => [...prev, ...newDispatches])
+      const total = newDispatches.reduce((n, d) => n + d.units, 0)
+      const names = newDispatches.map((d) => `${d.units}× ${d.stationName}`).join(', ')
+      addLog('success', `Dispatched ${total} ambulance${total === 1 ? '' : 's'} (${names}).`)
+    }
+    if (remaining > 0) {
+      addLog('error', `Short ${remaining} ambulance${remaining === 1 ? '' : 's'} — every hospital is at capacity.`)
+    }
+    fetch(`${BACKEND_URL}/api/hospitals`).then((r) => r.ok ? r.json() : null).then((j) => {
+      if (j) setHospitals(j.hospitals || [])
+    }).catch(() => {})
+    setAmbDispatchTarget(null)
+  }, [ambDispatchTarget, ambDispatchUnits, hospitals, engine]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleAmbulanceRecall = useCallback((dispatchId) => {
+    if (engine?.recallAmbulances) engine.recallAmbulances(dispatchId)
+    setActiveAmbulanceDispatches((prev) => prev.filter((d) => d.id !== dispatchId))
+    addLog('info', 'Ambulances recalled.')
+  }, [engine]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Multi-precinct manual patrol — same fan-out pattern as firefighters.
+  const handlePoliceDispatchManual = useCallback(async () => {
+    if (!policeDispatchTarget || !engine) {
+      addLog('error', 'Place a patrol target on the map first.')
+      return
+    }
+    if (policeStations.length === 0) {
+      addLog('error', 'No police stations configured. Open Settings (⚙) to add one.')
+      return
+    }
+    const sorted = policeStations
+      .map((p) => ({ p, d: Math.hypot(p.lat - policeDispatchTarget.lat, p.lng - policeDispatchTarget.lng) }))
+      .sort((a, b) => a.d - b.d)
+    let remaining = policeDispatchUnits
+    const newDispatches = []
+    if (engine.retaskReturningPolice && remaining > 0) {
+      const retaskId = `manual-retask-${Date.now()}-${Math.random().toString(36).slice(2, 4)}`
+      const retasked = engine.retaskReturningPolice(retaskId, policeDispatchTarget, remaining)
+      if (retasked > 0) {
+        newDispatches.push({ id: retaskId, units: retasked, target: policeDispatchTarget, stationName: 'returning crews' })
+        remaining -= retasked
+      }
+    }
+    for (const { p } of sorted) {
+      if (remaining <= 0) break
+      const available = (p.police_count ?? 0) - (p.police_dispatched ?? 0)
+      if (available <= 0) continue
+      const toTake = Math.min(remaining, available)
+      let ackOk = false
+      try {
+        const ack = await fetch(`${BACKEND_URL}/api/police-stations/${p.id}/dispatch_ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: toTake }),
+        })
+        ackOk = ack.ok
+      } catch { /* offline */ }
+      if (!ackOk) continue
+      fetch(`${BACKEND_URL}/api/dispatch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind: 'police', units: toTake, target: policeDispatchTarget, station_id: p.id }),
+      }).catch(() => {})
+      const dispatchId = `manual-${Date.now()}-${p.id.slice(0, 4)}-${Math.random().toString(36).slice(2, 4)}`
+      const spawned = engine.spawnPolice
+        ? engine.spawnPolice(dispatchId, { lat: p.lat, lng: p.lng }, policeDispatchTarget, toTake, p.id)
+        : 0
+      const shortfall = toTake - spawned
+      if (shortfall > 0) {
+        fetch(`${BACKEND_URL}/api/police-stations/${p.id}/return_ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ units: shortfall }),
+        }).catch(() => {})
+      }
+      if (spawned > 0) {
+        newDispatches.push({ id: dispatchId, units: spawned, target: policeDispatchTarget, stationName: p.name || 'Station' })
+        remaining -= spawned
+      }
+    }
+    if (newDispatches.length > 0) {
+      setActivePoliceDispatches((prev) => [...prev, ...newDispatches])
+      const total = newDispatches.reduce((n, d) => n + d.units, 0)
+      const names = newDispatches.map((d) => `${d.units}× ${d.stationName}`).join(', ')
+      addLog('success', `Dispatched ${total} officer${total === 1 ? '' : 's'} (${names}).`)
+    }
+    if (remaining > 0) {
+      addLog('error', `Short ${remaining} officer${remaining === 1 ? '' : 's'} — every station is at capacity.`)
+    }
+    fetch(`${BACKEND_URL}/api/police-stations`).then((r) => r.ok ? r.json() : null).then((j) => {
+      if (j) setPoliceStations(j.stations || [])
+    }).catch(() => {})
+    setPoliceDispatchTarget(null)
+  }, [policeDispatchTarget, policeDispatchUnits, policeStations, engine]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handlePoliceRecall = useCallback((dispatchId) => {
+    if (engine?.recallPolice) engine.recallPolice(dispatchId)
+    setActivePoliceDispatches((prev) => prev.filter((d) => d.id !== dispatchId))
+    addLog('info', 'Patrol recalled.')
+  }, [engine]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Robbery context-menu handlers
+  const handleCitizenContextMenu = useCallback((idx, x, y) => {
+    setCrimeMenu({ citizenIdx: idx, x, y })
+  }, [])
+
+  const handleTriggerRobbery = useCallback((level) => {
+    if (!engine?.triggerRobbery || !crimeMenu) return
+    const res = engine.triggerRobbery(crimeMenu.citizenIdx, level)
+    if (res?.result === 'caught') addLog('success', `L${level} robbery: suspect caught by officer on scene.`)
+    else if (res?.result === 'committed' && res.injuredIdx >= 0) addLog('error', `L${level} robbery: bystander injured. Dispatch an ambulance.`)
+    else if (res?.result === 'committed') addLog('info', `L${level} robbery: no one injured.`)
+    setCrimeMenu(null)
+  }, [engine, crimeMenu]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Close the crime menu on any click outside it.
   useEffect(() => {
-    if (!engine?.subscribe || !engine.getActiveDispatchIds) return
+    if (!crimeMenu) return
+    const close = () => setCrimeMenu(null)
+    window.addEventListener('click', close)
+    return () => window.removeEventListener('click', close)
+  }, [crimeMenu])
+
+  // ~50% auto-patrol: for each police station, keep round(police_count * 0.5)
+  // officers out on baseline patrol. Refills when one of those officers
+  // despawns at the station (e.g. stuck-detection sent them home).
+  // Manual operator dispatches stack on top of this baseline.
+  useEffect(() => {
+    if (!engine?.spawnPolice || !engine.getAutoPoliceCounts) return
+    let cancelled = false
+    const checkAndDeploy = async () => {
+      if (cancelled) return
+      if (policeStations.length === 0) return
+      const auto = engine.getAutoPoliceCounts()
+      for (const ps of policeStations) {
+        const target = Math.round((ps.police_count ?? 0) * 0.5)
+        const current = auto.get(ps.id) || 0
+        if (current >= target) continue
+        const available = (ps.police_count ?? 0) - (ps.police_dispatched ?? 0)
+        if (available <= 0) {
+          console.warn(`[auto-patrol] ${ps.name || ps.id}: at capacity (${ps.police_dispatched}/${ps.police_count}); skipping`)
+          continue
+        }
+        const need = Math.min(target - current, available)
+        if (need <= 0) continue
+        let ackOk = false
+        try {
+          const ack = await fetch(`${BACKEND_URL}/api/police-stations/${ps.id}/dispatch_ack`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ units: need }),
+          })
+          ackOk = ack.ok
+          if (!ackOk) {
+            console.warn(`[auto-patrol] ${ps.name || ps.id}: dispatch_ack returned ${ack.status}`)
+          }
+        } catch (e) {
+          console.warn(`[auto-patrol] ${ps.name || ps.id}: dispatch_ack failed`, e?.message)
+        }
+        if (!ackOk) continue
+        const dispatchId = `auto-${ps.id}-${Date.now()}`
+        const spawned = engine.spawnPolice(
+          dispatchId,
+          { lat: ps.lat, lng: ps.lng },
+          { lat: ps.lat, lng: ps.lng, radius: POLICE_PATROL_DEFAULT_RADIUS_M },
+          need,
+          ps.id,
+        )
+        // Refund any units the engine couldn't actually spawn so the DB
+        // counter doesn't drift over time (eventually stranding the station
+        // at "capacity" with no actual officers out).
+        const shortfall = need - spawned
+        if (shortfall > 0) {
+          console.warn(`[auto-patrol] ${ps.name || ps.id}: requested ${need}, engine spawned ${spawned}; refunding ${shortfall}`)
+          try {
+            await fetch(`${BACKEND_URL}/api/police-stations/${ps.id}/return_ack`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ units: shortfall }),
+            })
+          } catch { /* offline */ }
+        }
+        if (spawned > 0) {
+          console.info(`[auto-patrol] ${ps.name || ps.id}: deployed ${spawned} officer${spawned === 1 ? '' : 's'}`)
+        }
+        // Refresh station list so the capacity badge reflects the auto-deploy.
+        fetch(`${BACKEND_URL}/api/police-stations`).then((r) => r.ok ? r.json() : null).then((j) => {
+          if (j && !cancelled) setPoliceStations(j.stations || [])
+        }).catch(() => {})
+      }
+    }
+    // Fire immediately so the operator sees cops appear right after placing a
+    // station — don't wait 3 s for the first interval tick.
+    checkAndDeploy()
+    const id = setInterval(checkAndDeploy, 3000)
+    return () => { cancelled = true; clearInterval(id) }
+  }, [engine, policeStations])
+
+  // Subscribe to engine ticks and prune any active-dispatch entry whose units
+  // have all despawned. Without this the panel keeps showing "7 from Station"
+  // even after every unit has made it back.
+  useEffect(() => {
+    if (!engine?.subscribe) return
     const unsub = engine.subscribe(() => {
-      const live = engine.getActiveDispatchIds()
-      setActiveDispatches((prev) => {
-        const next = prev.filter((d) => live.has(d.id))
-        return next.length === prev.length ? prev : next
-      })
+      if (engine.getActiveDispatchIds) {
+        const live = engine.getActiveDispatchIds()
+        setActiveDispatches((prev) => {
+          const next = prev.filter((d) => live.has(d.id))
+          return next.length === prev.length ? prev : next
+        })
+      }
+      if (engine.getActiveAmbulanceDispatchIds) {
+        const live = engine.getActiveAmbulanceDispatchIds()
+        setActiveAmbulanceDispatches((prev) => {
+          const next = prev.filter((d) => live.has(d.id))
+          return next.length === prev.length ? prev : next
+        })
+      }
+      if (engine.getActivePoliceDispatchIds) {
+        const live = engine.getActivePoliceDispatchIds()
+        setActivePoliceDispatches((prev) => {
+          const next = prev.filter((d) => live.has(d.id))
+          return next.length === prev.length ? prev : next
+        })
+      }
     })
     return unsub
   }, [engine])
@@ -1142,6 +1633,177 @@ export default function DisasterDashboard() {
             )}
           </section>
 
+          {/* Ambulance dispatch */}
+          <section className="space-y-2">
+            <SectionLabel>Dispatch ambulances</SectionLabel>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setAmbDispatchUnits((v) => Math.max(1, v - 1))}
+                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+              >−</button>
+              <input
+                type="number"
+                min={1}
+                max={20}
+                value={ambDispatchUnits}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10) || 1
+                  setAmbDispatchUnits(Math.max(1, Math.min(20, v)))
+                }}
+                className="w-14 bg-zinc-900 border border-zinc-800 rounded px-2 py-0.5 text-[12px] text-zinc-100 tabular-nums text-center focus:outline-none focus:border-zinc-600"
+              />
+              <button
+                onClick={() => setAmbDispatchUnits((v) => Math.min(20, v + 1))}
+                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+              >+</button>
+              <span className="text-[10px] text-zinc-500">ambulances</span>
+            </div>
+            <button
+              onClick={() => setAmbDispatchTargetMode((v) => !v)}
+              className={[
+                'w-full py-1.5 rounded text-[11px] transition-colors',
+                ambDispatchTargetMode
+                  ? 'bg-rose-500/30 text-rose-100 border border-rose-500/60'
+                  : 'bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100',
+              ].join(' ')}
+            >
+              {ambDispatchTargetMode
+                ? 'Click on map to set patient pickup centre…'
+                : ambDispatchTarget
+                  ? `Pickup: ${ambDispatchTarget.lat.toFixed(3)}, ${ambDispatchTarget.lng.toFixed(3)} · ${Math.round(ambDispatchTarget.radius ?? ambDispatchRadius)} m (change)`
+                  : '🏥 Pick pickup area on map'}
+            </button>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-zinc-400 whitespace-nowrap">Search radius</span>
+              <input
+                type="range"
+                min={50}
+                max={300}
+                step={25}
+                value={ambDispatchRadius}
+                onChange={(e) => {
+                  const r = +e.target.value
+                  setAmbDispatchRadius(r)
+                  setAmbDispatchTarget((t) => (t ? { ...t, radius: r } : t))
+                }}
+                className="flex-1"
+              />
+              <span className="text-[11px] text-zinc-400 tabular-nums w-12 text-right">{ambDispatchRadius}m</span>
+            </div>
+            <button
+              onClick={handleAmbulanceDispatch}
+              disabled={!ambDispatchTarget || hospitals.length === 0}
+              className="w-full py-2 rounded text-[12px] font-medium text-white bg-rose-600 hover:bg-rose-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed transition-colors"
+            >
+              Dispatch {ambDispatchUnits} ambulance{ambDispatchUnits === 1 ? '' : 's'}
+            </button>
+            {hospitals.length === 0 && (
+              <p className="text-[10px] text-zinc-600">No hospitals — open ⚙ Settings to place one.</p>
+            )}
+            {activeAmbulanceDispatches.length > 0 && (
+              <div className="space-y-1 pt-1">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Active dispatches</div>
+                {activeAmbulanceDispatches.map((d) => (
+                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 rounded border border-zinc-800 bg-zinc-950 text-[10px]">
+                    <span>🚑 {d.units}</span>
+                    <span className="text-zinc-500 flex-1 truncate">from {d.stationName}</span>
+                    <button
+                      onClick={() => handleAmbulanceRecall(d.id)}
+                      className="text-zinc-500 hover:text-rose-300 text-[10px]"
+                    >Recall</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* Manual police patrol */}
+          <section className="space-y-2">
+            <SectionLabel>Manual police patrol</SectionLabel>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setPoliceDispatchUnits((v) => Math.max(1, v - 1))}
+                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+              >−</button>
+              <input
+                type="number"
+                min={1}
+                max={50}
+                value={policeDispatchUnits}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10) || 1
+                  setPoliceDispatchUnits(Math.max(1, Math.min(50, v)))
+                }}
+                className="w-14 bg-zinc-900 border border-zinc-800 rounded px-2 py-0.5 text-[12px] text-zinc-100 tabular-nums text-center focus:outline-none focus:border-zinc-600"
+              />
+              <button
+                onClick={() => setPoliceDispatchUnits((v) => Math.min(50, v + 1))}
+                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+              >+</button>
+              <span className="text-[10px] text-zinc-500">officers</span>
+            </div>
+            <button
+              onClick={() => setPoliceDispatchTargetMode((v) => !v)}
+              className={[
+                'w-full py-1.5 rounded text-[11px] transition-colors',
+                policeDispatchTargetMode
+                  ? 'bg-blue-500/30 text-blue-100 border border-blue-500/60'
+                  : 'bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100',
+              ].join(' ')}
+            >
+              {policeDispatchTargetMode
+                ? 'Click on map to set patrol centre…'
+                : policeDispatchTarget
+                  ? `Patrol: ${policeDispatchTarget.lat.toFixed(3)}, ${policeDispatchTarget.lng.toFixed(3)} · ${Math.round(policeDispatchTarget.radius ?? policeDispatchRadius)} m (change)`
+                  : '🚓 Pick patrol area on map'}
+            </button>
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-zinc-400 whitespace-nowrap">Patrol radius</span>
+              <input
+                type="range"
+                min={150}
+                max={1500}
+                step={50}
+                value={policeDispatchRadius}
+                onChange={(e) => {
+                  const r = +e.target.value
+                  setPoliceDispatchRadius(r)
+                  setPoliceDispatchTarget((t) => (t ? { ...t, radius: r } : t))
+                }}
+                className="flex-1"
+              />
+              <span className="text-[11px] text-zinc-400 tabular-nums w-12 text-right">{policeDispatchRadius}m</span>
+            </div>
+            <button
+              onClick={handlePoliceDispatchManual}
+              disabled={!policeDispatchTarget || policeStations.length === 0}
+              className="w-full py-2 rounded text-[12px] font-medium text-white bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed transition-colors"
+            >
+              Dispatch {policeDispatchUnits} officer{policeDispatchUnits === 1 ? '' : 's'}
+            </button>
+            {policeStations.length === 0 && (
+              <p className="text-[10px] text-zinc-600">No police stations — open ⚙ Settings to place one.</p>
+            )}
+            {activePoliceDispatches.length > 0 && (
+              <div className="space-y-1 pt-1">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Active patrols</div>
+                {activePoliceDispatches.map((d) => (
+                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 rounded border border-zinc-800 bg-zinc-950 text-[10px]">
+                    <span>🚓 {d.units}</span>
+                    <span className="text-zinc-500 flex-1 truncate">from {d.stationName}</span>
+                    <button
+                      onClick={() => handlePoliceRecall(d.id)}
+                      className="text-zinc-500 hover:text-blue-300 text-[10px]"
+                    >Recall</button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="text-[10px] text-zinc-600">
+              ~50% of each station's roster auto-patrols nearby looking for crime. Right-click any citizen to trigger a robbery.
+            </p>
+          </section>
+
           <section className="space-y-2">
             <SectionLabel>Notify / Cordon</SectionLabel>
             <input
@@ -1286,29 +1948,69 @@ export default function DisasterDashboard() {
           citizenEngine={engine}
           focusPoint={focusPoint}
           onCitizenClick={handleCitizenClick}
+          onCitizenContextMenu={handleCitizenContextMenu}
           fireStations={fireStations}
           stationPlacementMode={stationPlacementMode}
           onStationPlace={handleStationPlace}
+          hospitals={hospitals}
+          hospitalPlacementMode={hospitalPlacementMode}
+          onHospitalPlace={handleHospitalPlace}
+          policeStations={policeStations}
+          policePlacementMode={policePlacementMode}
+          onPolicePlace={handlePolicePlace}
           notifications={notifications}
           cordons={cordons}
           dispatchTargetMode={dispatchTargetMode}
           dispatchTarget={dispatchTarget}
           activeDispatches={activeDispatches}
           onDispatchTargetPick={(p) => { setDispatchTarget({ lat: p.lat, lng: p.lng, radius: dispatchRadius }); setDispatchTargetMode(false) }}
+          ambDispatchTargetMode={ambDispatchTargetMode}
+          ambDispatchTarget={ambDispatchTarget}
+          activeAmbulanceDispatches={activeAmbulanceDispatches}
+          onAmbDispatchTargetPick={(p) => { setAmbDispatchTarget({ lat: p.lat, lng: p.lng, radius: ambDispatchRadius }); setAmbDispatchTargetMode(false) }}
+          policeDispatchTargetMode={policeDispatchTargetMode}
+          policeDispatchTarget={policeDispatchTarget}
+          activePoliceDispatches={activePoliceDispatches}
+          onPoliceDispatchTargetPick={(p) => { setPoliceDispatchTarget({ lat: p.lat, lng: p.lng, radius: policeDispatchRadius }); setPoliceDispatchTargetMode(false) }}
           polygonDrawKind={polygonDrawKind}
           onPolygonDraw={handlePolygonDraw}
         />
 
         <SettingsPanel
           open={settingsOpen}
-          onClose={() => { setSettingsOpen(false); setStationPlacementMode(false) }}
+          onClose={() => {
+            setSettingsOpen(false)
+            setStationPlacementMode(false)
+            setHospitalPlacementMode(false)
+            setPolicePlacementMode(false)
+          }}
           stations={fireStations}
           placementMode={stationPlacementMode}
-          onStationPlacementToggle={(on, name) => {
+          onStationPlacementToggle={(on, name, capacity) => {
             setStationPlacementMode(on)
             setPendingStationName(name)
+            if (typeof capacity === 'number') setPendingStationCapacity(capacity)
           }}
           onStationRemove={handleStationRemove}
+          onStationCapacityChange={handleStationCapacityChange}
+          hospitals={hospitals}
+          hospitalPlacementMode={hospitalPlacementMode}
+          onHospitalPlacementToggle={(on, name, capacity) => {
+            setHospitalPlacementMode(on)
+            setPendingHospitalName(name)
+            if (typeof capacity === 'number') setPendingHospitalCapacity(capacity)
+          }}
+          onHospitalRemove={handleHospitalRemove}
+          onHospitalCapacityChange={handleHospitalCapacityChange}
+          policeStations={policeStations}
+          policePlacementMode={policePlacementMode}
+          onPolicePlacementToggle={(on, name, capacity) => {
+            setPolicePlacementMode(on)
+            setPendingPoliceName(name)
+            if (typeof capacity === 'number') setPendingPoliceCapacity(capacity)
+          }}
+          onPoliceRemove={handlePoliceRemove}
+          onPoliceCapacityChange={handlePoliceCapacityChange}
         />
 
         <div className="absolute top-4 right-4 z-30 flex flex-col items-end gap-2">
@@ -1493,6 +2195,38 @@ export default function DisasterDashboard() {
           onReportClick={handleReportClick}
           typeIconLookup={typeIconLookup}
         />
+
+        {/* Right-click crime menu (operator triggers a robbery on a citizen). */}
+        {crimeMenu && (
+          <div
+            className="fixed z-[1000] bg-zinc-900/97 backdrop-blur border border-zinc-700 rounded-md shadow-xl py-1 text-[11px] text-zinc-100"
+            style={{ left: crimeMenu.x + 4, top: crimeMenu.y + 4 }}
+            onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <div className="px-3 py-1 text-zinc-500 text-[10px] uppercase tracking-wide">
+              Citizen #{crimeMenu.citizenIdx}
+            </div>
+            <button
+              className="w-full text-left px-3 py-1.5 hover:bg-amber-500/20 hover:text-amber-200"
+              onClick={() => handleTriggerRobbery(1)}
+            >
+              💰 Trigger Robbery (L1 – pickpocket)
+            </button>
+            <button
+              className="w-full text-left px-3 py-1.5 hover:bg-red-500/20 hover:text-red-200"
+              onClick={() => handleTriggerRobbery(2)}
+            >
+              🔫 Trigger Robbery (L2 – armed)
+            </button>
+            <button
+              className="w-full text-left px-3 py-1.5 text-zinc-500 hover:text-zinc-300"
+              onClick={() => setCrimeMenu(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
       </main>
     </div>
   )

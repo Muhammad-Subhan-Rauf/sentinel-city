@@ -44,10 +44,13 @@ export type MobileCitizen = {
   last_seen: string;
 };
 
+export type WorkerSubRole = 'firefighter' | 'paramedic' | 'police';
+
 export type MobileWorker = {
   id: string;
   name: string;
-  role: 'firefighter' | 'paramedic' | 'police';
+  role: WorkerSubRole;
+  sub_role?: WorkerSubRole;
   lat: number;
   lng: number;
   status: 'available' | 'dispatched' | 'on_scene' | 'off_duty';
@@ -58,11 +61,14 @@ export type Disaster = {
   id: string;
   disaster_type: string;
   severity: number;
-  geometry: any;
+  area_geometry: any;
   geometry_kind: 'point' | 'area' | 'city' | null;
   notes: string | null;
-  status: 'draft' | 'active';
+  status: 'draft' | 'active' | 'cleared';
   cause: 'weather' | 'infrastructure' | null;
+  spread_speed: number | null;
+  people_inside: number | null;
+  safe_exit_pct: number | null;
   created_at: string;
 };
 
@@ -72,9 +78,38 @@ export type Notification = {
   reason: string;
   status: 'active' | 'cleared';
   created_at: string;
+  event_id: string | null;
 };
 
 export type Cordon = Notification;
+
+export type CitizenReport = {
+  id: string;
+  event_id: string | null;
+  citizen_idx: number;
+  reported_at: string;
+  report_kind: 'observation' | 'affected';
+  location: { lat: number; lng: number };
+  transcript: string;
+  perceived_severity: number | null;
+};
+
+export type FireStation = {
+  id: string;
+  name: string;
+  lat: number;
+  lng: number;
+  created_at: string;
+  truck_count: number;
+  trucks_dispatched: number;
+};
+
+export type LoginResponse = {
+  user_id: string;
+  role: Role;
+  sub_role?: WorkerSubRole;
+  name: string;
+};
 
 export type Agent = {
   id: string;
@@ -102,6 +137,13 @@ export type SavingsInsight = {
 // ─── Endpoints ───────────────────────────────────────────────────────
 
 export const api = {
+  // Auth
+  login: (deviceId: string, pin: string) =>
+    request<LoginResponse>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ device_id: deviceId, pin }),
+    }),
+
   // Mobile users
   listCitizens: () =>
     request<{ citizens: MobileCitizen[] }>('/api/citizens').then((r) => r.citizens),
@@ -128,17 +170,28 @@ export const api = {
   listCordons: () =>
     request<{ cordons: Cordon[] }>('/api/cordons?status_filter=active').then((r) => r.cordons),
 
+  // Disasters
+  listDisasters: () =>
+    request<{ disasters: Disaster[] }>('/api/disasters').then((r) => r.disasters),
+  getDisaster: (id: string) => request<Disaster>(`/api/disasters/${id}`),
+
+  // Citizen reports (admin Calls screen)
+  listCitizenReports: (limit = 100) =>
+    request<{ reports: CitizenReport[] }>(`/api/citizen-reports?limit=${limit}`).then(
+      (r) => r.reports
+    ),
+
   // Admin
   listAgents: () => request<{ agents: Agent[] }>('/api/agents').then((r) => r.agents),
   savingsSummary: () => request<SavingsSummary>('/api/savings-summary'),
   savingsInsight: (metric: 'lives' | 'infrastructure' | 'money') =>
     request<SavingsInsight>(`/api/savings-summary/insight?metric=${metric}`),
+  statsInjured: () =>
+    request<{ injured_estimate: number; contributing_events: number }>('/api/stats/injured'),
 
   // Dispatch — reuses the same endpoint as the web app
   listFireStations: () =>
-    request<{ stations: Array<{ id: string; name: string; lat: number; lng: number }> }>(
-      '/api/fire-stations'
-    ).then((r) => r.stations),
+    request<{ stations: FireStation[] }>('/api/fire-stations').then((r) => r.stations),
 };
 
 // ─── External: Valhalla routing ──────────────────────────────────────
