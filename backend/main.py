@@ -42,7 +42,9 @@ async def lifespan(app: FastAPI):
         from api_client import SentinelAPIClient
         from audit import AuditLogger
         from state import AgentState
-        from orchestrator import detection_loop, monitoring_supervisor
+        from orchestrator import detection_loop, monitoring_supervisor, load_prompt
+        from agent_tools import build_tools
+        from agent_graph import build_agent
     except Exception as exc:
         log.warning(f"Orchestrator import failed ({exc}); API will run without AI loops.")
         yield
@@ -54,11 +56,23 @@ async def lifespan(app: FastAPI):
     api = SentinelAPIClient(base_url=base_url)
     state = AgentState(agent_id="agent-sentinel-core")
     audit = AuditLogger()
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    api_key = os.environ["GEMINI_API_KEY"]
+    client = genai.Client(api_key=api_key)
+
+    # Build the LangGraph ReAct agents. The monitoring agent is built with
+    # force_tool_use=True so Gemini cannot reply with "Would you like me to
+    # proceed?" without actually invoking a tool — the structural fix for
+    # the autonomy bug observed in commit 55830c7's logs.
+    log.info("Building LangGraph agents...")
+    tools_list = build_tools(api, audit, client, agent_id=state.agent_id)
+    detection_prompt = await load_prompt("detection_prompt.md")
+    monitoring_prompt = await load_prompt("monitoring_prompt.md")
+    detection_agent = build_agent(api_key, detection_prompt, tools_list, force_tool_use=False)
+    monitoring_agent = build_agent(api_key, monitoring_prompt, tools_list, force_tool_use=True)
 
     log.info(f"Starting orchestrator loops against {base_url}")
-    detection_task = asyncio.create_task(detection_loop(api, state, audit, client))
-    monitoring_task = asyncio.create_task(monitoring_supervisor(api, state, audit, client))
+    detection_task = asyncio.create_task(detection_loop(api, state, audit, client, detection_agent))
+    monitoring_task = asyncio.create_task(monitoring_supervisor(api, state, audit, client, monitoring_agent))
 
     try:
         yield

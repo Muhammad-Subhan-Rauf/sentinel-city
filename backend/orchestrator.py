@@ -1,6 +1,13 @@
 """
 Core async agent script for Sentinel-City AI Orchestrator.
 Runs the Detection (Loop A) and Monitoring (Loop B) loops.
+
+The two loops are now LangGraph ReAct agents (built in ``main()`` via
+``agent_graph.build_agent``) that invoke ``@tool``-decorated functions from
+``agent_tools.build_tools``. The outer shell here only handles polling,
+fingerprinting (to skip Gemini calls when the world hasn't changed), 429
+back-off, and DECISION-level audit logging — the agents themselves drive
+the multi-step tool-use loop internally.
 """
 
 import asyncio
@@ -13,6 +20,7 @@ from typing import Any, Dict, Optional
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
+from langchain_core.messages import HumanMessage
 
 # Project-local imports MUST come before any function definitions below that
 # reference these names in type annotations — Python evaluates annotations at
@@ -20,8 +28,8 @@ from google.genai import errors as genai_errors
 from api_client import SentinelAPIClient
 from state import AgentState, IncidentState
 from audit import AuditLogger
-import tools
-from tools import ToolExecutor
+from agent_tools import build_tools
+from agent_graph import build_agent, count_tool_calls, extract_final_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -151,27 +159,6 @@ async def load_prompt(filename: str) -> str:
         return ""
     return filepath.read_text(encoding="utf-8")
 
-def get_gemini_tools() -> Optional[list]:
-    """Build the google-genai tools list from the raw dicts in tools.py.
-
-    tools.ALL_TOOLS is a list of plain dicts ({name, description, parameters}).
-    GenerateContentConfig.tools expects [types.Tool(function_declarations=[...])]
-    where each entry in function_declarations is a types.FunctionDeclaration.
-    """
-    raw: Optional[list] = None
-    if hasattr(tools, "ALL_TOOLS"):
-        raw = tools.ALL_TOOLS
-    elif hasattr(tools, "TOOLS"):
-        raw = tools.TOOLS
-    elif hasattr(tools, "get_tools"):
-        raw = tools.get_tools()
-    if not raw:
-        return None
-
-    declarations = [types.FunctionDeclaration(**d) for d in raw]
-    return [types.Tool(function_declarations=declarations)]
-
-
 def sync_state_with_disasters(state: AgentState, disasters: Any):
     """
     Synchronizes the local agent state with active disasters from the API.
@@ -240,88 +227,91 @@ def sync_state_with_disasters(state: AgentState, disasters: Any):
             state.remove_incident(d_id)
 
 
-async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: AuditLogger, client: genai.Client):
+async def _invoke_agent(agent: Any, label: str, system_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Invoke a LangGraph ReAct agent with a context dict as the user message.
+
+    Returns the final state dict (``{"messages": [...]}``). Exceptions
+    propagate to the caller so the loop-level 429/back-off handler runs.
     """
-    Loop A (Detection):
-    Polls the APIs, passes state to Gemini, executes its tool calls, updates state, and logs.
+    logger.info(f"[{label}] Invoking agent...")
+    result = await agent.ainvoke(
+        {"messages": [HumanMessage(content=f"Current world state:\n{system_context}")]}
+    )
+    logger.info(f"[{label}] Agent returned with {len(result.get('messages', []))} messages")
+    return result
+
+
+async def detection_loop(
+    api: SentinelAPIClient,
+    state: AgentState,
+    audit: AuditLogger,
+    client: genai.Client,
+    agent: Any,
+):
+    """Loop A (Detection): scan signals, invoke the detection ReAct agent.
+
+    The agent (built in ``main()``) internally drives the LLM → tool → LLM
+    loop. We only handle the outer cycle: poll, fingerprint, invoke, audit.
     """
     logger.info("Starting detection_loop (Loop A)")
-    prompt = await load_prompt("detection_prompt.md")
-    
-    # Initialize ToolExecutor
-    tool_executor = ToolExecutor(api_client=api, audit_logger=audit, gemini_client=client)
-    gemini_tools = get_gemini_tools()
     last_fingerprint: Optional[str] = None
 
     while True:
         try:
-            # Poll APIs for active data (these are free / non-Gemini hits).
             disasters = await api.get_disasters()
             sync_state_with_disasters(state, disasters)
             weather = await api.get_weather()
             traffic = await api.get_traffic()
             reports = await api.get_citizen_reports()
 
-            # Gate the (expensive, quota-bound) Gemini call: only fire if the
-            # world has actually changed since the last successful tick.
+            # Gate the (expensive, quota-bound) agent run: only fire if the
+            # world has actually changed since the last *productive* tick.
             fingerprint = _signal_fingerprint(disasters, reports, state)
             if fingerprint == last_fingerprint:
-                logger.info("[Detection] No new signals; skipping Gemini call.")
+                logger.info("[Detection] No new signals; skipping agent invocation.")
                 await asyncio.sleep(60)
                 continue
 
-            # Construct the context
             context = {
                 "active_incidents": {k: v.model_dump() for k, v in state.active_incidents.items()},
                 "signals": {
                     "disasters": disasters,
                     "weather": weather,
                     "traffic": traffic,
-                    "reports": reports
-                }
+                    "reports": reports,
+                },
             }
 
-            prompt_content = f"Analyze the following current data:\n{context}"
+            result = await _invoke_agent(agent, "Detection", context)
+            messages = result.get("messages", [])
+            tool_calls_made = count_tool_calls(messages)
 
-            logger.info("[Detection] Sending request to Gemini...")
-            response = await generate_with_fallback(
-                client,
-                contents=prompt_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=prompt,
-                    tools=gemini_tools,
-                    temperature=0.2,
-                ),
-                label="Detection",
-            )
-            logger.info("[Detection] Received response from Gemini.")
-            last_fingerprint = fingerprint
+            # Bug #2 fix: only advance the fingerprint when the agent actually
+            # acted. A text-only response (e.g. "Would you like me to proceed?")
+            # leaves the gate open so the next tick re-prompts.
+            if tool_calls_made > 0:
+                last_fingerprint = fingerprint
+                logger.info(f"[Detection] Agent executed {tool_calls_made} tool call(s).")
+            else:
+                logger.warning(
+                    "[Detection] Agent returned 0 tool calls; NOT advancing fingerprint."
+                )
+                audit.log_recovery_action(
+                    state.agent_id,
+                    "detection_loop: agent returned 0 tool calls",
+                    "Leaving fingerprint un-advanced so the next tick re-prompts.",
+                )
 
-            # Extract tool calls and execute
-            if response.function_calls:
-                for function_call in response.function_calls:
-                    logger.info(f"[Detection] Executing tool: {function_call.name}")
-                    
-                    # ToolExecutor handles the actual logic and updates state.py implicitly
-                    result = await tool_executor.execute(
-                        tool_name=function_call.name,
-                        arguments=function_call.args
-                    )
-                    
-                    # Update audit
-                    audit.log_tool_call(
-                        agent_id=state.agent_id,
-                        tool_name=function_call.name,
-                        arguments=function_call.args,
-                        result=result
-                    )
-            elif response.text:
+            # If the agent had a final text answer, capture it as an OBSERVATION
+            # — matches the previous behavior for "world looks quiet" turns.
+            final_text = extract_final_text(messages)
+            if final_text:
                 audit.log_observation(
                     agent_id=state.agent_id,
                     source="detection_loop",
-                    data=response.text
+                    data=final_text,
                 )
-                
+
         except Exception as e:
             logger.error(f"Error in detection_loop: {e}", exc_info=True)
             audit.log_recovery_action(state.agent_id, f"detection_loop error: {e}", "Wait and retry")
@@ -331,90 +321,80 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
                 await asyncio.sleep(delay)
                 continue
 
-        # Sleep to avoid spamming the APIs / staying inside free-tier quota.
         await asyncio.sleep(60)
 
 
-async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit: AuditLogger, client: genai.Client):
-    """
-    Loop B (Monitoring Supervisor):
-    Focuses on active incidents, tracks trajectories, and manages escalations/de-escalations.
+async def monitoring_supervisor(
+    api: SentinelAPIClient,
+    state: AgentState,
+    audit: AuditLogger,
+    client: genai.Client,
+    agent: Any,
+):
+    """Loop B (Monitoring): manage active incidents via the monitoring agent.
+
+    The monitoring agent is built with ``force_tool_use=True`` so Gemini is
+    required to call SOME tool every turn — closing the chat-mode escape
+    hatch that caused the "Would you like me to proceed?" bug.
     """
     logger.info("Starting monitoring_supervisor (Loop B)")
-    prompt = await load_prompt("monitoring_prompt.md")
-    
-    # Initialize ToolExecutor for this loop
-    tool_executor = ToolExecutor(api_client=api, audit_logger=audit, gemini_client=client)
-    gemini_tools = get_gemini_tools()
     last_fingerprint: Optional[str] = None
 
     while True:
         try:
-            # Fetch active disasters from database and sync state
             disasters = await api.get_disasters()
             sync_state_with_disasters(state, disasters)
 
-            # Only heavily monitor if there are active incidents
             if not state.active_incidents:
                 last_fingerprint = None  # reset so a fresh incident triggers a call
                 await asyncio.sleep(60)
                 continue
 
-            # Same gate as Detection: only call Gemini when incident state changed.
             fingerprint = _signal_fingerprint(disasters, [], state)
             if fingerprint == last_fingerprint:
-                logger.info("[Monitoring] Active incidents unchanged; skipping Gemini call.")
+                logger.info("[Monitoring] Active incidents unchanged; skipping agent invocation.")
                 await asyncio.sleep(60)
                 continue
 
-            # Fetch context relevant to managing ongoing incidents
             context = {
                 "active_incidents": {k: v.model_dump() for k, v in state.active_incidents.items()},
                 "fire_stations": await api.get_fire_stations(),
                 "police_stations": await api.get_police_stations(),
                 "hospitals": await api.get_hospitals(),
                 "cordons": await api.get_cordons(),
-                "traffic": await api.get_traffic()
+                "traffic": await api.get_traffic(),
             }
 
-            prompt_content = f"Review the active incidents and current resources:\n{context}"
+            result = await _invoke_agent(agent, "Monitoring", context)
+            messages = result.get("messages", [])
+            tool_calls_made = count_tool_calls(messages)
 
-            logger.info("[Monitoring] Sending request to Gemini...")
-            response = await generate_with_fallback(
-                client,
-                contents=prompt_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=prompt,
-                    tools=gemini_tools,
-                    temperature=0.2,
-                ),
-                label="Monitoring",
-            )
-            logger.info("[Monitoring] Received response from Gemini.")
-            last_fingerprint = fingerprint
+            if tool_calls_made > 0:
+                last_fingerprint = fingerprint
+                logger.info(f"[Monitoring] Agent executed {tool_calls_made} tool call(s).")
+            else:
+                # Bug #1 belt-and-suspenders: monitoring agent has incidents to
+                # manage but emitted no tool calls. Don't burn the fingerprint;
+                # log a recovery action and let the next tick re-prompt.
+                logger.warning(
+                    "[Monitoring] Agent returned 0 tool calls despite active incidents; "
+                    "NOT advancing fingerprint."
+                )
+                audit.log_recovery_action(
+                    state.agent_id,
+                    "monitoring_supervisor: agent returned 0 tool calls with active incidents",
+                    "Leaving fingerprint un-advanced so the next tick re-prompts.",
+                )
 
-            if response.function_calls:
-                for function_call in response.function_calls:
-                    logger.info(f"[Monitoring] Executing tool: {function_call.name}")
-                    result = await tool_executor.execute(
-                        tool_name=function_call.name,
-                        arguments=function_call.args
-                    )
-                    
-                    audit.log_tool_call(
-                        agent_id=state.agent_id,
-                        tool_name=function_call.name,
-                        arguments=function_call.args,
-                        result=result
-                    )
-            elif response.text:
+            final_text = extract_final_text(messages)
+            if final_text:
                 audit.log_decision(
                     agent_id=state.agent_id,
                     context="monitoring_supervisor",
                     decision="Review active incidents",
-                    rationale=response.text
+                    rationale=final_text,
                 )
-                
+
         except Exception as e:
             logger.error(f"Error in monitoring_supervisor: {e}", exc_info=True)
             audit.log_recovery_action(state.agent_id, f"monitoring_supervisor error: {e}", "Wait and retry")
@@ -424,7 +404,6 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
                 await asyncio.sleep(delay)
                 continue
 
-        # Slower poll rate for monitoring loop to avoid overlaps and API spam.
         await asyncio.sleep(60)
 
 
@@ -450,12 +429,22 @@ async def main():
         # Update AGENT_REGISTRY on startup
         logger.info("Registering agent as online...")
         await api.update_agent('agent-sentinel-core', {'status': 'online'})
-        
-        # Start both loops concurrently
+
+        # Build the two ReAct agents (one per loop) sharing the same toolset
+        # but bound to different system prompts. force_tool_use=True on the
+        # monitoring agent makes Gemini call SOME tool every turn — the
+        # structural fix for bug #1.
+        logger.info("Building LangGraph agents...")
+        tools_list = build_tools(api, audit, client, agent_id=state.agent_id)
+        detection_prompt = await load_prompt("detection_prompt.md")
+        monitoring_prompt = await load_prompt("monitoring_prompt.md")
+        detection_agent = build_agent(api_key, detection_prompt, tools_list, force_tool_use=False)
+        monitoring_agent = build_agent(api_key, monitoring_prompt, tools_list, force_tool_use=True)
+
         logger.info("Starting background loops...")
-        loop_a = asyncio.create_task(detection_loop(api, state, audit, client))
-        loop_b = asyncio.create_task(monitoring_supervisor(api, state, audit, client))
-        
+        loop_a = asyncio.create_task(detection_loop(api, state, audit, client, detection_agent))
+        loop_b = asyncio.create_task(monitoring_supervisor(api, state, audit, client, monitoring_agent))
+
         await asyncio.gather(loop_a, loop_b)
         
     except asyncio.CancelledError:
