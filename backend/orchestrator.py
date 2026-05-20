@@ -230,8 +230,8 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
                 await asyncio.sleep(delay)
                 continue
 
-        # Sleep to avoid spamming the APIs
-        await asyncio.sleep(10)
+        # Sleep to avoid spamming the APIs / staying inside free-tier quota.
+        await asyncio.sleep(30)
 
 
 async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit: AuditLogger, client: genai.Client):
@@ -254,7 +254,7 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
             
             # Only heavily monitor if there are active incidents
             if not state.active_incidents:
-                await asyncio.sleep(15)
+                await asyncio.sleep(30)
                 continue
                 
             # Fetch context relevant to managing ongoing incidents
@@ -312,8 +312,8 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
                 await asyncio.sleep(delay)
                 continue
 
-        # Slower poll rate for monitoring loop to avoid overlaps and API spam
-        await asyncio.sleep(15)
+        # Slower poll rate for monitoring loop to avoid overlaps and API spam.
+        await asyncio.sleep(30)
 
 
 async def main():
