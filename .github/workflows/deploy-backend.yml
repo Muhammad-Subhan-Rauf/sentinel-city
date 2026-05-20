@@ -53,8 +53,9 @@ jobs:
             --allow-unauthenticated \
             --service-account="cloud-run-sentinel@${{ env.PROJECT_ID }}.iam.gserviceaccount.com" \
             --set-secrets=DATABASE_URL=DATABASE_URL:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest \
-            --min-instances=0 \
-            --max-instances=5 \
+            --set-env-vars=SENTINEL_API_URL=http://localhost:8000 \
+            --min-instances=1 \
+            --max-instances=1 \
             --memory=512Mi \
             --cpu=1 \
             --timeout=300

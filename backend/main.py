@@ -2,12 +2,15 @@
 Sentinel-City — FastAPI Backend (no-auth mode)
 """
 
+import asyncio
+import logging
 import os
 import uuid
 import json
 import math
 import psycopg2
 import psycopg2.extras
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,10 +20,65 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Boot the AI orchestrator's detection + monitoring loops alongside the API.
+
+    Both loops talk to this same process via http://localhost:8000 (loopback,
+    microseconds of overhead), keeping the orchestrator code's HTTP-based
+    SentinelAPIClient unchanged. AuditLogger writes into the GLOBAL_LOG_BUFFER
+    that /api/logs reads from, so AI logs work end-to-end in the deployed UI.
+    """
+    log = logging.getLogger("sentinel.lifespan")
+
+    if not os.environ.get("GEMINI_API_KEY"):
+        log.warning("GEMINI_API_KEY not set — skipping orchestrator startup.")
+        yield
+        return
+
+    try:
+        from google import genai
+        from api_client import SentinelAPIClient
+        from audit import AuditLogger
+        from state import AgentState
+        from orchestrator import detection_loop, monitoring_supervisor
+    except Exception as exc:
+        log.warning(f"Orchestrator import failed ({exc}); API will run without AI loops.")
+        yield
+        return
+
+    # The orchestrator hits its own backend over loopback. Production env can
+    # override via SENTINEL_API_URL (e.g. https://sentinel-backend-...run.app).
+    base_url = os.environ.get("SENTINEL_API_URL", "http://localhost:8000")
+    api = SentinelAPIClient(base_url=base_url)
+    state = AgentState(agent_id="agent-sentinel-core")
+    audit = AuditLogger()
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    log.info(f"Starting orchestrator loops against {base_url}")
+    detection_task = asyncio.create_task(detection_loop(api, state, audit, client))
+    monitoring_task = asyncio.create_task(monitoring_supervisor(api, state, audit, client))
+
+    try:
+        yield
+    finally:
+        log.info("Shutting down orchestrator loops")
+        for t in (detection_task, monitoring_task):
+            t.cancel()
+        for t in (detection_task, monitoring_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        await api.close()
+
+
 app = FastAPI(
     title="Sentinel-City API",
     description="Municipal emergency orchestration backend",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -2472,30 +2530,11 @@ def savings_insight(metric: Literal["lives", "infrastructure", "money"] = Query(
 
 @app.get("/api/logs", tags=["Logs"])
 def get_audit_logs(limit: int = Query(100, ge=1, le=500)):
-    log_dir = os.path.join(os.path.dirname(__file__), "logs")
-    if not os.path.exists(log_dir):
-        return {"logs": []}
-        
-    logs = []
-    # Get all jsonl files, sort by name (which has date)
-    files = sorted([f for f in os.listdir(log_dir) if f.endswith(".jsonl")], reverse=True)
-    
-    for filename in files:
-        filepath = os.path.join(log_dir, filename)
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                # Read all lines
-                lines = f.readlines()
-                # Process from bottom (newest) to top
-                for line in reversed(lines):
-                    if not line.strip(): continue
-                    try:
-                        logs.append(json.loads(line))
-                        if len(logs) >= limit:
-                            return {"logs": logs}
-                    except:
-                        pass
-        except Exception as e:
-            print(f"Error reading {filename}: {e}")
-            
-    return {"logs": logs}
+    # Source of truth is the in-process ring buffer in audit.py, so this
+    # works regardless of where AuditLogger is writing files (or even if
+    # the disk write failed). Newest-first.
+    from audit import GLOBAL_LOG_BUFFER
+
+    items = list(GLOBAL_LOG_BUFFER)[-limit:]
+    items.reverse()
+    return {"logs": items}

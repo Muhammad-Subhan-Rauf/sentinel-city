@@ -20,13 +20,16 @@ services:
       timeout: 3s
       retries: 10
 
-  # ── FastAPI backend ─────────────────────────────────────────
+  # ── FastAPI backend (also runs the AI orchestrator loops via lifespan) ──
   backend:
     build:
       context: ./backend
     restart: unless-stopped
+    env_file:
+      - ./backend/.env
     environment:
       DATABASE_URL: postgresql://sentinel:sentinel@db:5432/sentinel_city
+      SENTINEL_API_URL: http://localhost:8000
     depends_on:
       db:
         condition: service_healthy
@@ -66,24 +69,6 @@ services:
       - valhalla
     ports:
       - "8080:80"
-
-  # ── Orchestrator ────────────────────────────────────────────
-  orchestrator:
-    build:
-      context: ./backend
-    command: ["python", "orchestrator.py"]
-    restart: unless-stopped
-    env_file:
-      - ./backend/.env
-    environment:
-      DATABASE_URL: postgresql://sentinel:sentinel@db:5432/sentinel_city
-    depends_on:
-      db:
-        condition: service_healthy
-      backend:
-        condition: service_started
-    volumes:
-      - orchestrator_logs:/app/logs
 
 volumes:
   db_data:

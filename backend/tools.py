@@ -386,9 +386,68 @@ def _build_cordon_payload(args: Dict[str, Any]) -> Dict[str, Any]:
 class ToolExecutor:
     """Executes Sentinel City tools, applying validation and audit logging."""
 
-    def __init__(self, api_client: Any, audit_logger: Any):
+    def __init__(self, api_client: Any, audit_logger: Any, gemini_client: Any = None):
         self.api = api_client
         self.audit = audit_logger
+        self.gemini = gemini_client
+
+    async def _resolve_target_via_gemini(self, incident_id: Optional[str]) -> Optional[Dict[str, float]]:
+        """When Gemini hands us target=(0,0), ask it again with the incident's
+        actual record and have it return real coordinates.
+
+        Costs one extra Gemini call per occurrence; only triggered when the
+        primary dispatch arg is obviously invalid.
+        """
+        if not self.gemini or not incident_id:
+            return None
+        try:
+            disasters_raw = await self.api.get_disasters()
+            disasters_list = disasters_raw if isinstance(disasters_raw, list) else disasters_raw.get("disasters", [])
+            match = next((d for d in disasters_list if d.get("id") == incident_id), None)
+            if not match:
+                logger.warning(f"Cannot resolve coords for unknown incident {incident_id}")
+                return None
+
+            from google.genai import types as _gtypes  # local to avoid top-level dep cycle
+            prompt = (
+                "You just dispatched units with target={lat:0,lng:0} which is invalid. "
+                f"The full incident record is:\n{json.dumps(match)}\n"
+                "Reply with ONLY a single-line JSON object of the form "
+                '{"lat": <float>, "lng": <float>} giving the dispatch target. '
+                "Use the coordinates from area_geometry if present."
+            )
+            resp = await self.gemini.aio.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=_gtypes.GenerateContentConfig(temperature=0.0),
+            )
+            text = (resp.text or "").strip()
+            # Strip code fences if Gemini added them.
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:].strip()
+            data = json.loads(text)
+            lat = float(data["lat"])
+            lng = float(data["lng"])
+            if abs(lat) < 0.001 and abs(lng) < 0.001:
+                return None  # Gemini still gave us junk
+            logger.info(f"Resolved target for {incident_id} via Gemini: lat={lat}, lng={lng}")
+            return {"lat": lat, "lng": lng}
+        except Exception as exc:
+            logger.warning(f"_resolve_target_via_gemini failed: {exc}")
+            return None
+
+    @staticmethod
+    def _target_is_invalid(target: Any) -> bool:
+        if not isinstance(target, dict):
+            return True
+        lat = target.get("lat", 0)
+        lng = target.get("lng", 0)
+        try:
+            return abs(float(lat)) < 0.001 and abs(float(lng)) < 0.001
+        except (TypeError, ValueError):
+            return True
 
     async def execute(self, tool_name: str, arguments: Dict[str, Any], agent_id: str = "orchestrator") -> Any:
         logger.info(f"Executing tool {tool_name} with arguments {arguments}")
@@ -484,12 +543,21 @@ class ToolExecutor:
             for field in ["incident_id", "station_id", "unit_type", "count", "target"]:
                 if field not in args:
                     raise ValueError(f"Missing required field '{field}' in dispatch_units")
-            
-            # Map to backend's DispatchPayload structure
+
+            target = args["target"]
+            if self._target_is_invalid(target):
+                logger.warning(
+                    f"dispatch_units got target={target} for incident {args.get('incident_id')}; "
+                    "re-prompting Gemini for correct coordinates"
+                )
+                corrected = await self._resolve_target_via_gemini(args.get("incident_id"))
+                if corrected:
+                    target = corrected
+
             payload = {
                 "kind": args["unit_type"],
                 "units": args["count"],
-                "target": args["target"],
+                "target": target,
                 "station_id": args["station_id"]
             }
             return await self.api.dispatch(payload)
@@ -497,9 +565,18 @@ class ToolExecutor:
         elif tool_name == "multi_station_dispatch":
             if "incident_id" not in args or "dispatches" not in args or "target" not in args:
                 raise ValueError("Missing 'incident_id', 'target' or 'dispatches' in multi_station_dispatch")
-            
+
             incident_id = args["incident_id"]
             target = args["target"]
+            if self._target_is_invalid(target):
+                logger.warning(
+                    f"multi_station_dispatch got target={target} for incident {incident_id}; "
+                    "re-prompting Gemini for correct coordinates"
+                )
+                corrected = await self._resolve_target_via_gemini(incident_id)
+                if corrected:
+                    target = corrected
+
             results = []
             for d in args["dispatches"]:
                 for field in ["station_id", "unit_type", "count"]:
