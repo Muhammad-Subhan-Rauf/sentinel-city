@@ -13,7 +13,10 @@ export function Screen({ title, children, scroll = true }: Props) {
   const body = scroll ? (
     <ScrollView contentContainerStyle={styles.scrollPad}>{children}</ScrollView>
   ) : (
-    <View style={styles.scrollPad}>{children}</View>
+    // Non-scroll body must flex so a FlatList/list child can size itself.
+    // Without `flex: 1` here, virtualized children collapse to 0 height and
+    // render no rows (the bug that hid the Notifications feed).
+    <View style={[styles.scrollPad, { flex: 1 }]}>{children}</View>
   );
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>

@@ -41,7 +41,12 @@ function ToastCard({ toast, onDismiss }: { toast: GeofenceToast; onDismiss: () =
     }).start();
   }, [slide]);
 
-  const accent = toast.kind === 'cordon' ? colors.hazardCordon : colors.hazardNotification;
+  const accent =
+    toast.kind === 'disaster'
+      ? colors.danger
+      : toast.kind === 'cordon'
+        ? colors.hazardCordon
+        : colors.hazardNotification;
 
   return (
     <Animated.View
