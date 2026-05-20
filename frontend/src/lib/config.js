@@ -45,28 +45,50 @@ export const NOTIFICATION_TTL_S = 180
 export const FLEEING_CALL_PROBABILITY = 0.4
 
 // Background "noise" to stress-test the orchestrator. Every PRANK_CALL_INTERVAL_S
-// sim-seconds a random walking citizen dials in a frivolous emergency. Prank
-// calls use a synthetic event_id ('prank:<idx>:<t>') so they appear in the
-// call drawer like any other report but never persist to disaster_events and
-// never cause state transitions — they exist purely so the AI orchestrator
-// must learn to filter low-credibility, uncorroborated single-source signals.
+// sim-seconds a random walking citizen dials in a fake emergency. The
+// transcripts deliberately *sound* like real 911 calls (fire, robbery, accident,
+// flood, etc.) — the AI orchestrator's job is NOT to spot absurd content, it's
+// to filter low-credibility, uncorroborated single-source signals against the
+// disaster registry. Prank calls use a synthetic event_id ('prank:<idx>:<t>')
+// so they appear in the call drawer like any other report but never persist
+// to disaster_events and never cause state transitions.
 export const PRANK_CALL_INTERVAL_S = 30
 export const PRANK_TRANSCRIPTS = [
-  'There is a UFO landing on my roof, please send help!',
-  'My neighbor’s cat has been staring at me for two hours, send police.',
-  'Aliens just abducted my pizza delivery guy, I have no toppings.',
-  'A pigeon is following me with intent.',
-  'The moon looks too close tonight, is this an emergency?',
-  'Someone stole my parking spot, I demand a SWAT team.',
-  'My WiFi is slow and I think it’s a national security threat.',
-  'There’s a man wearing sandals with socks, suspicious activity.',
-  'I can hear my plants screaming, send botanists immediately.',
-  'My ex just walked past my house, I need a restraining order via 911.',
-  'Pretty sure my fridge is haunted, lights flickering.',
-  'I heard a noise. Just one noise. But still.',
-  'There is a squirrel acting too confident in the park.',
-  'My pizza came with three olives instead of four, this is a crime.',
-  'A man in a trench coat asked for the time. Suspicious.',
+  // Building fire — sounds urgent, no corroboration from neighbors
+  'There is heavy smoke coming from the third floor of my apartment building, I can smell something burning!',
+  'The warehouse next to me has flames shooting out of the roof, please send fire trucks immediately!',
+  'My kitchen caught fire, I got out but the whole apartment is going up, send help fast!',
+  // Wildfire / brush fire
+  'I see flames in the trees behind the park, looks like the brush is burning out of control.',
+  'There is a fire spreading on the hillside near my street, the wind is pushing it toward houses!',
+  // Flood / water main
+  'A water main just burst on my block, the street is filling up fast, cars are floating!',
+  'Water is rushing into the subway entrance, I think the storm drain failed!',
+  'My basement is flooding fast, looks like a pipe burst in the whole building.',
+  // Accident / vehicle
+  'There has been a serious car accident at the intersection, one vehicle is overturned and people are trapped!',
+  'A motorcyclist just got hit by a truck on the avenue, he is on the ground not moving!',
+  'A bus and a taxi collided, I can see injured passengers, please send ambulances!',
+  // Robbery / armed
+  'Three men with masks just ran out of the convenience store carrying bags, I think it was a robbery.',
+  'Someone is breaking into the jewelry store on the corner, I can hear glass shattering!',
+  'There is a man with a weapon outside my building demanding people hand over wallets!',
+  // Gunshots / gang
+  'I just heard multiple gunshots in the alley behind my building, please send police!',
+  'There is a fight breaking out between two groups on the street, I think someone has a knife!',
+  // Power / infrastructure
+  'A power line just came down across my street, it is sparking on a parked car!',
+  'A construction crane is leaning over a building, looks like it might collapse!',
+  'I think the gas line ruptured, the smell is overwhelming and people are coughing.',
+  // Medical / heat
+  'An elderly man just collapsed on the sidewalk in front of me, he is unresponsive!',
+  'A jogger is down in the park, I think he had a heat stroke, he is not waking up.',
+  // Building / structural
+  'A piece of the building facade just fell onto the sidewalk, people are screaming!',
+  'I can hear loud cracking sounds from the parking garage, I think it might be collapsing!',
+  // Road block / chemical
+  'There is a tanker truck leaking some kind of liquid all over the highway, it smells chemical!',
+  'A tree just fell across the road blocking both lanes, traffic is backed up for blocks!',
 ]
 
 // Soft cap on stations the operator can place (UI guard, not DB).
