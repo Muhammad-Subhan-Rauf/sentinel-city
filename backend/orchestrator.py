@@ -158,7 +158,7 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
             logger.info("[Detection] Sending request to Gemini...")
             # Pass to Gemini via async client
             response = await client.aio.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-2.0-flash',
                 contents=prompt_content,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
@@ -238,7 +238,7 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
             
             logger.info("[Monitoring] Sending request to Gemini...")
             response = await client.aio.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-2.0-flash',
                 contents=prompt_content,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
