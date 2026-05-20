@@ -5,9 +5,10 @@ Sentinel-City — FastAPI Backend (no-auth mode)
 import os
 import uuid
 import json
+import math
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -214,68 +215,384 @@ SEVERITY_MAX_BY_TYPE = {
 }
 
 
-# Mocked weather: what /api/weather returns when no disaster is bending it.
+# Baseline weather: returned by /api/weather when no disaster is bending it,
+# and used by /api/weather/regions as the ambient state outside any region.
 BASELINE_WEATHER = {
     "icon": "☀️",
     "label": "Clear",
     "condition": "clear",
-    "temperature_c": 22,
     "detail": "Calm and sunny across the metro.",
+    "temperature_c": 22,
+    "dew_point_c": 12,
+    "wind_speed_kph": 8,
+    "wind_direction_deg": 180,
+    "precipitation_mm_per_hour": 0.0,
+    "humidity_pct": 55,
+    "pressure_hpa": 1015,
+    "air_quality_aqi": 40,
+    "visibility_km": 15.0,
+    "alerts": [],
 }
 
 
-def _weather_for_event(disaster_type: str, severity: int, cause: Optional[str]):
-    """Return a weather dict if this disaster bends the weather, else None."""
+def _clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def _alert_severity(disaster_severity: int) -> str:
+    if disaster_severity <= 2:
+        return "minor"
+    if disaster_severity <= 4:
+        return "moderate"
+    if disaster_severity <= 7:
+        return "severe"
+    return "extreme"
+
+
+def _alert(event_id: Optional[str], kind: str, disaster_severity: int,
+           headline: str, duration_minutes: int = 60) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    return {
+        "id": f"{event_id or 'baseline'}:{kind}",
+        "type": kind,
+        "severity": _alert_severity(disaster_severity),
+        "headline": headline,
+        "start": now.isoformat(),
+        "end": (now + timedelta(minutes=duration_minutes)).isoformat(),
+    }
+
+
+def _wildfire_weather(severity: int, event_id: Optional[str]) -> Dict[str, Any]:
+    # Temp climbs steeply with severity; humidity falls; AQI/visibility degrade.
+    temp = _clamp(30 + severity * 3.5, 28, 60)
+    aqi = int(_clamp(60 + severity * 45, 50, 500))
+    alerts = [_alert(event_id, "air_quality", severity,
+                     f"Smoke advisory — AQI {aqi} near active wildfire.")]
+    if severity >= 3:
+        alerts.append(_alert(event_id, "heat", severity,
+                             f"Extreme heat from active wildfire ({int(temp)}°C)."))
+    label = "Hot & Dry" if severity <= 2 else "Extreme Heat"
+    icon = "☀️" if severity <= 2 else "🔥"
+    return {
+        "icon": icon, "label": label,
+        "condition": "extreme_heat" if severity > 2 else "hot_dry",
+        "detail": "Heatwave intensified by active wildfire."
+                  if severity > 2 else "Dry heat, low humidity — fire weather.",
+        "temperature_c": round(temp, 1),
+        "dew_point_c": round(_clamp(8 - severity * 0.8, -5, 12), 1),
+        "wind_speed_kph": int(_clamp(12 + severity * 3, 5, 80)),
+        "wind_direction_deg": 225,
+        "precipitation_mm_per_hour": 0.0,
+        "humidity_pct": int(_clamp(35 - severity * 3, 5, 90)),
+        "pressure_hpa": int(_clamp(1010 - severity, 980, 1025)),
+        "air_quality_aqi": aqi,
+        "visibility_km": round(_clamp(15 - severity * 1.6, 0.3, 20), 1),
+        "alerts": alerts,
+    }
+
+
+def _heatwave_weather(severity: int, event_id: Optional[str]) -> Dict[str, Any]:
+    severity = _clamp(severity, 1, 10)
+    temp = _clamp(28 + severity * 2.5, 28, 55)
+    aqi = int(_clamp(50 + severity * 10, 40, 350))
+    alerts = [_alert(event_id, "heat", severity,
+                     f"Heat advisory — {int(temp)}°C.")]
+    if severity >= 3:
+        alerts.append(_alert(event_id, "air_quality", severity,
+                             f"Stagnant air — AQI {aqi}."))
+    icon = "🥵" if severity >= 3 else "☀️"
+    label = {1: "Warm", 2: "Hot", 3: "Severe Heat", 4: "Extreme Heat"}.get(
+        severity, "Extreme Heat"
+    )
+    return {
+        "icon": icon, "label": label,
+        "condition": "extreme_heat" if severity >= 3 else ("hot" if severity == 2 else "warm"),
+        "detail": f"{label} advisory — cooling centres on standby.",
+        "temperature_c": round(temp, 1),
+        "dew_point_c": round(_clamp(14 + severity * 0.4, 8, 22), 1),
+        "wind_speed_kph": int(_clamp(6 - severity * 0.3, 2, 12)),
+        "wind_direction_deg": 180,
+        "precipitation_mm_per_hour": 0.0,
+        "humidity_pct": int(_clamp(35 + severity * 2, 20, 70)),
+        "pressure_hpa": int(_clamp(1018 - severity, 1000, 1025)),
+        "air_quality_aqi": aqi,
+        "visibility_km": round(_clamp(15 - severity * 0.5, 5, 20), 1),
+        "alerts": alerts,
+    }
+
+
+def _flood_weather(severity: int, event_id: Optional[str]) -> Dict[str, Any]:
+    # Storm-driven flood: heavy rain, falling temperature, severe winds.
+    temp = _clamp(18 - severity * 1.2, 2, 20)
+    precip = round(_clamp(severity * 8, 0, 120), 1)
+    wind = int(_clamp(18 + severity * 4, 10, 110))
+    alerts = [_alert(event_id, "flood", severity,
+                     f"Flood advisory — {precip} mm/h rainfall.")]
+    if severity >= 4:
+        alerts.append(_alert(event_id, "severe_thunderstorm", severity,
+                             f"Severe thunderstorm — wind {wind} kph."))
+    if severity <= 2:
+        icon, label, cond = "🌦️", "Light Rain", "light_rain"
+        detail = "Light rain — minor street flooding."
+    elif severity <= 4:
+        icon, label, cond = "🌧️", "Heavy Rain", "heavy_rain"
+        detail = "Sustained heavy rainfall."
+    else:
+        icon, label, cond = "⛈️", "Severe Storm", "severe_storm"
+        detail = "Severe storm with flooding."
+    return {
+        "icon": icon, "label": label,
+        "condition": cond, "detail": detail,
+        "temperature_c": round(temp, 1),
+        "dew_point_c": round(_clamp(temp - 1.5, -2, 18), 1),
+        "wind_speed_kph": wind,
+        "wind_direction_deg": 90,
+        "precipitation_mm_per_hour": precip,
+        "humidity_pct": int(_clamp(80 + severity * 2, 70, 100)),
+        "pressure_hpa": int(_clamp(1005 - severity, 970, 1015)),
+        "air_quality_aqi": int(_clamp(35 - severity, 10, 60)),
+        "visibility_km": round(_clamp(8 - severity * 0.7, 0.3, 12), 1),
+        "alerts": alerts,
+    }
+
+
+def _infra_flood_weather(severity: int, event_id: Optional[str]) -> Dict[str, Any]:
+    # Infrastructure-driven flood (broken main, dam release, storm-drain
+    # failure). No storm system, but standing water cools the air and pushes
+    # humidity high. No rain, no wind to speak of.
+    temp = _clamp(20 - severity * 0.6, 12, 22)
+    alerts = [_alert(event_id, "flood", severity,
+                     "Flood advisory — standing water from infrastructure failure.")]
+    return {
+        "icon": "💧", "label": "Humid & Cool",
+        "condition": "humid_cool",
+        "detail": "Standing water from a burst main / dam — humid and slightly cool.",
+        "temperature_c": round(temp, 1),
+        "dew_point_c": round(_clamp(temp - 1, 10, 20), 1),
+        "wind_speed_kph": 6,
+        "wind_direction_deg": 180,
+        "precipitation_mm_per_hour": 0.0,
+        "humidity_pct": int(_clamp(75 + severity * 3, 70, 98)),
+        "pressure_hpa": 1013,
+        "air_quality_aqi": 38,
+        "visibility_km": round(_clamp(12 - severity * 0.3, 8, 15), 1),
+        "alerts": alerts,
+    }
+
+
+def _storm_outage_weather(severity: int, event_id: Optional[str]) -> Dict[str, Any]:
+    temp = _clamp(13 - severity * 0.4, 2, 18)
+    wind = int(_clamp(40 + severity * 6, 35, 130))
+    precip = round(_clamp(12 + severity * 3, 5, 80), 1)
+    alerts = [_alert(event_id, "severe_thunderstorm", severity,
+                     f"Severe storm — wind {wind} kph, {precip} mm/h.")]
+    return {
+        "icon": "⛈️", "label": "Severe Storm",
+        "condition": "severe_storm",
+        "detail": "Storm-related grid failure.",
+        "temperature_c": round(temp, 1),
+        "dew_point_c": round(_clamp(temp - 1.0, -2, 16), 1),
+        "wind_speed_kph": wind,
+        "wind_direction_deg": 270,
+        "precipitation_mm_per_hour": precip,
+        "humidity_pct": int(_clamp(85 + severity, 70, 100)),
+        "pressure_hpa": int(_clamp(995 - severity, 960, 1010)),
+        "air_quality_aqi": 30,
+        "visibility_km": round(_clamp(6 - severity * 0.4, 0.3, 10), 1),
+        "alerts": alerts,
+    }
+
+
+def _freezing_weather(severity: int, event_id: Optional[str]) -> Dict[str, Any]:
+    temp = _clamp(-3 - severity * 1.5, -25, 2)
+    alerts = [_alert(event_id, "freeze", severity,
+                     f"Freeze warning — {int(temp)}°C, water-main risk.")]
+    return {
+        "icon": "❄️", "label": "Freezing",
+        "condition": "freezing",
+        "detail": "Freezing temperatures — water main rupture.",
+        "temperature_c": round(temp, 1),
+        "dew_point_c": round(temp - 3, 1),
+        "wind_speed_kph": int(_clamp(12 + severity * 2, 5, 40)),
+        "wind_direction_deg": 0,
+        "precipitation_mm_per_hour": 0.0,
+        "humidity_pct": int(_clamp(75 + severity, 60, 100)),
+        "pressure_hpa": int(_clamp(1020 + severity, 1000, 1040)),
+        "air_quality_aqi": 35,
+        "visibility_km": round(_clamp(8 - severity * 0.5, 1, 12), 1),
+        "alerts": alerts,
+    }
+
+
+def _building_fire_weather(severity: int, event_id: Optional[str]) -> Dict[str, Any]:
+    # Local heat dome + smoke around an active structure fire.
+    temp = _clamp(24 + severity * 4, 24, 70)
+    aqi = int(_clamp(80 + severity * 50, 60, 500))
+    alerts = [_alert(event_id, "air_quality", severity,
+                     f"Structure-fire smoke — AQI {aqi}.")]
+    if severity >= 3:
+        alerts.append(_alert(event_id, "heat", severity,
+                             f"Localised heat from active structure fire ({int(temp)}°C)."))
+    return {
+        "icon": "🔥", "label": "Structure Fire Heat",
+        "condition": "extreme_heat",
+        "detail": "Elevated temperatures and smoke from a structure fire.",
+        "temperature_c": round(temp, 1),
+        "dew_point_c": round(_clamp(10 - severity * 0.5, -2, 15), 1),
+        "wind_speed_kph": int(_clamp(8 + severity * 1.5, 4, 30)),
+        "wind_direction_deg": 200,
+        "precipitation_mm_per_hour": 0.0,
+        "humidity_pct": int(_clamp(40 - severity * 2, 15, 80)),
+        "pressure_hpa": int(_clamp(1012 - severity, 990, 1020)),
+        "air_quality_aqi": aqi,
+        "visibility_km": round(_clamp(12 - severity * 1.2, 0.5, 15), 1),
+        "alerts": alerts,
+    }
+
+
+def _weather_for_event(disaster_type: str, severity: int,
+                       cause: Optional[str],
+                       event_id: Optional[str] = None):
+    """Return a full weather dict if this disaster bends the weather, else None.
+
+    Severity is clamped to 1..10 by the disasters API, but we defensively clamp
+    again so out-of-range inputs from older rows can't crash the field scalers.
+    """
+    if severity is None:
+        return None
+    severity = _clamp(int(severity), 1, 10)
+
     if disaster_type == "Wildfire":
-        if severity <= 2:
-            return {"icon": "☀️", "label": "Hot & Dry",
-                    "condition": "hot_dry", "temperature_c": 32,
-                    "detail": "Dry heat, low humidity — fire weather."}
-        return {"icon": "🔥", "label": "Extreme Heat",
-                "condition": "extreme_heat",
-                "temperature_c": 38 + (severity - 3) * 5,   # sev 3/4/5 → 38/43/48
-                "detail": "Heatwave intensified by active wildfire."}
+        return _wildfire_weather(severity, event_id)
 
     if disaster_type == "Heatwave":
-        return {
-            1: {"icon": "☀️", "label": "Warm",
-                "condition": "warm", "temperature_c": 30,
-                "detail": "Warm afternoon advisory."},
-            2: {"icon": "☀️", "label": "Hot",
-                "condition": "hot", "temperature_c": 35,
-                "detail": "Hot day — hydrate."},
-            3: {"icon": "🥵", "label": "Severe Heat",
-                "condition": "severe_heat", "temperature_c": 40,
-                "detail": "Severe heat — cooling centres open."},
-            4: {"icon": "🥵", "label": "Extreme Heat",
-                "condition": "extreme_heat", "temperature_c": 43,
-                "detail": "Extreme heatwave — citywide alert."},
-        }.get(severity)
+        return _heatwave_weather(severity, event_id)
 
-    if disaster_type == "Flood" and cause == "weather":
-        if severity <= 2:
-            return {"icon": "🌦️", "label": "Light Rain",
-                    "condition": "light_rain", "temperature_c": 16,
-                    "detail": "Light rain — minor street flooding."}
-        if severity <= 4:
-            return {"icon": "🌧️", "label": "Heavy Rain",
-                    "condition": "heavy_rain", "temperature_c": 14,
-                    "detail": "Sustained heavy rainfall."}
-        return {"icon": "⛈️", "label": "Severe Storm",
-                "condition": "severe_storm", "temperature_c": 13,
-                "detail": "Severe storm with flooding."}
+    if disaster_type == "Building_Fire":
+        return _building_fire_weather(severity, event_id)
+
+    if disaster_type == "Flood":
+        # Storm-driven floods get the full storm profile (rain, wind, falling
+        # temp). Infrastructure-driven floods get a milder humid+cool profile.
+        # Either way, every Flood produces a weather effect — flood without
+        # weather impact is a UX dead end.
+        if cause == "weather":
+            return _flood_weather(severity, event_id)
+        return _infra_flood_weather(severity, event_id)
 
     if disaster_type == "Power_Outage" and cause == "weather" and severity >= 3:
-        return {"icon": "⛈️", "label": "Severe Storm",
-                "condition": "severe_storm", "temperature_c": 13,
-                "detail": "Storm-related grid failure."}
+        return _storm_outage_weather(severity, event_id)
 
     if disaster_type == "Infrastructure_Failure" and cause == "weather" and severity == 1:
-        return {"icon": "❄️", "label": "Freezing",
-                "condition": "freezing", "temperature_c": -4,
-                "detail": "Freezing temperatures — water main rupture."}
+        return _freezing_weather(severity, event_id)
 
     return None
+
+
+def _regional_weather(disaster_type: str, severity: int,
+                      cause: Optional[str],
+                      event_id: Optional[str] = None) -> Dict[str, Any]:
+    """Always returns a full weather dict for a disaster's footprint.
+
+    Falls back to a baseline-shaped snapshot for non-thermal events so the
+    overlay still renders (and is therefore clickable) for things like
+    Accident / Robbery / Road_Blockage — operators can still click the zone
+    to see ambient conditions there.
+    """
+    weather = _weather_for_event(disaster_type, severity, cause, event_id)
+    if weather is not None:
+        return weather
+    return {
+        **BASELINE_WEATHER,
+        "detail": f"No weather effect from {disaster_type.replace('_', ' ').lower()} — ambient conditions.",
+        # Baseline alerts list is shared; copy so per-region edits don't leak.
+        "alerts": [],
+    }
+
+
+# ── Geometry helpers for /api/weather/regions ─────────────────
+# Just enough math to give the frontend a point + radius per region.
+# Not GIS-accurate — disasters are small enough on a city scale that a
+# flat-earth average of vertices is fine for overlay placement.
+
+def _coerce_geojson(geometry):
+    """psycopg2 returns JSONB as either dict or raw str depending on type
+    registration. Normalise to dict (or None)."""
+    if geometry is None:
+        return None
+    if isinstance(geometry, str):
+        try:
+            return json.loads(geometry)
+        except (ValueError, TypeError):
+            return None
+    return geometry
+
+
+def _geometry_centroid(geometry: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    """Returns {lat, lng} or None. Handles Point/Polygon/MultiPolygon/Feature."""
+    geometry = _coerce_geojson(geometry)
+    if not geometry:
+        return None
+    if geometry.get("type") == "Feature":
+        geometry = geometry.get("geometry")
+        if not geometry:
+            return None
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates")
+    if not coords:
+        return None
+    try:
+        if gtype == "Point":
+            lng, lat = coords[0], coords[1]
+            return {"lat": float(lat), "lng": float(lng)}
+        if gtype == "Polygon":
+            ring = coords[0]
+        elif gtype == "MultiPolygon":
+            ring = coords[0][0]
+        else:
+            return None
+        if not ring:
+            return None
+        lng = sum(p[0] for p in ring) / len(ring)
+        lat = sum(p[1] for p in ring) / len(ring)
+        return {"lat": float(lat), "lng": float(lng)}
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _geometry_radius_m(geometry: Optional[Dict[str, Any]],
+                       centroid: Optional[Dict[str, float]]) -> Optional[float]:
+    """Rough radius (metres) — farthest vertex from centroid. None for points/cities."""
+    geometry = _coerce_geojson(geometry)
+    if not geometry or not centroid:
+        return None
+    if geometry.get("type") == "Feature":
+        geometry = geometry.get("geometry") or {}
+    gtype = geometry.get("type")
+    coords = geometry.get("coordinates") or []
+    rings = []
+    if gtype == "Polygon":
+        rings = coords
+    elif gtype == "MultiPolygon":
+        for poly in coords:
+            rings.extend(poly)
+    else:
+        return None
+    if not rings:
+        return None
+    # ~111_320 m per degree latitude; longitude varies with cos(lat).
+    lat0 = math.radians(centroid["lat"])
+    mx_per_deg_lng = 111_320 * math.cos(lat0)
+    my_per_deg_lat = 110_540
+    best = 0.0
+    for ring in rings:
+        for lng, lat in ring:
+            dx = (lng - centroid["lng"]) * mx_per_deg_lng
+            dy = (lat - centroid["lat"]) * my_per_deg_lat
+            d = math.hypot(dx, dy)
+            if d > best:
+                best = d
+    return round(best, 1) if best > 0 else None
 
 
 class DisasterPayload(BaseModel):
@@ -592,41 +909,72 @@ def get_citizen_reports(
     }
 
 
-@app.get("/api/weather", tags=["Weather"])
-def get_weather():
-    """
-    Mocked weather snapshot derived from active disasters.
+def _fetch_weather_driving_events():
+    """Returns rows (id, disaster_type, severity, cause, area_geometry, geometry_kind)
+    for events that influence weather, severity-desc then recency.
 
-    Walks active disaster_events ordered by severity (then recency) and returns
-    the first event that bends the weather. Falls back to a fixed sunny
-    baseline when nothing matches.
+    The deployed schema stores area_geometry as PostGIS geometry (not JSONB as
+    init.sql declares). We cast through ST_AsGeoJSON when the column is
+    geometry-typed; for legacy JSONB rows we fall through to the JSONB read.
+    The CASE handles both deployments without needing a migration.
     """
+    conn = psycopg2.connect(DATABASE_URL)
     try:
-        conn = psycopg2.connect(DATABASE_URL)
         with conn:
             with conn.cursor() as cur:
+                # Detect column type once per request — cheap, and lets us avoid
+                # a hard dependency on PostGIS being installed.
                 cur.execute(
                     """
-                    SELECT disaster_type, severity, cause
+                    SELECT udt_name FROM information_schema.columns
+                    WHERE table_name = 'disaster_events'
+                      AND column_name = 'area_geometry';
+                    """
+                )
+                udt = cur.fetchone()
+                geom_expr = (
+                    "ST_AsGeoJSON(area_geometry)"
+                    if udt and udt[0] == "geometry"
+                    else "area_geometry"
+                )
+                cur.execute(
+                    f"""
+                    SELECT id, disaster_type, severity, cause,
+                           {geom_expr}, geometry_kind
                     FROM disaster_events
                     WHERE status IN ('draft', 'active')
                     ORDER BY severity DESC, created_at DESC;
                     """
                 )
-                rows = cur.fetchall()
+                return cur.fetchall()
+    finally:
         conn.close()
+
+
+@app.get("/api/weather", tags=["Weather"])
+def get_weather():
+    """
+    Global weather summary derived from active disasters.
+
+    Returns the worst-case weather across all active disaster events (the first
+    that bends the weather in severity-desc order). Use /api/weather/regions
+    for the full per-region breakdown.
+    """
+    try:
+        rows = _fetch_weather_driving_events()
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Weather read failed: {exc}",
         )
 
-    for disaster_type, severity, cause in rows:
-        weather = _weather_for_event(disaster_type, severity, cause)
+    for event_id, disaster_type, severity, cause, _geom, _gkind in rows:
+        weather = _weather_for_event(disaster_type, severity, cause, str(event_id))
         if weather is not None:
             return {
                 **weather,
                 "driver": {
+                    "event_id": str(event_id),
                     "disaster_type": disaster_type,
                     "severity": severity,
                     "cause": cause,
@@ -634,6 +982,96 @@ def get_weather():
             }
 
     return {**BASELINE_WEATHER, "driver": None}
+
+
+@app.get("/api/weather/regions", tags=["Weather"])
+def get_weather_regions():
+    """
+    Per-region weather. Each weather-bending active disaster produces one
+    region; the response also carries the ambient baseline applied everywhere
+    outside those regions.
+
+    A region with no geometry (citywide events like Heatwave / citywide
+    Power_Outage) sets `scope: "city"` and is meant to override the baseline
+    globally on the client.
+    """
+    try:
+        rows = _fetch_weather_driving_events()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Weather read failed: {exc}",
+        )
+
+    regions: List[Dict[str, Any]] = []
+    citywide_override: Optional[Dict[str, Any]] = None
+
+    for event_id, disaster_type, severity, cause, geom, gkind in rows:
+        weather = _regional_weather(disaster_type, severity, cause, str(event_id))
+        # `_weather_for_event` is what tells us whether this disaster actually
+        # bends the weather (only the bending ones can override the global
+        # chip when they're citywide).
+        bends_weather = _weather_for_event(disaster_type, severity, cause, str(event_id)) is not None
+
+        geom = _coerce_geojson(geom)
+        if gkind == "city" or geom is None:
+            scope = "city"
+        else:
+            # Trust the geometry's actual type — geometry_kind in the DB has
+            # been observed to disagree (Point stored with kind='area').
+            geom_type = geom.get("type") if isinstance(geom, dict) else None
+            scope = "point" if geom_type == "Point" else "area"
+
+        # Citywide events that DON'T bend weather (e.g. citywide Power_Outage
+        # with cause='infrastructure') would otherwise return baseline-shaped
+        # snapshots and clutter the response without affecting anything. Skip.
+        if scope == "city" and not bends_weather:
+            continue
+
+        centroid = _geometry_centroid(geom)
+        radius_m = _geometry_radius_m(geom, centroid)
+
+        region = {
+            "event_id": str(event_id),
+            "disaster_type": disaster_type,
+            "severity": severity,
+            "cause": cause,
+            "scope": scope,
+            "geometry": geom,
+            "geometry_kind": gkind,
+            "centroid": centroid,
+            "radius_m": radius_m,
+            "bends_weather": bends_weather,
+            "weather": weather,
+        }
+        regions.append(region)
+
+        # Remember the most-severe citywide region as the global override
+        # (only bending citywide events get this — non-bending ones were
+        # already filtered out above).
+        if scope == "city" and citywide_override is None:
+            citywide_override = region
+
+    baseline = {**BASELINE_WEATHER}
+    global_weather = citywide_override["weather"] if citywide_override else baseline
+
+    return {
+        "baseline": baseline,
+        "global": {
+            **global_weather,
+            "driver": (
+                {
+                    "event_id": citywide_override["event_id"],
+                    "disaster_type": citywide_override["disaster_type"],
+                    "severity": citywide_override["severity"],
+                    "cause": citywide_override["cause"],
+                }
+                if citywide_override
+                else None
+            ),
+        },
+        "regions": regions,
+    }
 
 
 @app.patch("/api/disasters/{event_id}", tags=["Disasters"])
