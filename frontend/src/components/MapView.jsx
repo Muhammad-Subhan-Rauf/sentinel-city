@@ -312,6 +312,224 @@ function ActiveDispatchCircles({ dispatches, color = '#fbbf24' }) {
 }
 
 // ── Notification & Cordon Polygon Layer ──────────────────────
+// ── Weather Region Overlay ───────────────────────────────────
+// Tints each weather-bending disaster's geometry with a colour scaled to its
+// regional temperature (cold blue → hot red) and binds a tooltip with the full
+// meteorological snapshot. City-scope regions have no geometry and are skipped
+// here — they show up in the global chip instead.
+function weatherTone(temperatureC, condition, bendsWeather = true) {
+  // Disasters that don't bend the weather get a neutral grey outline so the
+  // map still reads as "this is a non-thermal incident."
+  if (bendsWeather === false) return '#a1a1aa'
+  // Storm/flood conditions get a blue tone regardless of mid-range temps.
+  if (condition === 'severe_storm' || condition === 'heavy_rain') return '#2563eb'
+  if (condition === 'light_rain') return '#38bdf8'
+  if (condition === 'freezing') return '#60a5fa'
+  if (typeof temperatureC !== 'number') return '#71717a'
+  if (temperatureC <= 0) return '#1e3a8a'
+  if (temperatureC <= 10) return '#0ea5e9'
+  if (temperatureC <= 20) return '#22c55e'
+  if (temperatureC <= 28) return '#facc15'
+  if (temperatureC <= 36) return '#f97316'
+  if (temperatureC <= 45) return '#ef4444'
+  return '#b91c1c'
+}
+
+function weatherTooltipHtml(region) {
+  const w = region.weather || {}
+  const alerts = Array.isArray(w.alerts) ? w.alerts : []
+  const row = (label, value, suffix = '') =>
+    value === null || value === undefined
+      ? ''
+      : `<div style="display:flex;justify-content:space-between;gap:8px;font-size:11px;line-height:1.4"><span style="color:#a1a1aa">${label}</span><span style="color:#e4e4e7;font-variant-numeric:tabular-nums">${value}${suffix}</span></div>`
+  const alertsHtml = alerts.length
+    ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #3f3f46;display:flex;flex-direction:column;gap:2px">${alerts
+        .map(
+          (a) =>
+            `<div style="font-size:10px;color:#fda4af"><b style="text-transform:uppercase;letter-spacing:.04em">${a.type}</b> · ${a.headline}</div>`,
+        )
+        .join('')}</div>`
+    : ''
+  return `
+    <div style="min-width:180px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <span style="color:#fafafa;font-weight:600;font-size:12px">${w.label ?? 'Weather'}</span>
+        <span style="font-size:16px">${w.icon ?? ''}</span>
+      </div>
+      <div style="color:#a1a1aa;font-size:10px;margin-bottom:6px">${region.disaster_type} · sev ${region.severity}</div>
+      ${row('Temp', w.temperature_c, ' °C')}
+      ${row('Dew pt', w.dew_point_c, ' °C')}
+      ${row('Humidity', w.humidity_pct, ' %')}
+      ${row('Precip', w.precipitation_mm_per_hour, ' mm/h')}
+      ${row('Wind', w.wind_speed_kph != null ? `${w.wind_speed_kph} kph @ ${w.wind_direction_deg ?? 0}°` : null)}
+      ${row('Pressure', w.pressure_hpa, ' hPa')}
+      ${row('Visibility', w.visibility_km, ' km')}
+      ${row('AQI', w.air_quality_aqi)}
+      ${alertsHtml}
+    </div>`
+}
+
+function buildBadgeIcon(zoneNumber, colour) {
+  // Circular numbered badge at the region's centroid. Acts as the operator's
+  // visual link between the map polygon and the right-side WeatherRegionsPanel
+  // card for the same zone.
+  const num = zoneNumber ?? '·'
+  return L.divIcon({
+    className: '',
+    html: `<div style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:9999px;background:rgba(9,9,11,0.92);border:2px solid ${colour};color:${colour};font-size:12px;font-weight:700;line-height:1;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,0.45);transform:translate(-50%,-50%)">${num}</div>`,
+    iconSize: [0, 0],
+  })
+}
+
+function geomLatLngsFor(r) {
+  const geom = r.geometry?.type === 'Feature' ? r.geometry.geometry : r.geometry
+  const gtype = geom?.type
+  const coords = geom?.coordinates
+  if (gtype === 'Polygon' && Array.isArray(coords?.[0])) {
+    return { kind: 'polygon', latlngs: coords[0].map(([lng, lat]) => [lat, lng]) }
+  }
+  if (gtype === 'MultiPolygon' && Array.isArray(coords?.[0]?.[0])) {
+    return { kind: 'polygon', latlngs: coords.map((p) => p[0].map(([lng, lat]) => [lat, lng])) }
+  }
+  if (r.centroid) {
+    const radius = r.radius_m && r.radius_m > 0 ? r.radius_m : 200
+    return { kind: 'circle', latlng: [r.centroid.lat, r.centroid.lng], radius }
+  }
+  return null
+}
+
+// Renders one persistent Leaflet polygon per active region (identified by
+// event_id) plus a numbered badge at the centroid. The badge's number maps to
+// a matching card in the right-side WeatherRegionsPanel — that's the read-only
+// link from map to weather details, since direct map clicks were unreliable.
+// Layers are updated in place across ticks (never torn down) to keep the
+// browser's render path stable.
+function WeatherRegionOverlay({ regions = [] }) {
+  const map = useMap()
+  // event_id → { layer, badge, kind, currentColour }
+  const itemsRef = useRef(new Map())
+
+  // Custom panes — keep weather overlays above other map layers regardless of
+  // creation order.
+  useEffect(() => {
+    if (!map.getPane('weather-overlay')) {
+      const pane = map.createPane('weather-overlay')
+      pane.style.zIndex = 480
+      pane.style.pointerEvents = 'none'
+    }
+    if (!map.getPane('weather-overlay-labels')) {
+      const pane = map.createPane('weather-overlay-labels')
+      pane.style.zIndex = 620
+      pane.style.pointerEvents = 'none'
+    }
+  }, [map])
+
+  useEffect(() => {
+    const items = itemsRef.current
+    const seen = new Set()
+
+    for (const r of regions) {
+      if (!r || !r.event_id || r.scope === 'city') continue
+      const geomSpec = geomLatLngsFor(r)
+      if (!geomSpec) continue
+
+      seen.add(r.event_id)
+      const w = r.weather || {}
+      const bends = r.bends_weather !== false
+      const colour = weatherTone(w.temperature_c, w.condition, bends)
+      const isClearing = r.cleared === true
+      // Non-thermal disasters (Robbery, Accident, etc.) get a numbered badge
+      // on the map and a card in the panel, but no polygon/circle overlay —
+      // it'd add visual noise without conveying any weather signal.
+      const drawOutline = bends
+      const style = {
+        color: colour,
+        weight: 2,
+        opacity: isClearing ? 0.5 : 0.95,
+        fillColor: colour,
+        fillOpacity: isClearing ? 0.06 : 0.18,
+        dashArray: '4 6',
+      }
+
+      let entry = items.get(r.event_id)
+
+      // ── Create on first sight ─────────────────────────────────
+      if (!entry || entry.kind !== geomSpec.kind || entry.hasOutline !== drawOutline) {
+        if (entry) {
+          if (entry.layer) map.removeLayer(entry.layer)
+          if (entry.badge) map.removeLayer(entry.badge)
+        }
+        let layer = null
+        if (drawOutline) {
+          const layerOpts = { ...style, interactive: false, pane: 'weather-overlay' }
+          layer = geomSpec.kind === 'polygon'
+            ? L.polygon(geomSpec.latlngs, layerOpts)
+            : L.circle(geomSpec.latlng, { ...layerOpts, radius: geomSpec.radius })
+          layer.addTo(map)
+        }
+
+        let badge = null
+        if (r.centroid) {
+          badge = L.marker([r.centroid.lat, r.centroid.lng], {
+            interactive: false,
+            pane: 'weather-overlay-labels',
+            icon: buildBadgeIcon(r.zone_number, colour),
+          })
+          badge.addTo(map)
+        }
+        entry = { kind: geomSpec.kind, layer, badge, hasOutline: drawOutline }
+        items.set(r.event_id, entry)
+      } else {
+        // ── Update in place ────────────────────────────────────
+        if (entry.layer) {
+          if (geomSpec.kind === 'polygon') {
+            entry.layer.setLatLngs(geomSpec.latlngs)
+          } else {
+            entry.layer.setLatLng(geomSpec.latlng)
+            entry.layer.setRadius(geomSpec.radius)
+          }
+          entry.layer.setStyle(style)
+        }
+        if (r.centroid) {
+          if (!entry.badge) {
+            entry.badge = L.marker([r.centroid.lat, r.centroid.lng], {
+              interactive: false,
+              pane: 'weather-overlay-labels',
+              icon: buildBadgeIcon(r.zone_number, colour),
+            })
+            entry.badge.addTo(map)
+          } else {
+            entry.badge.setLatLng([r.centroid.lat, r.centroid.lng])
+            entry.badge.setIcon(buildBadgeIcon(r.zone_number, colour))
+          }
+        } else if (entry.badge) {
+          map.removeLayer(entry.badge)
+          entry.badge = null
+        }
+      }
+    }
+
+    // Remove layers for regions that disappeared.
+    for (const [id, entry] of [...items.entries()]) {
+      if (seen.has(id)) continue
+      if (entry.layer) map.removeLayer(entry.layer)
+      if (entry.badge) map.removeLayer(entry.badge)
+      items.delete(id)
+    }
+  }, [map, regions])
+
+  // Cleanup on unmount only.
+  useEffect(() => () => {
+    for (const entry of itemsRef.current.values()) {
+      if (entry.layer) map.removeLayer(entry.layer)
+      if (entry.badge) map.removeLayer(entry.badge)
+    }
+    itemsRef.current.clear()
+  }, [map])
+
+  return null
+}
+
 // Renders simple polygons with a translucent fill. Notifications are yellow,
 // cordons are amber striped. Read-only — no interaction.
 function PolygonOverlay({ items, style }) {
@@ -779,6 +997,7 @@ export default function MapView({
   onPoliceDispatchTargetPick,
   polygonDrawKind = null, // 'notification' | 'cordon' | null
   onPolygonDraw,
+  weatherRegions = [],
 }) {
   const tileUrls = {
     colored: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
@@ -852,6 +1071,7 @@ export default function MapView({
         style={{ color: '#f97316', weight: 2, dashArray: '4 6', fillColor: '#f97316', fillOpacity: 0.12 }}
       />
       <PolygonDrawer mode={!!polygonDrawKind} onComplete={onPolygonDraw} />
+      <WeatherRegionOverlay regions={weatherRegions} />
     </MapContainer>
   )
 }
