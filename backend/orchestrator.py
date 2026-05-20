@@ -15,6 +15,58 @@ from google.genai import types
 from google.genai import errors as genai_errors
 
 
+# Models tried in order. First one is the preferred quality; each fallback
+# has its own quota bucket on the Generative Language API, so when one fails
+# with 429 (quota) or 5xx (high demand) the next is usually still available.
+GEMINI_MODEL_FALLBACK = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+]
+
+# Transient error codes that should trigger a fallback to the next model.
+_FALLBACK_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+async def generate_with_fallback(
+    client: genai.Client,
+    contents: Any,
+    config: types.GenerateContentConfig,
+    label: str = "Gemini",
+) -> Any:
+    """Try each model in GEMINI_MODEL_FALLBACK until one succeeds.
+
+    On a transient error (429/5xx), log and try the next model. On a
+    non-transient error (auth, malformed request), raise immediately so
+    we surface the real bug instead of cascading through every model.
+    On full exhaustion, raise the last transient error.
+    """
+    last_err: Optional[Exception] = None
+    for model in GEMINI_MODEL_FALLBACK:
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            if last_err is not None:
+                logger.info(f"[{label}] Recovered using fallback model {model}")
+            return resp
+        except (genai_errors.ClientError, genai_errors.ServerError) as e:
+            code = getattr(e, "code", None)
+            if code not in _FALLBACK_STATUS_CODES:
+                raise  # auth / validation — no point trying other models
+            last_err = e
+            logger.warning(f"[{label}] {model} returned {code}; trying next fallback")
+            continue
+    # All models exhausted; re-raise the last error so the existing
+    # loop-level handler (429 sleep, etc.) still runs.
+    assert last_err is not None
+    raise last_err
+
+
 def _signal_fingerprint(disasters: Any, reports: Any, state: AgentState) -> str:
     """Cheap dedup key. Skip Gemini call when this matches the previous tick.
 
@@ -230,15 +282,15 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
             prompt_content = f"Analyze the following current data:\n{context}"
 
             logger.info("[Detection] Sending request to Gemini...")
-            # Pass to Gemini via async client
-            response = await client.aio.models.generate_content(
-                model='gemini-2.5-flash',
+            response = await generate_with_fallback(
+                client,
                 contents=prompt_content,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
                     tools=gemini_tools,
-                    temperature=0.2
-                )
+                    temperature=0.2,
+                ),
+                label="Detection",
             )
             logger.info("[Detection] Received response from Gemini.")
             last_fingerprint = fingerprint
@@ -326,14 +378,15 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
             prompt_content = f"Review the active incidents and current resources:\n{context}"
 
             logger.info("[Monitoring] Sending request to Gemini...")
-            response = await client.aio.models.generate_content(
-                model='gemini-2.5-flash',
+            response = await generate_with_fallback(
+                client,
                 contents=prompt_content,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
                     tools=gemini_tools,
-                    temperature=0.2
-                )
+                    temperature=0.2,
+                ),
+                label="Monitoring",
             )
             logger.info("[Monitoring] Received response from Gemini.")
             last_fingerprint = fingerprint
