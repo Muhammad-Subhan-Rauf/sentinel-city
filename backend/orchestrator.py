@@ -33,12 +33,24 @@ async def load_prompt(filename: str) -> str:
     return filepath.read_text(encoding="utf-8")
 
 def get_gemini_tools() -> Optional[list]:
-    """Helper to safely extract the tools list from tools.py."""
-    if hasattr(tools, "TOOLS"):
-        return tools.TOOLS
+    """Build the google-genai tools list from the raw dicts in tools.py.
+
+    tools.ALL_TOOLS is a list of plain dicts ({name, description, parameters}).
+    GenerateContentConfig.tools expects [types.Tool(function_declarations=[...])]
+    where each entry in function_declarations is a types.FunctionDeclaration.
+    """
+    raw: Optional[list] = None
+    if hasattr(tools, "ALL_TOOLS"):
+        raw = tools.ALL_TOOLS
+    elif hasattr(tools, "TOOLS"):
+        raw = tools.TOOLS
     elif hasattr(tools, "get_tools"):
-        return tools.get_tools()
-    return None
+        raw = tools.get_tools()
+    if not raw:
+        return None
+
+    declarations = [types.FunctionDeclaration(**d) for d in raw]
+    return [types.Tool(function_declarations=declarations)]
 
 async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: AuditLogger, client: genai.Client):
     """
@@ -91,7 +103,7 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
                     
                     # ToolExecutor handles the actual logic and updates state.py implicitly
                     result = await tool_executor.execute(
-                        name=function_call.name,
+                        tool_name=function_call.name,
                         arguments=function_call.args
                     )
                     
@@ -162,7 +174,7 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
                 for function_call in response.function_calls:
                     logger.info(f"[Monitoring] Executing tool: {function_call.name}")
                     result = await tool_executor.execute(
-                        name=function_call.name,
+                        tool_name=function_call.name,
                         arguments=function_call.args
                     )
                     
