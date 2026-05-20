@@ -227,6 +227,17 @@ def sync_state_with_disasters(state: AgentState, disasters: Any):
             state.remove_incident(d_id)
 
 
+# Hard cap on LLM ↔ tool cycles inside a single agent.ainvoke. LangGraph's
+# default recursion_limit is 25, which on the free-tier 20-RPD quota burns a
+# whole day's budget in one tick. 6 = enough for "read 1-2 signals, then act
+# 1-3 times, then summarize" without runaway loops.
+_AGENT_RECURSION_LIMIT = 6
+
+# Outer loop sleep. Bumped from 60s after observing the agent burn through
+# free-tier daily quota inside ~5 minutes during a busy demo.
+_LOOP_SLEEP_SECONDS = 90
+
+
 async def _invoke_agent(agent: Any, label: str, system_context: Dict[str, Any]) -> Dict[str, Any]:
     """Invoke a LangGraph ReAct agent with a context dict as the user message.
 
@@ -235,7 +246,8 @@ async def _invoke_agent(agent: Any, label: str, system_context: Dict[str, Any]) 
     """
     logger.info(f"[{label}] Invoking agent...")
     result = await agent.ainvoke(
-        {"messages": [HumanMessage(content=f"Current world state:\n{system_context}")]}
+        {"messages": [HumanMessage(content=f"Current world state:\n{system_context}")]},
+        config={"recursion_limit": _AGENT_RECURSION_LIMIT},
     )
     logger.info(f"[{label}] Agent returned with {len(result.get('messages', []))} messages")
     return result
@@ -269,7 +281,7 @@ async def detection_loop(
             fingerprint = _signal_fingerprint(disasters, reports, state)
             if fingerprint == last_fingerprint:
                 logger.info("[Detection] No new signals; skipping agent invocation.")
-                await asyncio.sleep(60)
+                await asyncio.sleep(_LOOP_SLEEP_SECONDS)
                 continue
 
             context = {
@@ -321,7 +333,7 @@ async def detection_loop(
                 await asyncio.sleep(delay)
                 continue
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(_LOOP_SLEEP_SECONDS)
 
 
 async def monitoring_supervisor(
@@ -347,13 +359,13 @@ async def monitoring_supervisor(
 
             if not state.active_incidents:
                 last_fingerprint = None  # reset so a fresh incident triggers a call
-                await asyncio.sleep(60)
+                await asyncio.sleep(_LOOP_SLEEP_SECONDS)
                 continue
 
             fingerprint = _signal_fingerprint(disasters, [], state)
             if fingerprint == last_fingerprint:
                 logger.info("[Monitoring] Active incidents unchanged; skipping agent invocation.")
-                await asyncio.sleep(60)
+                await asyncio.sleep(_LOOP_SLEEP_SECONDS)
                 continue
 
             context = {
@@ -404,7 +416,7 @@ async def monitoring_supervisor(
                 await asyncio.sleep(delay)
                 continue
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(_LOOP_SLEEP_SECONDS)
 
 
 async def main():

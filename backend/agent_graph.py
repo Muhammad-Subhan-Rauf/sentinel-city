@@ -31,13 +31,16 @@ from langgraph.prebuilt import create_react_agent
 logger = logging.getLogger(__name__)
 
 
-# Models tried in order — identical to orchestrator.GEMINI_MODEL_FALLBACK
-# so behavior under quota pressure matches what we had before.
+# Models tried in order. Lite variants are listed first because the free-tier
+# RPD (requests-per-day) cap is several multiples higher on lite than on the
+# full flash models — observed: `gemini-2.5-flash` was capped at 20 RPD and
+# we burned through it in minutes. Putting lite first preserves the full
+# fallback ladder but front-loads the cheaper quota bucket.
 GEMINI_MODELS: List[str] = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
     "gemini-1.5-flash",
 ]
 
@@ -49,26 +52,28 @@ def _build_chat_model(
 ) -> Any:
     """Build a Gemini chat model with `.with_fallbacks()` over the 5-model list.
 
-    We intentionally pass ``exceptions_to_handle=(Exception,)`` (the default)
-    so any 429/5xx (and even malformed responses) cascade to the next model.
-    The old ``generate_with_fallback`` gated on a specific set of HTTP codes
-    via ``getattr(e, 'code', None) in _FALLBACK_STATUS_CODES``; LangChain's
-    fallback chain runs *all* fallbacks for any exception, which is a slight
-    behavior change — but a strictly safer one for the orchestrator since
-    auth-error symptoms (which used to fail fast) will now still try every
-    model. We tolerate that: an unrecoverable problem still raises at the
-    end of the chain, just a few seconds later.
+    ``max_retries=1`` is the critical knob for quota survival: the
+    google-genai SDK has its own auto-retry on 429 (visible in logs as
+    ``google_genai._api_client - INFO - Retrying``) that swallows the
+    exception and re-tries the *same* model with exponential backoff. With
+    LangChain's default ``max_retries=6`` stacked on top, a single 429 can
+    waste many seconds and dozens of retries on the same exhausted model
+    before ``with_fallbacks()`` gets a chance to move on. Setting it to 1
+    makes LangChain raise on the first failure so the fallback chain
+    actually fires.
     """
     primary = ChatGoogleGenerativeAI(
         model=GEMINI_MODELS[0],
         temperature=temperature,
         google_api_key=api_key,
+        max_retries=1,
     )
     fallbacks = [
         ChatGoogleGenerativeAI(
             model=m,
             temperature=temperature,
             google_api_key=api_key,
+            max_retries=1,
         )
         for m in GEMINI_MODELS[1:]
     ]
