@@ -37,6 +37,38 @@ export const BUILDING_EXTINGUISH_RATE = 0.5
 // Notification lifetime (sim seconds) before auto-clear.
 export const NOTIFICATION_TTL_S = 180
 
+// Probability that a citizen who observes a disaster AND reacts by fleeing
+// will actually dial 911 before running. People mid-panic often just run.
+// Citizens still transition to 'fleeing' regardless — only the call is gated.
+// Observation reports from non-fleeing reactions (hide / approach / shelter /
+// neutral) and 'affected' self-reports always emit.
+export const FLEEING_CALL_PROBABILITY = 0.4
+
+// Background "noise" to stress-test the orchestrator. Every PRANK_CALL_INTERVAL_S
+// sim-seconds a random walking citizen dials in a frivolous emergency. Prank
+// calls use a synthetic event_id ('prank:<idx>:<t>') so they appear in the
+// call drawer like any other report but never persist to disaster_events and
+// never cause state transitions — they exist purely so the AI orchestrator
+// must learn to filter low-credibility, uncorroborated single-source signals.
+export const PRANK_CALL_INTERVAL_S = 30
+export const PRANK_TRANSCRIPTS = [
+  'There is a UFO landing on my roof, please send help!',
+  'My neighbor’s cat has been staring at me for two hours, send police.',
+  'Aliens just abducted my pizza delivery guy, I have no toppings.',
+  'A pigeon is following me with intent.',
+  'The moon looks too close tonight, is this an emergency?',
+  'Someone stole my parking spot, I demand a SWAT team.',
+  'My WiFi is slow and I think it’s a national security threat.',
+  'There’s a man wearing sandals with socks, suspicious activity.',
+  'I can hear my plants screaming, send botanists immediately.',
+  'My ex just walked past my house, I need a restraining order via 911.',
+  'Pretty sure my fridge is haunted, lights flickering.',
+  'I heard a noise. Just one noise. But still.',
+  'There is a squirrel acting too confident in the park.',
+  'My pizza came with three olives instead of four, this is a crime.',
+  'A man in a trench coat asked for the time. Suspicious.',
+]
+
 // Soft cap on stations the operator can place (UI guard, not DB).
 export const MAX_FIRE_STATIONS = 8
 export const MAX_HOSPITALS = 6

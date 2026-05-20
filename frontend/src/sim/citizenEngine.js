@@ -41,6 +41,9 @@ import {
   ROBBERY_L2_INJURE_CHANCE,
   ROBBERY_L1_INITIAL_HP,
   ROBBERY_L2_INITIAL_HP,
+  FLEEING_CALL_PROBABILITY,
+  PRANK_CALL_INTERVAL_S,
+  PRANK_TRANSCRIPTS,
 } from '../lib/config.js'
 
 // Speeds are "demo-tuned" — faster than realistic pedestrian speeds so motion
@@ -453,6 +456,8 @@ export function createCitizenEngine({
   const EVACUEE_TETHER_M = 150
 
   let simTimeS = 0
+  // Sim time at which the next prank-call should fire. See maybeEmitPrankCall.
+  let nextPrankAtS = PRANK_CALL_INTERVAL_S
   let tickHandle = null
   const listeners = new Set()
 
@@ -671,9 +676,12 @@ export function createCitizenEngine({
   function advanceAlongPath(idx, dtS, zones) {
     const p = path[idx]
     if (!p || p.length < 2) {
-      // Trucks have their own retarget logic in tickFireTruck — calling
-      // retargetForState here would dump them on a random node.
-      if (kind[idx] !== 1) retargetForState(idx, zones)
+      // Emergency units (trucks/ambulances/police) have their own role-aware
+      // retarget logic in their tick functions. Calling retargetForState
+      // here would fall through to a random city node for any state it
+      // doesn't recognise (police_patrolling, amb_searching, etc.) — which
+      // teleports the unit's destination out of its search/patrol circle.
+      if (kind[idx] === 0) retargetForState(idx, zones)
       return
     }
     const speed = SPEED_MPS[states[idx]] ?? SPEED_MPS.walking
@@ -714,11 +722,10 @@ export function createCitizenEngine({
     }
 
     if (path[idx].length < 2) {
-      // Same guard as the top of this function: trucks have their own
-      // path-exhaustion logic in tickFireTruck (each role re-targets to its
-      // own destination — search circle, fire, or station). Calling
-      // retargetForState here would dump them on a random city node.
-      if (kind[idx] !== 1) retargetForState(idx, zones)
+      // Same guard as the top of this function — only citizens (kind 0)
+      // should fall back to retargetForState. Emergency units re-target via
+      // their own tick functions.
+      if (kind[idx] === 0) retargetForState(idx, zones)
     }
   }
 
@@ -869,6 +876,15 @@ export function createCitizenEngine({
         : ec
           ? `Citizen reporting ${profile.label.toLowerCase()} near ${ec.lat.toFixed(4)}, ${ec.lng.toFixed(4)}.`
           : `Citizen reporting ${profile.label.toLowerCase()}.`
+
+    // 911-call gate: not every panicked citizen has the presence of mind to
+    // dial before running. We still trigger the behavioural transition above
+    // (they DO flee), but the report is only emitted with some probability.
+    // Affected ("I feel sick") reports and non-flee reactions always call —
+    // those are the high-value 911 signals.
+    if (kind === 'observation' && response === 'flee' && Math.random() >= FLEEING_CALL_PROBABILITY) {
+      return
+    }
 
     onReport?.({
       event_id: zone.id,
@@ -1579,7 +1595,45 @@ export function createCitizenEngine({
         }
       }
     }
+    maybeEmitPrankCall()
     notifyListeners()
+  }
+
+  // Background "noise" generator: every PRANK_CALL_INTERVAL_S sim-seconds a
+  // random walking citizen dials in a frivolous emergency. Event id is the
+  // synthetic 'prank:<idx>:<t>' form that the report-flush layer already
+  // filters out of the DB write (it isn't a UUID) — so pranks appear in the
+  // operator's call drawer but never persist or trigger any state change.
+  function maybeEmitPrankCall() {
+    if (!onReport) return
+    if (simTimeS < nextPrankAtS) return
+    // Lock the next slot whether or not we successfully find a caller, so a
+    // momentarily empty city doesn't burst-fire every tick once citizens
+    // respawn.
+    nextPrankAtS = simTimeS + PRANK_CALL_INTERVAL_S
+
+    // Pick a random walking citizen. Don't pull from fleeing / fainted /
+    // dead / arrested slots — those people aren't joking around.
+    const candidates = []
+    for (let i = 0; i < activeCount; i++) {
+      if (!alive[i] || kind[i] !== 0) continue
+      if (states[i] !== 'walking') continue
+      candidates.push(i)
+    }
+    if (candidates.length === 0) return
+    const caller = candidates[Math.floor(Math.random() * candidates.length)]
+    const transcript = PRANK_TRANSCRIPTS[Math.floor(Math.random() * PRANK_TRANSCRIPTS.length)]
+    onReport({
+      event_id: `prank:${caller}:${Math.floor(simTimeS)}`,
+      citizen_idx: caller,
+      report_kind: 'observation',
+      location: { lat: lats[caller], lng: lngs[caller] },
+      transcript,
+      // Pranksters often *sound* dramatic — pick a mid-to-high severity so
+      // the orchestrator has to look past the volume knob and weigh the
+      // (lack of) corroborating signals.
+      perceived_severity: 5 + Math.floor(Math.random() * 5),
+    })
   }
 
   function notifyListeners() {

@@ -1,0 +1,63 @@
+name: Deploy backend to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: hackathon-496916
+  REGION: me-central1
+  SERVICE: sentinel-backend
+  REPO: sentinel-city
+  IMAGE: me-central1-docker.pkg.dev/hackathon-496916/sentinel-city/backend
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build & push image
+        run: |
+          IMAGE_TAG="${{ env.IMAGE }}:${{ github.sha }}"
+          docker build -t "$IMAGE_TAG" -t "${{ env.IMAGE }}:latest" ./backend
+          docker push "$IMAGE_TAG"
+          docker push "${{ env.IMAGE }}:latest"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE }} \
+            --image="${{ env.IMAGE }}:${{ github.sha }}" \
+            --region="${{ env.REGION }}" \
+            --platform=managed \
+            --port=8000 \
+            --allow-unauthenticated \
+            --service-account="cloud-run-sentinel@${{ env.PROJECT_ID }}.iam.gserviceaccount.com" \
+            --set-secrets=DATABASE_URL=DATABASE_URL:latest \
+            --min-instances=0 \
+            --max-instances=5 \
+            --memory=512Mi \
+            --cpu=1 \
+            --timeout=300
+
+      - name: Show service URL
+        run: gcloud run services describe ${{ env.SERVICE }} --region=${{ env.REGION }} --format='value(status.url)'
