@@ -53,6 +53,7 @@ valhalla.zip
 
 # ─── AI orchestration spec (working doc) ─────────────────────
 prompt.md
+prompt.pdf
 
 # ─── Log files ────────────────────────────────────────────────
 *.log
