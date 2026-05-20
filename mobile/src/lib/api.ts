@@ -1,28 +1,65 @@
 // Thin client over the Sentinel-City FastAPI backend.
 //
-// Base URL is read from app.json `extra.backendUrl`. Override at runtime by
-// shaking the dev menu and editing it, or by setting EXPO_PUBLIC_BACKEND_URL.
+// Base URL resolution order:
+//   1. EXPO_PUBLIC_BACKEND_URL env var (explicit operator override)
+//   2. Metro/Expo Go LAN host on port 8000 — auto-derived so a physical
+//      device can reach the dev machine without manual config
+//   3. app.json `extra.backendUrl`
+//   4. http://localhost:8000 (simulator / web)
 
 import Constants from 'expo-constants';
 
+// Expo exposes the dev-machine host (e.g. "192.168.1.42:8081") via a few
+// different fields depending on SDK version + whether the bundle is dev or
+// production. Try them all.
+function resolveDevHost(): string | null {
+  const candidates: Array<string | undefined> = [
+    (Constants.expoConfig as any)?.hostUri,
+    (Constants as any).expoGoConfig?.debuggerHost,
+    (Constants as any).manifest2?.extra?.expoGo?.developer?.host,
+    (Constants as any).manifest?.debuggerHost,
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    const host = String(c).split(':')[0];
+    if (!host || host === 'localhost' || host === '127.0.0.1') continue;
+    return host;
+  }
+  return null;
+}
+
+const devHost = resolveDevHost();
+
 const BACKEND_URL: string =
   (process.env.EXPO_PUBLIC_BACKEND_URL as string | undefined) ??
+  (devHost ? `http://${devHost}:8000` : undefined) ??
   (Constants.expoConfig?.extra as any)?.backendUrl ??
   'http://localhost:8000';
 
 const VALHALLA_URL: string =
   (process.env.EXPO_PUBLIC_VALHALLA_URL as string | undefined) ??
+  (devHost ? `http://${devHost}:8002` : undefined) ??
   (Constants.expoConfig?.extra as any)?.valhallaUrl ??
   'http://localhost:8002';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BACKEND_URL}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BACKEND_URL}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {}),
+      },
+    });
+  } catch (e: any) {
+    // Network-level failure (DNS, can't reach host, CORS pre-flight). Give a
+    // clearer message than "Network request failed" so the user can spot
+    // backend-not-running vs. wrong-IP issues quickly.
+    throw new Error(
+      `Cannot reach backend at ${BACKEND_URL}. Check that the FastAPI server is running and on the same network. (${e?.message ?? 'network error'})`,
+    );
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`API ${res.status} ${path}: ${text || res.statusText}`);
@@ -79,6 +116,45 @@ export type Notification = {
   status: 'active' | 'cleared';
   created_at: string;
   event_id: string | null;
+};
+
+// Emergency service types a citizen can request when placing a 911 call.
+export type EmergencyService = 'ambulance' | 'police' | 'firefighter';
+
+// 911 emergency call placed by a citizen while inside an active disaster.
+// Each call carries `requested_services`: workers see only calls whose
+// requested set includes their own service.
+export type EmergencyCall = {
+  id: string;
+  created_at: string;
+  citizen_id: string;
+  citizen_name: string;
+  caller_lat: number;
+  caller_lng: number;
+  disaster_id: string;
+  disaster_type: string;
+  severity: number;
+  cause: 'weather' | 'infrastructure' | null;
+  disaster_lat: number | null;
+  disaster_lng: number | null;
+  transcript: string;
+  requested_services: EmergencyService[];
+  status: 'new' | 'acknowledged' | 'closed';
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  closed_at: string | null;
+  responders: Array<{
+    worker_id: string;
+    sub_role: 'paramedic' | 'police' | 'firefighter';
+    acknowledged_at: string;
+  }>;
+};
+
+// Maps a worker's sub_role to the matching 911 service identifier.
+export const SUBROLE_TO_SERVICE: Record<'paramedic' | 'police' | 'firefighter', EmergencyService> = {
+  paramedic: 'ambulance',
+  police: 'police',
+  firefighter: 'firefighter',
 };
 
 export type Cordon = Notification;
@@ -181,6 +257,42 @@ export const api = {
       (r) => r.reports
     ),
 
+  // 911 calls (citizen creates, workers consume — filtered by their service)
+  placeEmergencyCall: (body: {
+    citizen_id: string;
+    disaster_id: string;
+    caller_lat: number;
+    caller_lng: number;
+    transcript: string;
+    requested_services: EmergencyService[];
+  }) =>
+    request<EmergencyCall>('/api/911/call', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  listEmergencyCalls: (params?: {
+    statusFilter?: 'new' | 'acknowledged' | 'closed' | 'all';
+    service?: EmergencyService;
+  }) => {
+    const q: string[] = [];
+    if (params?.statusFilter) q.push(`status_filter=${params.statusFilter}`);
+    if (params?.service) q.push(`service=${params.service}`);
+    const suffix = q.length ? `?${q.join('&')}` : '';
+    return request<{ calls: EmergencyCall[] }>(`/api/911/calls${suffix}`).then((r) => r.calls);
+  },
+  updateEmergencyCall: (
+    id: string,
+    patch: {
+      status?: 'new' | 'acknowledged' | 'closed';
+      worker_id?: string;
+      sub_role?: 'paramedic' | 'police' | 'firefighter';
+    },
+  ) =>
+    request<EmergencyCall>(`/api/911/calls/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
   // Admin
   listAgents: () => request<{ agents: Agent[] }>('/api/agents').then((r) => r.agents),
   savingsSummary: () => request<SavingsSummary>('/api/savings-summary'),
@@ -242,26 +354,76 @@ export type Route = {
   durationMin: number;
 };
 
+// Ray-cast point-in-polygon on a [lng,lat] closed ring. Duplicated here to
+// keep the api module free of cross-imports.
+function isInsideRing(pt: { lng: number; lat: number }, ring: number[][]): boolean {
+  if (ring.length < 3) return false;
+  let inside = false;
+  const x = pt.lng;
+  const y = pt.lat;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    const intersect =
+      yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 export async function fetchRoute(
   start: { lat: number; lng: number },
   end: { lat: number; lng: number },
-  avoidPolygons: number[][][] = []
+  avoidPolygons: number[][][] = [],
+  // 'pedestrian' = walking (shortest path, uses sidewalks/footpaths);
+  // 'auto' = driving (time-optimized over a road network);
+  // 'bicycle' = cycling. Default to pedestrian for citizen escape routes.
+  costing: 'auto' | 'pedestrian' | 'bicycle' = 'pedestrian',
 ): Promise<Route> {
+  // Strip any avoid polygon that contains the start OR end point. Valhalla
+  // returns 400 ("No path could be found") when the routing endpoints sit
+  // inside a forbidden zone — which is exactly what happens to a citizen
+  // already inside a danger zone. Excluding those polygons means the route
+  // will start by leaving the zone, which is the desired behavior anyway.
+  const safeAvoid = avoidPolygons.filter(
+    (ring) => !isInsideRing(start, ring) && !isInsideRing(end, ring),
+  );
+
   const body = {
     locations: [
       { lat: start.lat, lon: start.lng },
       { lat: end.lat, lon: end.lng },
     ],
-    costing: 'auto',
+    costing,
     units: 'kilometers',
-    ...(avoidPolygons.length > 0 ? { avoid_polygons: avoidPolygons } : {}),
+    ...(safeAvoid.length > 0 ? { avoid_polygons: safeAvoid } : {}),
   };
-  const res = await fetch(`${VALHALLA_URL}/route`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Valhalla ${res.status}`);
+  let res: Response;
+  try {
+    res = await fetch(`${VALHALLA_URL}/route`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e: any) {
+    throw new Error(
+      `Cannot reach routing service at ${VALHALLA_URL}. Start the Valhalla container (\`docker compose up valhalla\`) and ensure port 8002 is reachable from your phone. (${e?.message ?? 'network error'})`,
+    );
+  }
+  if (!res.ok) {
+    // Surface Valhalla's actual error string (e.g. "No path could be found",
+    // "costing_options invalid") — otherwise debugging is a guessing game.
+    let detail = res.statusText;
+    try {
+      const errBody = await res.json();
+      detail = errBody?.error_code
+        ? `${errBody.error_code}: ${errBody.error ?? errBody.error_message ?? 'unknown'}`
+        : errBody?.error ?? errBody?.error_message ?? detail;
+    } catch {
+      try { detail = (await res.text()) || detail } catch { /* ignore */ }
+    }
+    throw new Error(`Valhalla ${res.status} — ${detail}`);
+  }
   const data = (await res.json()) as ValhallaResponse;
   const points: Array<{ latitude: number; longitude: number }> = [];
   for (const leg of data.trip.legs) {

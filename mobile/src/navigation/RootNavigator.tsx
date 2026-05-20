@@ -17,6 +17,7 @@ import CitizenMapScreen from '@/screens/citizen/CitizenMapScreen';
 import NotificationsScreen from '@/screens/citizen/NotificationsScreen';
 import SettingsScreen from '@/screens/SettingsScreen';
 import WorkerMapScreen from '@/screens/worker/WorkerMapScreen';
+import WorkerCallLogsScreen from '@/screens/worker/WorkerCallLogsScreen';
 import AdminDispatchScreen from '@/screens/admin/AdminDispatchScreen';
 import AdminCallsScreen from '@/screens/admin/AdminCallsScreen';
 import AdminAgentsScreen from '@/screens/admin/AdminAgentsScreen';
@@ -78,17 +79,28 @@ function CitizenTabs() {
 }
 
 function WorkerTabs() {
+  // All worker sub-roles (police / firefighter / paramedic) get a Calls tab
+  // that lists only the 911 calls whose requested_services includes their
+  // service. The screen filters server-side.
+  const { session } = useAuth();
+  const mapIcon =
+    session?.sub_role === 'paramedic' ? '🚑' : session?.sub_role === 'police' ? '🚓' : '🚒';
   return (
     <Tab.Navigator screenOptions={tabScreenOptions(colors.worker)}>
       <Tab.Screen
         name="Map"
         component={WorkerMapScreen}
-        options={{ tabBarIcon: emoji('🚒') }}
+        options={{ tabBarIcon: emoji(mapIcon) }}
       />
       <Tab.Screen
         name="Alerts"
         component={NotificationsScreen}
         options={{ tabBarIcon: emoji('🔔') }}
+      />
+      <Tab.Screen
+        name="Calls"
+        component={WorkerCallLogsScreen}
+        options={{ tabBarIcon: emoji('📞') }}
       />
       <Tab.Screen
         name="Settings"
@@ -123,6 +135,11 @@ function AdminTabs() {
         name="Impact"
         component={AdminSavingsScreen}
         options={{ tabBarIcon: emoji('📈') }}
+      />
+      <Tab.Screen
+        name="Alerts"
+        component={NotificationsScreen}
+        options={{ tabBarIcon: emoji('🔔') }}
       />
       <Tab.Screen
         name="Settings"

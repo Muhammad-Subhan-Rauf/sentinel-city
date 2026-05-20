@@ -981,34 +981,40 @@ def get_citizen_reports(
     }
 
 
+# Cache the detected geometry-column SQL expression for the lifetime of the
+# process. The schema doesn't change on the fly, so a single probe is enough.
+_GEOM_EXPR: Optional[str] = None
+
+
+def _geometry_select_expr(cur) -> str:
+    """SQL expression that yields area_geometry as a GeoJSON string. The
+    deployed Supabase schema stores it as PostGIS geometry (despite init.sql
+    declaring JSONB), so we wrap in ST_AsGeoJSON when needed."""
+    global _GEOM_EXPR
+    if _GEOM_EXPR is not None:
+        return _GEOM_EXPR
+    cur.execute(
+        """
+        SELECT udt_name FROM information_schema.columns
+        WHERE table_name = 'disaster_events'
+          AND column_name = 'area_geometry';
+        """
+    )
+    udt = cur.fetchone()
+    _GEOM_EXPR = (
+        "ST_AsGeoJSON(area_geometry)" if udt and udt[0] == "geometry" else "area_geometry"
+    )
+    return _GEOM_EXPR
+
+
 def _fetch_weather_driving_events():
     """Returns rows (id, disaster_type, severity, cause, area_geometry, geometry_kind)
-    for events that influence weather, severity-desc then recency.
-
-    The deployed schema stores area_geometry as PostGIS geometry (not JSONB as
-    init.sql declares). We cast through ST_AsGeoJSON when the column is
-    geometry-typed; for legacy JSONB rows we fall through to the JSONB read.
-    The CASE handles both deployments without needing a migration.
-    """
+    for events that influence weather, severity-desc then recency."""
     conn = psycopg2.connect(DATABASE_URL)
     try:
         with conn:
             with conn.cursor() as cur:
-                # Detect column type once per request — cheap, and lets us avoid
-                # a hard dependency on PostGIS being installed.
-                cur.execute(
-                    """
-                    SELECT udt_name FROM information_schema.columns
-                    WHERE table_name = 'disaster_events'
-                      AND column_name = 'area_geometry';
-                    """
-                )
-                udt = cur.fetchone()
-                geom_expr = (
-                    "ST_AsGeoJSON(area_geometry)"
-                    if udt and udt[0] == "geometry"
-                    else "area_geometry"
-                )
+                geom_expr = _geometry_select_expr(cur)
                 cur.execute(
                     f"""
                     SELECT id, disaster_type, severity, cause,
@@ -1359,11 +1365,15 @@ def delete_disaster(event_id: str):
 
 
 def _row_to_disaster(row) -> Dict[str, Any]:
+    # area_geometry comes back either as raw JSONB (dict) or a GeoJSON-string
+    # (from ST_AsGeoJSON on PostGIS geometry columns). Normalise to dict here
+    # so every consumer — web dashboard, mobile WebView, /api/weather/regions —
+    # gets a parseable GeoJSON object.
     return {
         "id": str(row[0]),
         "disaster_type": row[1],
         "severity": row[2],
-        "area_geometry": row[3],
+        "area_geometry": _coerce_geojson(row[3]),
         "geometry_kind": row[4],
         "notes": row[5],
         "status": row[6],
@@ -1386,9 +1396,10 @@ def list_disasters(status_filter: Optional[str] = Query(None, description="activ
         conn = psycopg2.connect(DATABASE_URL)
         with conn:
             with conn.cursor() as cur:
+                geom_expr = _geometry_select_expr(cur)
                 cur.execute(
                     f"""
-                    SELECT id, disaster_type, severity, area_geometry, geometry_kind,
+                    SELECT id, disaster_type, severity, {geom_expr}, geometry_kind,
                            notes, status, cause, spread_speed, people_inside,
                            safe_exit_pct, created_at
                     FROM disaster_events
@@ -1413,9 +1424,10 @@ def get_disaster(event_id: str):
         conn = psycopg2.connect(DATABASE_URL)
         with conn:
             with conn.cursor() as cur:
+                geom_expr = _geometry_select_expr(cur)
                 cur.execute(
-                    """
-                    SELECT id, disaster_type, severity, area_geometry, geometry_kind,
+                    f"""
+                    SELECT id, disaster_type, severity, {geom_expr}, geometry_kind,
                            notes, status, cause, spread_speed, people_inside,
                            safe_exit_pct, created_at
                     FROM disaster_events
@@ -2281,9 +2293,15 @@ def auth_login(payload: LoginPayload):
                 "last_seen": now,
             }
         elif role == "worker":
-            existing = MOBILE_WORKERS.get(device_id)
-            MOBILE_WORKERS[device_id] = {
-                "id": device_id,
+            # Workers are scoped per (device + sub_role) so a single phone
+            # signing in as firefighter then police gets two distinct records.
+            # Without this, the firefighter's pin/position would leak into
+            # the police session and vice versa (shared single record per
+            # device_id was the previous bug).
+            worker_key = f"{device_id}:{sub_role}"
+            existing = MOBILE_WORKERS.get(worker_key)
+            MOBILE_WORKERS[worker_key] = {
+                "id": worker_key,
                 "name": friendly_name,
                 "role": sub_role,  # Keep field name 'role' for backward compat with frontend
                 "sub_role": sub_role,
@@ -2299,8 +2317,11 @@ def auth_login(payload: LoginPayload):
                 "role": "admin",
                 "last_seen": now,
             }
+    # Workers identify by composite key — every subsequent /api/workers/<id>
+    # call from the mobile uses this. Citizens/admins still use device_id.
+    user_id_out = f"{device_id}:{sub_role}" if role == "worker" else device_id
     response: Dict[str, Any] = {
-        "user_id": device_id,
+        "user_id": user_id_out,
         "role": role,
         "name": friendly_name,
     }
@@ -2376,6 +2397,223 @@ def update_worker(worker_id: str, update: MobileUserUpdate):
             worker["status"] = update.status
         worker["last_seen"] = datetime.utcnow().isoformat() + "Z"
         return worker
+
+
+@app.delete("/api/workers/{worker_id}", tags=["Mobile"])
+def delete_worker(worker_id: str):
+    """Remove a worker from the in-memory roster. Used to evict stale test
+    sessions (e.g. PD-TEST / FF-TEST) that were created by curl/Postman
+    traffic and don't correspond to a real phone. The worker can re-upsert
+    by signing in again — POST /api/auth/login is the source of truth."""
+    with _mobile_lock:
+        worker = MOBILE_WORKERS.pop(worker_id, None)
+    if worker is None:
+        raise HTTPException(status_code=404, detail="Worker not found.")
+    return {"deleted": True, "id": worker_id, "name": worker.get("name")}
+
+
+# ════════════════════════════════════════════════════════════════════
+# 911 calls — citizen-initiated, surfaced to police via the call log
+# ════════════════════════════════════════════════════════════════════
+#
+# Citizen taps "Call 911" while inside an active disaster zone. The mobile
+# app pre-fills the call with disaster context (type, severity, footprint,
+# the citizen's own coords + name) so dispatch knows what they're walking
+# into before they even pick up. Calls stay in memory — fine for hackathon
+# scope; survives a single backend session.
+
+EMERGENCY_CALLS: List[Dict[str, Any]] = []
+
+
+EMERGENCY_SERVICES = ("ambulance", "police", "firefighter")
+# Sub-role on the workers roster → which 911 service this worker can answer.
+# Each call has one or more requested_services; a worker only sees calls
+# whose requested set intersects their sub-role.
+SUBROLE_TO_SERVICE: Dict[str, str] = {
+    "paramedic": "ambulance",
+    "police": "police",
+    "firefighter": "firefighter",
+}
+
+
+class EmergencyCallPayload(BaseModel):
+    """Body for POST /api/911/call. Citizen submits this on tap."""
+    citizen_id: str = Field(..., description="Mobile device_id of the caller.")
+    disaster_id: str = Field(..., description="UUID of the disaster the citizen is reporting.")
+    # Citizen's own coordinates at call time. Stored alongside the disaster
+    # location so dispatch can see exactly where the caller is, even if they
+    # walk away from the zone after placing the call.
+    caller_lat: float
+    caller_lng: float
+    # The auto-generated script the citizen "spoke" — composed client-side
+    # so the citizen can review what dispatch will hear before they tap call.
+    transcript: str
+    # Which emergency service(s) the citizen requested via the in-app prompt.
+    # At least one required; ['ambulance','police','firefighter'] means "all
+    # services" and fans out to every responder type.
+    requested_services: List[Literal["ambulance", "police", "firefighter"]] = Field(
+        ..., min_length=1,
+    )
+
+
+@app.post("/api/911/call", tags=["911"])
+def create_emergency_call(payload: EmergencyCallPayload):
+    """Citizens-only endpoint. Builds an enriched call record by joining the
+    citizen + disaster details and pushes it onto the in-memory call log."""
+    # Citizen resolution — we surface the friendly name in the call log.
+    with _mobile_lock:
+        citizen = MOBILE_CITIZENS.get(payload.citizen_id)
+    if citizen is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Citizen not found — sign in again.",
+        )
+
+    # Disaster lookup — fail loud if the citizen claims they're inside a
+    # disaster the operator already cleared. Front-end checks this too, but
+    # we don't trust client state.
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    geom_expr = _geometry_select_expr(cur)
+                    cur.execute(
+                        f"""
+                        SELECT id, disaster_type, severity, cause, status,
+                               {geom_expr}, geometry_kind
+                        FROM disaster_events
+                        WHERE id = %s;
+                        """,
+                        (payload.disaster_id,),
+                    )
+                    row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Disaster lookup failed: {exc}",
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Disaster no longer active.",
+        )
+    if row[4] != "active":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Disaster status is '{row[4]}', not active.",
+        )
+
+    disaster_geom = _coerce_geojson(row[5])
+    disaster_centroid = _geometry_centroid(disaster_geom)
+
+    # De-dupe + canonicalise requested_services. The citizen UI sends
+    # ['ambulance','police','firefighter'] for "all services"; we keep it as a
+    # list rather than a flag so adding new service types later is non-breaking.
+    services = sorted({s for s in payload.requested_services if s in EMERGENCY_SERVICES})
+    if not services:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one valid requested service is required.",
+        )
+
+    call = {
+        "id": str(uuid.uuid4()),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        # Citizen context
+        "citizen_id": payload.citizen_id,
+        "citizen_name": citizen.get("name") or "Unknown caller",
+        "caller_lat": payload.caller_lat,
+        "caller_lng": payload.caller_lng,
+        # Disaster context — frozen at call time so the log reads correctly
+        # even after the operator bumps severity or clears the event.
+        "disaster_id": str(row[0]),
+        "disaster_type": row[1],
+        "severity": row[2],
+        "cause": row[3],
+        "disaster_lat": disaster_centroid["lat"] if disaster_centroid else None,
+        "disaster_lng": disaster_centroid["lng"] if disaster_centroid else None,
+        # Pre-built script the citizen "spoke" on tap.
+        "transcript": payload.transcript.strip() or "(no transcript provided)",
+        # Service routing — which responder types the citizen asked for.
+        "requested_services": services,
+        # Lifecycle: new → acknowledged → closed. Workers flip these.
+        "status": "new",
+        "acknowledged_by": None,
+        "acknowledged_at": None,
+        "closed_at": None,
+        # Identity of the worker(s) who acknowledged. Multiple responders can
+        # roll on a single call (e.g. ambulance + police on a major incident).
+        "responders": [],  # list of {worker_id, sub_role, acknowledged_at}
+    }
+    EMERGENCY_CALLS.append(call)
+    # Keep the log bounded so demo sessions don't grow unbounded in memory.
+    if len(EMERGENCY_CALLS) > 500:
+        del EMERGENCY_CALLS[:-500]
+    return call
+
+
+@app.get("/api/911/calls", tags=["911"])
+def list_emergency_calls(
+    status_filter: Optional[str] = Query(None, description="new|acknowledged|closed|all"),
+    service: Optional[str] = Query(
+        None,
+        description="ambulance|police|firefighter — restrict to calls requesting this service. Workers should pass their own service to see their queue.",
+    ),
+):
+    """Newest-first dispatch feed. Workers filter by `service` to see only
+    calls relevant to their unit; admins / operators omit it for the full feed."""
+    rows = list(EMERGENCY_CALLS)
+    if status_filter and status_filter != "all":
+        rows = [c for c in rows if c["status"] == status_filter]
+    if service:
+        if service not in EMERGENCY_SERVICES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"service must be one of {EMERGENCY_SERVICES}",
+            )
+        rows = [c for c in rows if service in c.get("requested_services", [])]
+    rows.sort(key=lambda c: c["created_at"], reverse=True)
+    return {"calls": rows}
+
+
+class EmergencyCallUpdate(BaseModel):
+    status: Optional[Literal["new", "acknowledged", "closed"]] = None
+    # When a worker acknowledges, the client sends their userId + sub-role so
+    # we can record who's rolling. Multiple workers can acknowledge the same
+    # call (e.g. ambulance + police on a serious incident).
+    worker_id: Optional[str] = None
+    sub_role: Optional[Literal["paramedic", "police", "firefighter"]] = None
+
+
+@app.patch("/api/911/calls/{call_id}", tags=["911"])
+def update_emergency_call(call_id: str, update: EmergencyCallUpdate):
+    """Mark a call acknowledged (responder en-route) or closed (incident
+    resolved). Acknowledgements append to the responders list rather than
+    overwriting — multiple services can take the same call."""
+    for c in EMERGENCY_CALLS:
+        if c["id"] != call_id:
+            continue
+        if update.status:
+            c["status"] = update.status
+            if update.status == "acknowledged" and not c.get("acknowledged_at"):
+                c["acknowledged_at"] = datetime.utcnow().isoformat() + "Z"
+            if update.status == "closed" and not c.get("closed_at"):
+                c["closed_at"] = datetime.utcnow().isoformat() + "Z"
+        if update.worker_id and update.sub_role:
+            already = any(r.get("worker_id") == update.worker_id for r in c.get("responders", []))
+            if not already:
+                c.setdefault("responders", []).append({
+                    "worker_id": update.worker_id,
+                    "sub_role": update.sub_role,
+                    "acknowledged_at": datetime.utcnow().isoformat() + "Z",
+                })
+            # Keep the legacy single-string field populated for backward compat.
+            c["acknowledged_by"] = update.worker_id
+        return c
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
 
 
 # ════════════════════════════════════════════════════════════════════

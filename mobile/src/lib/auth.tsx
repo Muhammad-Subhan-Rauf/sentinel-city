@@ -104,3 +104,14 @@ export function useAuth(): Ctx {
   if (!ctx) throw new Error('useAuth must be used inside <AuthProvider>');
   return ctx;
 }
+
+// Detect "the backend doesn't know who I am anymore" — happens when the FastAPI
+// process restarts (the mobile-user roster lives only in memory). The api
+// client formats errors as `API 404 /api/citizens/<id>: …` or
+// `API 404 /api/workers/<id>: …`. Any screen that calls a "me" endpoint
+// should funnel its catch through this and `signOut()` if true, so the user
+// gets bounced back to PIN entry instead of seeing silent stale data.
+export function isStaleSession(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e ?? '');
+  return /\bAPI 404\b/.test(msg) && /\/api\/(citizens|workers)\//.test(msg);
+}
