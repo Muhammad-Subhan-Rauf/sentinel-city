@@ -47,6 +47,20 @@ export default function LoginScreen() {
     ]).start();
   };
 
+  // Blur+focus toggle. On Android, calling .focus() on an input that the
+  // framework already considers focused is a no-op and the soft keyboard
+  // doesn't re-appear — pressing the pin slots ends up doing nothing visible
+  // after a failed submit. Toggling forces the keyboard back up.
+  const refocusInput = () => {
+    const input = inputRef.current;
+    if (!input) return;
+    input.blur();
+    // requestAnimationFrame so the blur lands before the focus, and so we
+    // run after any state-change re-render (e.g. busy → false flipping
+    // `editable` back on after a failed submit).
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
   const handleSubmit = async (value: string) => {
     if (value.length !== PIN_LENGTH || busy) return;
     setBusy(true);
@@ -60,9 +74,11 @@ export default function LoginScreen() {
       setError(userFacing);
       setPin('');
       triggerShake();
-      inputRef.current?.focus();
     } finally {
       setBusy(false);
+      // Refocus AFTER busy is cleared (and the editable prop is back to true)
+      // so the native widget actually accepts focus.
+      refocusInput();
     }
   };
 
@@ -82,7 +98,7 @@ export default function LoginScreen() {
         <Text style={styles.tagline}>Enter your PIN</Text>
       </View>
 
-      <Pressable onPress={() => inputRef.current?.focus()} style={{ alignItems: 'center' }}>
+      <Pressable onPress={refocusInput} style={{ alignItems: 'center' }}>
         <Animated.View
           style={[
             styles.pinRow,
