@@ -6,11 +6,39 @@ Runs the Detection (Loop A) and Monitoring (Loop B) loops.
 import asyncio
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
+
+
+def _extract_retry_delay_seconds(err: Exception) -> Optional[float]:
+    """Pull retryDelay (e.g. '54s') out of a google-genai ClientError, if present."""
+    details = getattr(err, "details", None)
+    payload = None
+    if isinstance(details, dict):
+        payload = details
+    else:
+        msg = str(err)
+        m = re.search(r"'retryDelay':\s*'([^']+)'", msg)
+        if m:
+            raw = m.group(1)
+            try:
+                return float(raw.rstrip("s"))
+            except ValueError:
+                return None
+    if payload:
+        for d in payload.get("error", {}).get("details", []):
+            if d.get("@type", "").endswith("RetryInfo"):
+                raw = d.get("retryDelay", "")
+                try:
+                    return float(str(raw).rstrip("s"))
+                except ValueError:
+                    return None
+    return None
 
 # Assuming these are available as local imports as specified
 from api_client import SentinelAPIClient
@@ -158,7 +186,7 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
             logger.info("[Detection] Sending request to Gemini...")
             # Pass to Gemini via async client
             response = await client.aio.models.generate_content(
-                model='gemini-2.0-flash',
+                model='gemini-2.5-flash',
                 contents=prompt_content,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
@@ -196,7 +224,12 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
         except Exception as e:
             logger.error(f"Error in detection_loop: {e}", exc_info=True)
             audit.log_recovery_action(state.agent_id, f"detection_loop error: {e}", "Wait and retry")
-            
+            if isinstance(e, genai_errors.ClientError) and getattr(e, "code", None) == 429:
+                delay = _extract_retry_delay_seconds(e) or 30.0
+                logger.warning(f"[Detection] Gemini 429 — sleeping {delay:.0f}s before retry")
+                await asyncio.sleep(delay)
+                continue
+
         # Sleep to avoid spamming the APIs
         await asyncio.sleep(10)
 
@@ -238,7 +271,7 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
             
             logger.info("[Monitoring] Sending request to Gemini...")
             response = await client.aio.models.generate_content(
-                model='gemini-2.0-flash',
+                model='gemini-2.5-flash',
                 contents=prompt_content,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
@@ -273,7 +306,12 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
         except Exception as e:
             logger.error(f"Error in monitoring_supervisor: {e}", exc_info=True)
             audit.log_recovery_action(state.agent_id, f"monitoring_supervisor error: {e}", "Wait and retry")
-            
+            if isinstance(e, genai_errors.ClientError) and getattr(e, "code", None) == 429:
+                delay = _extract_retry_delay_seconds(e) or 30.0
+                logger.warning(f"[Monitoring] Gemini 429 — sleeping {delay:.0f}s before retry")
+                await asyncio.sleep(delay)
+                continue
+
         # Slower poll rate for monitoring loop to avoid overlaps and API spam
         await asyncio.sleep(15)
 
