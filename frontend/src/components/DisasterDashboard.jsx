@@ -4,7 +4,7 @@ import CityPicker from './CityPicker'
 import RoutePanel from './RoutePanel'
 import CallsDrawer from './CallsDrawer'
 import SeveritySelector from './SeveritySelector'
-import WeatherIndicator from './WeatherIndicator'
+import WeatherRegionsPanel from './WeatherRegionsPanel'
 import SettingsPanel from './SettingsPanel'
 import { requestRoute } from '../lib/routing'
 import { loadRoadGraph } from '../lib/roadGraph'
@@ -177,7 +177,34 @@ export default function DisasterDashboard() {
   const cordonsRef = useRef([])
 
   // Mocked weather: re-fetched on mount, every 15 s, and after every trigger.
-  const { weather, refresh: refreshWeather } = useWeather()
+  const { regions: weatherRegions, refresh: refreshWeather } = useWeather()
+  // Stable numbering for the map badges and the right-side WeatherRegionsPanel.
+  // Numbers are reusable: each new zone takes the lowest positive integer not
+  // currently in use. So after Clear all the next zone is 1 again, and if you
+  // delete zone 2 while 1/3 remain, the next new zone fills slot 2.
+  const zoneNumberMapRef = useRef(new Map())
+  const numberedWeatherRegions = useMemo(() => {
+    const map = zoneNumberMapRef.current
+    const liveIds = new Set()
+    for (const r of weatherRegions) {
+      if (r?.event_id) liveIds.add(r.event_id)
+    }
+    // Prune dead entries FIRST so their numbers become available again.
+    for (const id of [...map.keys()]) {
+      if (!liveIds.has(id)) map.delete(id)
+    }
+    // Assign the lowest free number to any newly-seen event_id.
+    for (const r of weatherRegions) {
+      if (!r?.event_id || map.has(r.event_id)) continue
+      const used = new Set(map.values())
+      let n = 1
+      while (used.has(n)) n += 1
+      map.set(r.event_id, n)
+    }
+    return weatherRegions.map((r) =>
+      r?.event_id ? { ...r, zone_number: map.get(r.event_id) ?? null } : r,
+    )
+  }, [weatherRegions])
 
   // Push simSpeed changes into the engine's tick loop.
   useEffect(() => {
@@ -1094,15 +1121,24 @@ export default function DisasterDashboard() {
   }, [refreshWeather])
 
   const handleClearAllZones = useCallback(() => {
-    if (zones.length === 0) return
-    const count = zones.length
+    // Always issue the DELETE: local state can be empty while the DB still
+    // holds orphaned rows from prior sessions. The endpoint is idempotent.
+    const localCount = zones.length
     setZones([])
     fetch(`${BACKEND_URL}/api/disasters`, { method: 'DELETE' })
-      .catch(() => {})
+      .then((res) => res.ok ? res.json() : null)
+      .catch(() => null)
+      .then((body) => {
+        const serverCount = body && typeof body.deleted === 'number' ? body.deleted : null
+        const detail =
+          serverCount !== null
+            ? `Cleared ${serverCount} zone${serverCount === 1 ? '' : 's'}.`
+            : `Cleared ${localCount} local zone${localCount === 1 ? '' : 's'} (server unreachable).`
+        setLog((prev) =>
+          [{ type: 'info', time: now(), message: detail }, ...prev].slice(0, 80),
+        )
+      })
       .finally(() => refreshWeather())
-    setLog((prev) =>
-      [{ type: 'info', time: now(), message: `Cleared all zones (${count}).` }, ...prev].slice(0, 80),
-    )
   }, [zones.length, refreshWeather])
 
   // ── Routing handlers ───────────────────────────────────────
@@ -1885,7 +1921,7 @@ export default function DisasterDashboard() {
               Useful for resetting the simulator between scenarios. */}
           <button
             onClick={handleClearAllZones}
-            disabled={loading || zones.length === 0}
+            disabled={loading}
             className="w-full mt-2 py-1.5 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900 disabled:text-zinc-700 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-colors"
           >
             Clear all zones
@@ -1974,6 +2010,7 @@ export default function DisasterDashboard() {
           onPoliceDispatchTargetPick={(p) => { setPoliceDispatchTarget({ lat: p.lat, lng: p.lng, radius: policeDispatchRadius }); setPoliceDispatchTargetMode(false) }}
           polygonDrawKind={polygonDrawKind}
           onPolygonDraw={handlePolygonDraw}
+          weatherRegions={numberedWeatherRegions}
         />
 
         <SettingsPanel
@@ -2021,7 +2058,10 @@ export default function DisasterDashboard() {
           >
             ⚙
           </button>
-          <WeatherIndicator weather={weather} />
+          <WeatherRegionsPanel
+            regions={numberedWeatherRegions}
+            onClearAll={handleClearAllZones}
+          />
           {(() => {
             const totals = zones.reduce(
               (acc, z) => {
