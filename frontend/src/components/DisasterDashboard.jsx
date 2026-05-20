@@ -929,6 +929,63 @@ export default function DisasterDashboard() {
     return () => { cancelled = true; clearInterval(id) }
   }, [engine, policeStations])
 
+  // Poll for pending dispatches from the AI Orchestrator
+  useEffect(() => {
+    if (!engine) return
+
+    let cancelled = false;
+    const pollAIJobs = async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/dispatch/pending`)
+        if (!res.ok || cancelled) return
+        const data = await res.json()
+        if (!data.dispatches || data.dispatches.length === 0 || cancelled) return
+
+        for (const disp of data.dispatches) {
+          const kind = disp.kind
+          const units = disp.units
+          const target = disp.target
+          const stationId = disp.station_id
+          const dispatchId = disp.dispatch_id || `disp-${Date.now()}-${Math.random().toString(36).slice(2, 4)}`
+
+          if (kind === 'firefighter' || kind === 'fire') {
+            const s = fireStations.find(x => x.id === stationId)
+            if (s && engine.spawnFireTrucks) {
+              const spawned = engine.spawnFireTrucks(dispatchId, { lat: s.lat, lng: s.lng }, target, units, s.id)
+              if (spawned > 0 && !cancelled) {
+                setActiveDispatches((prev) => [...prev, { id: dispatchId, trucks: spawned, target, stationName: s.name || 'Station' }])
+                addLog('success', `AI Dispatched ${spawned} fire truck(s) from ${s.name || 'Station'}.`)
+              }
+            }
+          } else if (kind === 'ambulance' || kind === 'medical') {
+            const h = hospitals.find(x => x.id === stationId)
+            if (h && engine.spawnAmbulances) {
+              const spawned = engine.spawnAmbulances(dispatchId, { lat: h.lat, lng: h.lng }, target, units, h.id)
+              if (spawned > 0 && !cancelled) {
+                setActiveAmbulanceDispatches((prev) => [...prev, { id: dispatchId, units: spawned, target, stationName: h.name || 'Hospital' }])
+                addLog('success', `AI Dispatched ${spawned} ambulance(s) from ${h.name || 'Hospital'}.`)
+              }
+            }
+          } else if (kind === 'police' || kind === 'security') {
+            const p = policeStations.find(x => x.id === stationId)
+            if (p && engine.spawnPolice) {
+              const spawned = engine.spawnPolice(dispatchId, { lat: p.lat, lng: p.lng }, target, units, p.id)
+              if (spawned > 0 && !cancelled) {
+                setActivePoliceDispatches((prev) => [...prev, { id: dispatchId, units: spawned, target, stationName: p.name || 'Station' }])
+                addLog('success', `AI Dispatched ${spawned} officer(s) from ${p.name || 'Station'}.`)
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Failed to poll AI jobs:", err)
+      }
+    }
+
+    const interval = setInterval(pollAIJobs, 2000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [engine, fireStations, hospitals, policeStations])
+
   // Subscribe to engine ticks and prune any active-dispatch entry whose units
   // have all despawned. Without this the panel keeps showing "7 from Station"
   // even after every unit has made it back.

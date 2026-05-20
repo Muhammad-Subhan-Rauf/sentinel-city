@@ -1513,6 +1513,8 @@ def reset_dispatched_counters():
 # caller can correlate logs / recall the units later.
 # ──────────────────────────────────────────────────────────────────────
 
+PENDING_DISPATCHES = []
+
 @app.post("/api/dispatch", tags=["Emergency Services"])
 def dispatch_units(payload: DispatchPayload):
     target = payload.target or {}
@@ -1540,15 +1542,34 @@ def dispatch_units(payload: DispatchPayload):
     echo_target = {"lat": lat, "lng": lng}
     if radius is not None:
         echo_target["radius"] = radius
+
+    dispatch_id = str(uuid.uuid4())
+    global PENDING_DISPATCHES
+    PENDING_DISPATCHES.append({
+        "dispatch_id": dispatch_id,
+        "kind": payload.kind,
+        "units": units,
+        "target": echo_target,
+        "station_id": payload.station_id,
+    })
+
     return {
         "success": True,
-        "dispatch_id": str(uuid.uuid4()),
+        "dispatch_id": dispatch_id,
         "kind": payload.kind,
         "units": units,
         "trucks": units,  # back-compat
         "target": echo_target,
         "station_id": payload.station_id,
     }
+
+
+@app.get("/api/dispatch/pending", tags=["Emergency Services"])
+def get_pending_dispatches():
+    global PENDING_DISPATCHES
+    res = list(PENDING_DISPATCHES)
+    PENDING_DISPATCHES.clear()
+    return {"dispatches": res}
 
 
 # ──────────────────────────────────────────────────────────────────────

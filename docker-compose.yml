@@ -32,6 +32,8 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
+    volumes:
+      - orchestrator_logs:/app/logs
 
   # ── Valhalla routing engine ─────────────────────────────────
   # Place one or more .osm.pbf files in ./valhalla/data/ before first launch.
