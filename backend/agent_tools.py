@@ -33,6 +33,23 @@ from tools import (
 logger = logging.getLogger(__name__)
 
 
+def _to_jsonable(obj: Any) -> Any:
+    """Recursively convert Pydantic models / lists / dicts into JSON-safe types.
+
+    LangChain materializes nested args (e.g. ``target: _LatLng``) as Pydantic
+    BaseModel instances, which ``json.dumps`` cannot serialize. This is the
+    line of defense before anything reaches the audit logger or the
+    in-memory ring buffer that ``/api/logs`` serves.
+    """
+    if isinstance(obj, BaseModel):
+        return obj.model_dump()
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    return obj
+
+
 # ─────────────────────────── Argument schemas ────────────────────────────
 
 
@@ -145,20 +162,32 @@ def build_tools(api: Any, audit_logger: Any, gemini_client: Any, agent_id: str) 
     legacy = ToolExecutor(api_client=api, audit_logger=audit_logger, gemini_client=gemini_client)
 
     async def _audit_ok(name: str, arguments: Dict[str, Any], result: Any) -> None:
+        # Audit is best-effort: never let a logging failure crash a tool that
+        # already succeeded against the API. The pre-serialize step removes
+        # Pydantic BaseModel instances that json.dumps would choke on.
+        safe_args = _to_jsonable(arguments)
+        safe_result = _to_jsonable(result)
         try:
-            audit_logger.log_tool_call(
-                agent_id=agent_id, tool_name=name, arguments=arguments, result=result
-            )
-        except TypeError:
-            audit_logger.log_tool_call(agent_id, name, arguments, result)
+            try:
+                audit_logger.log_tool_call(
+                    agent_id=agent_id, tool_name=name, arguments=safe_args, result=safe_result
+                )
+            except TypeError:
+                audit_logger.log_tool_call(agent_id, name, safe_args, safe_result)
+        except Exception as audit_exc:
+            logger.warning(f"[agent_tool:{name}] audit log_tool_call failed: {audit_exc}")
 
     async def _audit_err(name: str, arguments: Dict[str, Any], err: Exception) -> None:
+        safe_args = _to_jsonable(arguments)
         try:
-            audit_logger.log_tool_call(
-                agent_id=agent_id, tool_name=name, arguments=arguments, error=str(err)
-            )
-        except TypeError:
-            audit_logger.log_tool_call(agent_id, name, arguments, error=str(err))
+            try:
+                audit_logger.log_tool_call(
+                    agent_id=agent_id, tool_name=name, arguments=safe_args, error=str(err)
+                )
+            except TypeError:
+                audit_logger.log_tool_call(agent_id, name, safe_args, error=str(err))
+        except Exception as audit_exc:
+            logger.warning(f"[agent_tool:{name}] audit log_tool_call (err) failed: {audit_exc}")
 
     def _wrap(name: str, args_schema, fn):
         """Wrap an async dispatch fn with audit-logging + uniform error handling.
