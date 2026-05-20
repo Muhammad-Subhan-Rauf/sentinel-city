@@ -49,7 +49,7 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
     prompt = await load_prompt("detection_prompt.md")
     
     # Initialize ToolExecutor
-    tool_executor = ToolExecutor(api=api, state=state, audit=audit)
+    tool_executor = ToolExecutor(api_client=api, audit_logger=audit)
     gemini_tools = get_gemini_tools()
     
     while True:
@@ -126,7 +126,7 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
     prompt = await load_prompt("monitoring_prompt.md")
     
     # Initialize ToolExecutor for this loop
-    tool_executor = ToolExecutor(api=api, state=state, audit=audit)
+    tool_executor = ToolExecutor(api_client=api, audit_logger=audit)
     gemini_tools = get_gemini_tools()
     
     while True:
