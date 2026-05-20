@@ -15,6 +15,43 @@ from google.genai import types
 from google.genai import errors as genai_errors
 
 
+def _signal_fingerprint(disasters: Any, reports: Any, state: AgentState) -> str:
+    """Cheap dedup key. Skip Gemini call when this matches the previous tick.
+
+    Includes counts + the latest disaster's id/status/severity + the latest
+    citizen report's event_id+timestamp. Anything subtler (incident metadata
+    drift) is handled by the prompts/state sync, not by triggering an extra
+    Gemini call.
+    """
+    def _listify(x: Any) -> list:
+        if isinstance(x, list):
+            return x
+        if isinstance(x, dict) and isinstance(x.get("disasters"), list):
+            return x["disasters"]
+        if isinstance(x, dict) and isinstance(x.get("reports"), list):
+            return x["reports"]
+        return []
+
+    d_list = _listify(disasters)
+    r_list = _listify(reports)
+    incident_keys = sorted(state.active_incidents.keys()) if hasattr(state, "active_incidents") else []
+
+    def _last(items: list, *keys: str) -> str:
+        if not items:
+            return ""
+        # Pick the last by id-as-string for stable ordering without timestamps.
+        last = sorted(items, key=lambda x: str(x.get("id") or x.get("event_id") or ""))[-1]
+        return "|".join(str(last.get(k, "")) for k in keys)
+
+    return "::".join([
+        f"d={len(d_list)}",
+        f"r={len(r_list)}",
+        f"a={','.join(incident_keys)}",
+        f"d_last={_last(d_list, 'id', 'status', 'severity')}",
+        f"r_last={_last(r_list, 'event_id', 'reported_at')}",
+    ])
+
+
 def _extract_retry_delay_seconds(err: Exception) -> Optional[float]:
     """Pull retryDelay (e.g. '54s') out of a google-genai ClientError, if present."""
     details = getattr(err, "details", None)
@@ -160,16 +197,25 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
     # Initialize ToolExecutor
     tool_executor = ToolExecutor(api_client=api, audit_logger=audit)
     gemini_tools = get_gemini_tools()
-    
+    last_fingerprint: Optional[str] = None
+
     while True:
         try:
-            # Poll APIs for active data
+            # Poll APIs for active data (these are free / non-Gemini hits).
             disasters = await api.get_disasters()
             sync_state_with_disasters(state, disasters)
             weather = await api.get_weather()
             traffic = await api.get_traffic()
             reports = await api.get_citizen_reports()
-            
+
+            # Gate the (expensive, quota-bound) Gemini call: only fire if the
+            # world has actually changed since the last successful tick.
+            fingerprint = _signal_fingerprint(disasters, reports, state)
+            if fingerprint == last_fingerprint:
+                logger.info("[Detection] No new signals; skipping Gemini call.")
+                await asyncio.sleep(60)
+                continue
+
             # Construct the context
             context = {
                 "active_incidents": {k: v.model_dump() for k, v in state.active_incidents.items()},
@@ -180,9 +226,9 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
                     "reports": reports
                 }
             }
-            
+
             prompt_content = f"Analyze the following current data:\n{context}"
-            
+
             logger.info("[Detection] Sending request to Gemini...")
             # Pass to Gemini via async client
             response = await client.aio.models.generate_content(
@@ -195,7 +241,8 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
                 )
             )
             logger.info("[Detection] Received response from Gemini.")
-            
+            last_fingerprint = fingerprint
+
             # Extract tool calls and execute
             if response.function_calls:
                 for function_call in response.function_calls:
@@ -231,7 +278,7 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
                 continue
 
         # Sleep to avoid spamming the APIs / staying inside free-tier quota.
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 
 async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit: AuditLogger, client: genai.Client):
@@ -245,18 +292,27 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
     # Initialize ToolExecutor for this loop
     tool_executor = ToolExecutor(api_client=api, audit_logger=audit)
     gemini_tools = get_gemini_tools()
-    
+    last_fingerprint: Optional[str] = None
+
     while True:
         try:
             # Fetch active disasters from database and sync state
             disasters = await api.get_disasters()
             sync_state_with_disasters(state, disasters)
-            
+
             # Only heavily monitor if there are active incidents
             if not state.active_incidents:
-                await asyncio.sleep(30)
+                last_fingerprint = None  # reset so a fresh incident triggers a call
+                await asyncio.sleep(60)
                 continue
-                
+
+            # Same gate as Detection: only call Gemini when incident state changed.
+            fingerprint = _signal_fingerprint(disasters, [], state)
+            if fingerprint == last_fingerprint:
+                logger.info("[Monitoring] Active incidents unchanged; skipping Gemini call.")
+                await asyncio.sleep(60)
+                continue
+
             # Fetch context relevant to managing ongoing incidents
             context = {
                 "active_incidents": {k: v.model_dump() for k, v in state.active_incidents.items()},
@@ -266,9 +322,9 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
                 "cordons": await api.get_cordons(),
                 "traffic": await api.get_traffic()
             }
-            
+
             prompt_content = f"Review the active incidents and current resources:\n{context}"
-            
+
             logger.info("[Monitoring] Sending request to Gemini...")
             response = await client.aio.models.generate_content(
                 model='gemini-2.5-flash',
@@ -280,7 +336,8 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
                 )
             )
             logger.info("[Monitoring] Received response from Gemini.")
-            
+            last_fingerprint = fingerprint
+
             if response.function_calls:
                 for function_call in response.function_calls:
                     logger.info(f"[Monitoring] Executing tool: {function_call.name}")
@@ -313,7 +370,7 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
                 continue
 
         # Slower poll rate for monitoring loop to avoid overlaps and API spam.
-        await asyncio.sleep(30)
+        await asyncio.sleep(60)
 
 
 async def main():
