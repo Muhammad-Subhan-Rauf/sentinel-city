@@ -323,6 +323,36 @@ def _build_disaster_payload(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _build_disaster_update_payload(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate Gemini's update_incident args into a PATCH /api/disasters body.
+
+    Backend's allowed update fields (main.py:update_disaster) are:
+    {status, spread_speed, notes, people_inside, safe_exit_pct,
+     spread_in_seconds, severity, area_geometry}. Anything else is dropped.
+    Notably 'description' is NOT in that set — must map to 'notes'.
+    """
+    payload: Dict[str, Any] = {}
+    if "description" in args:
+        payload["notes"] = args["description"]
+    if "notes" in args:
+        payload["notes"] = args["notes"]
+    if "severity" in args:
+        sev_raw = args["severity"]
+        if isinstance(sev_raw, str):
+            sev = _SEVERITY_WORD_MAP.get(sev_raw.strip().lower(), 4)
+        else:
+            try:
+                sev = int(sev_raw)
+            except (TypeError, ValueError):
+                sev = 4
+        payload["severity"] = max(1, min(10, sev))
+    if "status" in args:
+        payload["status"] = args["status"]
+    if "spread_speed" in args:
+        payload["spread_speed"] = args["spread_speed"]
+    return payload
+
+
 def _circle_to_geojson_polygon(lat: float, lng: float, radius_m: float, vertices: int = 24) -> Dict[str, Any]:
     """Approximate a circle (lat, lng, radius in meters) as a GeoJSON Polygon."""
     if radius_m <= 0:
@@ -419,9 +449,8 @@ class ToolExecutor:
         elif tool_name == "update_incident":
             if "incident_id" not in args:
                 raise ValueError("Missing 'incident_id' in update_incident")
-            payload = dict(args)
-            incident_id = payload.pop("incident_id")
-            return await self.api.update_disaster(incident_id, payload)
+            payload = _build_disaster_update_payload(args)
+            return await self.api.update_disaster(args["incident_id"], payload)
             
         elif tool_name == "clear_incident":
             if "incident_id" not in args:
