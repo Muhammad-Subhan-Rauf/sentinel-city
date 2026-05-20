@@ -14,6 +14,20 @@ from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
+# Project-local imports MUST come before any function definitions below that
+# reference these names in type annotations — Python evaluates annotations at
+# def-time, so a misplaced import here raises NameError at module load.
+from api_client import SentinelAPIClient
+from state import AgentState, IncidentState
+from audit import AuditLogger
+import tools
+from tools import ToolExecutor
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+PROMPTS_DIR = Path(__file__).parent / "prompts"
+
 
 # Models tried in order. First one is the preferred quality; each fallback
 # has its own quota bucket on the Generative Language API, so when one fails
@@ -128,18 +142,6 @@ def _extract_retry_delay_seconds(err: Exception) -> Optional[float]:
                 except ValueError:
                     return None
     return None
-
-# Assuming these are available as local imports as specified
-from api_client import SentinelAPIClient
-from state import AgentState, IncidentState
-from audit import AuditLogger
-import tools
-from tools import ToolExecutor
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 async def load_prompt(filename: str) -> str:
     """Load a prompt string from the prompts directory."""
