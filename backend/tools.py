@@ -252,6 +252,76 @@ ALL_TOOLS = [
     CREATE_CORDON, CLEAR_CORDON, DISPATCH_UNITS, MULTI_STATION_DISPATCH, RETURN_UNITS
 ]
 
+# Backend /api/trigger-disaster expects DisasterPayload with disaster_type as
+# Title_Case (Flood, Wildfire, Power_Outage, ...). Gemini sends free-form
+# strings like "wildfire", "building fire", "medical". Normalize.
+_DISASTER_TYPE_MAP = {
+    "flood": "Flood",
+    "wildfire": "Wildfire",
+    "fire": "Wildfire",
+    "building_fire": "Wildfire",
+    "heatwave": "Heatwave",
+    "heat": "Heatwave",
+    "power_outage": "Power_Outage",
+    "power": "Power_Outage",
+    "blackout": "Power_Outage",
+    "robbery": "Robbery",
+    "theft": "Robbery",
+    "gang_violence": "Gang_Violence",
+    "gang": "Gang_Violence",
+    "violence": "Gang_Violence",
+    "accident": "Accident",
+    "medical": "Accident",
+    "crash": "Accident",
+    "road_blockage": "Road_Blockage",
+    "road_block": "Road_Blockage",
+    "roadblock": "Road_Blockage",
+    "infrastructure_failure": "Infrastructure_Failure",
+    "infrastructure": "Infrastructure_Failure",
+}
+
+# Backend severity ceilings by type (mirror SEVERITY_MAX_BY_TYPE in main.py).
+_SEVERITY_MAX_BY_TYPE = {
+    "Flood": 5, "Wildfire": 5, "Heatwave": 4, "Power_Outage": 3,
+    "Robbery": 4, "Gang_Violence": 5, "Accident": 4,
+    "Road_Blockage": 3, "Infrastructure_Failure": 4,
+}
+
+_SEVERITY_WORD_MAP = {"low": 2, "medium": 4, "high": 6, "critical": 8}
+
+
+def _build_disaster_payload(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate Gemini's declare_incident args into a DisasterPayload body."""
+    raw_type = str(args["type"]).strip().lower().replace(" ", "_").replace("-", "_")
+    disaster_type = _DISASTER_TYPE_MAP.get(raw_type, raw_type.title())
+
+    sev_raw = args["severity"]
+    if isinstance(sev_raw, str):
+        sev = _SEVERITY_WORD_MAP.get(sev_raw.strip().lower(), 4)
+    else:
+        try:
+            sev = int(sev_raw)
+        except (TypeError, ValueError):
+            sev = 4
+    sev = max(1, min(10, sev))
+    cap = _SEVERITY_MAX_BY_TYPE.get(disaster_type)
+    if cap is not None:
+        sev = min(sev, cap)
+
+    loc = args["location"]
+    lat = loc["lat"]
+    lng = loc["lng"]
+
+    return {
+        "disaster_type": disaster_type,
+        "severity": sev,
+        "geometry": {"type": "Point", "coordinates": [lng, lat]},
+        "geometry_kind": "point",
+        "notes": args.get("description", ""),
+        "status": "active",
+    }
+
+
 class ToolExecutor:
     """Executes Sentinel City tools, applying validation and audit logging."""
 
@@ -312,7 +382,8 @@ class ToolExecutor:
             for field in ["type", "location", "severity", "description"]:
                 if field not in args:
                     raise ValueError(f"Missing required field '{field}' in declare_incident")
-            return await self.api.trigger_disaster(args)
+            payload = _build_disaster_payload(args)
+            return await self.api.trigger_disaster(payload)
             
         elif tool_name == "update_incident":
             if "incident_id" not in args:
