@@ -3,6 +3,7 @@ import MapView from './MapView'
 import CityPicker from './CityPicker'
 import RoutePanel from './RoutePanel'
 import CallsDrawer from './CallsDrawer'
+import AILogsDrawer from './AILogsDrawer'
 import SeveritySelector from './SeveritySelector'
 import WeatherRegionsPanel from './WeatherRegionsPanel'
 import SettingsPanel from './SettingsPanel'
@@ -117,6 +118,7 @@ export default function DisasterDashboard() {
   const [routeError, setRouteError] = useState(null)
 
   const [logOpen, setLogOpen] = useState(true)
+  const [aiLogsOpen, setAiLogsOpen] = useState(false)
   const [log, setLog] = useState([
     { type: 'info', time: now(), message: 'System ready.' },
   ])
@@ -1926,6 +1928,12 @@ export default function DisasterDashboard() {
           >
             Clear all zones
           </button>
+          <button
+            onClick={() => setAiLogsOpen(true)}
+            className="w-full mt-3 py-2 px-4 bg-purple-500/10 text-purple-300 font-medium text-[11px] tracking-wider uppercase rounded hover:bg-purple-500/20 transition-colors border border-purple-500/30"
+          >
+            View AI Reasoning
+          </button>
 
           {/* Routing */}
           <section>
@@ -2224,6 +2232,12 @@ export default function DisasterDashboard() {
           <span className="tabular-nums">{citizenReports.length}</span>
           <span className="text-zinc-500">calls</span>
         </button>
+
+        <AILogsDrawer
+          open={aiLogsOpen}
+          onClose={() => setAiLogsOpen(false)}
+          backendUrl={BACKEND_URL}
+        />
 
         <CallsDrawer
           open={drawerOpen}

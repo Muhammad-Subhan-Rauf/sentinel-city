@@ -65,5 +65,23 @@ services:
     ports:
       - "8080:80"
 
+  # ── Orchestrator ────────────────────────────────────────────
+  orchestrator:
+    build:
+      context: ./backend
+    command: ["python", "orchestrator.py"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://sentinel:sentinel@db:5432/sentinel_city
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    volumes:
+      - orchestrator_logs:/app/logs
+
 volumes:
   db_data:
+  orchestrator_logs:

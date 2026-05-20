@@ -984,6 +984,140 @@ def get_weather():
     return {**BASELINE_WEATHER, "driver": None}
 
 
+def _distance_haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    R = 6371000  # radius of Earth in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+@app.get("/api/traffic", tags=["Traffic"])
+def get_traffic():
+    """
+    Mocked traffic snapshot derived from active disasters and cordons.
+    - Segments near active disasters: flow stopped / severely congested
+    - Segments within/near active cordons: blocked / rerouted
+    - Baseline: normal Manhattan flow
+    """
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                # Get active disasters with geometry
+                cur.execute(
+                    """
+                    SELECT id, disaster_type, area_geometry
+                    FROM disaster_events
+                    WHERE status IN ('draft', 'active') AND area_geometry IS NOT NULL;
+                    """
+                )
+                active_disasters = cur.fetchall()
+
+                # Get active cordons
+                cur.execute(
+                    """
+                    SELECT id, reason, geometry
+                    FROM cordons
+                    WHERE status = 'active';
+                    """
+                )
+                active_cordons = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Traffic read failed: {exc}",
+        )
+
+    # Mock road segments (a small sample for the demo)
+    segments = [
+        {"id": "seg_001", "name": "W 42nd St & 7th Ave", "lat": 40.7565, "lng": -73.9870},
+        {"id": "seg_002", "name": "E 14th St & Broadway", "lat": 40.7348, "lng": -73.9908},
+        {"id": "seg_003", "name": "5th Ave & 59th St", "lat": 40.7645, "lng": -73.9733},
+        {"id": "seg_004", "name": "Canal St & Bowery", "lat": 40.7159, "lng": -73.9961},
+        {"id": "seg_005", "name": "125th St & Lexington", "lat": 40.8043, "lng": -73.9372},
+        {"id": "seg_006", "name": "Houston St & 1st Ave", "lat": 40.7231, "lng": -73.9881},
+        {"id": "seg_007", "name": "23rd St & 8th Ave", "lat": 40.7445, "lng": -73.9994},
+        {"id": "seg_008", "name": "86th St & 2nd Ave", "lat": 40.7776, "lng": -73.9515},
+    ]
+
+    traffic_response = []
+    
+    for seg in segments:
+        slat = seg["lat"]
+        slng = seg["lng"]
+        
+        # Default state
+        speed = 30
+        congestion = 0.2
+        incident = None
+        
+        # Check cordons first (blocks road completely)
+        for cid, reason, geom in active_cordons:
+            if not geom: continue
+            try:
+                geom_dict = geom if isinstance(geom, dict) else json.loads(geom)
+                if geom_dict.get("type") == "Polygon" and len(geom_dict.get("coordinates", [])) > 0:
+                    # Simple bounding box check for the mock
+                    coords = geom_dict["coordinates"][0]
+                    lats = [c[1] for c in coords]
+                    lngs = [c[0] for c in coords]
+                    if min(lats) <= slat <= max(lats) and min(lngs) <= slng <= max(lngs):
+                        speed = 0
+                        congestion = 1.0
+                        incident = f"Road blocked by cordon: {reason or 'No entry'}"
+                        break
+            except Exception:
+                pass
+                
+        # If not fully blocked by cordon, check disasters
+        if incident is None:
+            for did, dtype, geom in active_disasters:
+                if not geom: continue
+                try:
+                    geom_dict = geom if isinstance(geom, dict) else json.loads(geom)
+                    if geom_dict.get("type") == "Polygon" and len(geom_dict.get("coordinates", [])) > 0:
+                        coords = geom_dict["coordinates"][0]
+                        # Use first point as approximate center for distance
+                        clat = coords[0][1]
+                        clng = coords[0][0]
+                        dist = _distance_haversine(slat, slng, clat, clng)
+                        
+                        if dist < 150: # Inside or very close
+                            speed = 5
+                            congestion = 0.9
+                            incident = f"{dtype} active — severe congestion"
+                            break
+                        elif dist < 400: # Adjacent
+                            speed = 15
+                            congestion = 0.6
+                            incident = f"Slow traffic due to nearby {dtype}"
+                except Exception:
+                    pass
+
+        traffic_response.append({
+            "segment_id": seg["id"],
+            "name": seg["name"],
+            "lat": slat,
+            "lng": slng,
+            "current_speed_kph": speed,
+            "free_flow_speed_kph": 35,
+            "congestion_pct": congestion,
+            "confidence": 0.85,
+            "incident": incident
+        })
+
+    return {
+        "segments": traffic_response,
+        "updated_at": datetime.utcnow().isoformat() + "Z"
+    }
+
+
 @app.get("/api/weather/regions", tags=["Weather"])
 def get_weather_regions():
     """
@@ -1076,9 +1210,16 @@ def get_weather_regions():
 
 @app.patch("/api/disasters/{event_id}", tags=["Disasters"])
 def update_disaster(event_id: str, update: Dict[str, Any]):
-    """Partial update of a disaster_events row. Used to flip draft → active."""
-    allowed = {"status", "spread_speed", "notes", "people_inside", "safe_exit_pct", "spread_in_seconds"}
-    sets = {k: v for k, v in update.items() if k in allowed}
+    """Partial update of a disaster_events row. Used to flip draft → active, or update polygon."""
+    allowed = {"status", "spread_speed", "notes", "people_inside", "safe_exit_pct", "spread_in_seconds", "severity", "area_geometry"}
+    sets = {}
+    for k, v in update.items():
+        if k in allowed:
+            if k == "area_geometry":
+                sets[k] = json.dumps(v) if v is not None else None
+            else:
+                sets[k] = v
+
     if not sets:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2148,44 +2289,43 @@ def update_worker(worker_id: str, update: MobileUserUpdate):
 # Admin: dispatch roster + AI agents + savings summary
 # ════════════════════════════════════════════════════════════════════
 
-# Mock AI agent registry. Real models will replace this; the shape is
-# stable so the mobile admin screen doesn't need to change when they land.
-MOCK_AGENTS: List[Dict[str, Any]] = [
+# Replace static MOCK_AGENTS with mutable registry
+AGENT_REGISTRY: List[Dict[str, Any]] = [
     {
-        "id": "agent-routing",
-        "name": "Routing Sentinel",
-        "role": "Live re-routing around active disasters",
-        "model": "claude-opus-4-7",
-        "status": "online",
-        "last_action": "Rerouted 142 citizens away from Flood zone #f3a1",
-        "metrics": {"decisions_per_min": 320, "avg_latency_ms": 84},
+        "id": "agent-sentinel-core",
+        "name": "Sentinel Core",
+        "role": "Master orchestrator — detection, triage, and response coordination",
+        "model": "gemini-2.5-flash",
+        "status": "initializing",
+        "last_action": "Starting up...",
+        "metrics": {"detection_sweeps": 0, "incidents_declared": 0, "dispatches": 0},
     },
     {
-        "id": "agent-prediction",
-        "name": "Spread Forecaster",
-        "role": "Predicts wildfire / flood spread 5–60 minutes ahead",
-        "model": "claude-sonnet-4-6",
-        "status": "online",
-        "last_action": "Forecasted wildfire growth radius at 412m over next 10m",
-        "metrics": {"forecast_horizon_min": 60, "rmse_m": 38},
+        "id": "agent-incident-monitor",
+        "name": "Incident Monitor",
+        "role": "Active incident tracking, trajectory prediction, response adaptation",
+        "model": "gemini-2.5-flash",
+        "status": "idle",
+        "last_action": "Waiting for active incidents...",
+        "metrics": {"incidents_monitored": 0, "patches_issued": 0, "recalls": 0},
     },
     {
         "id": "agent-triage",
-        "name": "911 Triage Agent",
-        "role": "Ranks citizen reports by urgency for dispatch",
-        "model": "claude-haiku-4-5",
-        "status": "online",
-        "last_action": "Escalated 7 reports to immediate dispatch",
-        "metrics": {"reports_handled": 1843, "false_negatives_pct": 0.4},
+        "name": "Crisis Triage",
+        "role": "Multi-crisis resource allocation and harm-avoided optimization",
+        "model": "gemini-2.5-flash",
+        "status": "idle",
+        "last_action": "No competing incidents",
+        "metrics": {"triage_decisions": 0, "units_reallocated": 0},
     },
     {
-        "id": "agent-dispatcher",
-        "name": "Dispatch Optimizer",
-        "role": "Allocates fire trucks / ambulances to incidents",
-        "model": "claude-opus-4-7",
+        "id": "agent-credibility",
+        "name": "Signal Analyst",
+        "role": "Source credibility scoring, prank filtering, triangulation",
+        "model": "gemini-2.5-flash",
         "status": "online",
-        "last_action": "Re-balanced 3 trucks from Station #2 → Wildfire #c4d2",
-        "metrics": {"avg_response_min": 4.2, "utilization_pct": 73},
+        "last_action": "Monitoring signal feeds...",
+        "metrics": {"reports_scored": 0, "pranks_filtered": 0, "false_alarms_caught": 0},
     },
 ]
 
@@ -2194,14 +2334,26 @@ MOCK_AGENTS: List[Dict[str, Any]] = [
 def list_agents():
     """Mock AI agent roster. Will be replaced by live model status when
     the real agents come online."""
-    return {"agents": MOCK_AGENTS}
+    return {"agents": AGENT_REGISTRY}
 
 
 @app.get("/api/agents/{agent_id}", tags=["Admin"])
 def get_agent(agent_id: str):
-    for agent in MOCK_AGENTS:
+    for agent in AGENT_REGISTRY:
         if agent["id"] == agent_id:
             return agent
+    raise HTTPException(status_code=404, detail="Agent not found.")
+
+
+@app.patch("/api/agents/{agent_id}", tags=["Admin"])
+def update_agent(agent_id: str, update: Dict[str, Any]):
+    """Orchestrator updates its own agent status."""
+    for agent in AGENT_REGISTRY:
+        if agent["id"] == agent_id:
+            for k in ("status", "last_action", "metrics"):
+                if k in update:
+                    agent[k] = update[k]
+            return {"success": True}
     raise HTTPException(status_code=404, detail="Agent not found.")
 
 
@@ -2296,3 +2448,33 @@ def savings_insight(metric: Literal["lives", "infrastructure", "money"] = Query(
     if insight is None:
         raise HTTPException(status_code=404, detail="Unknown metric.")
     return insight
+
+@app.get("/api/logs", tags=["Logs"])
+def get_audit_logs(limit: int = Query(100, ge=1, le=500)):
+    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    if not os.path.exists(log_dir):
+        return {"logs": []}
+        
+    logs = []
+    # Get all jsonl files, sort by name (which has date)
+    files = sorted([f for f in os.listdir(log_dir) if f.endswith(".jsonl")], reverse=True)
+    
+    for filename in files:
+        filepath = os.path.join(log_dir, filename)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                # Read all lines
+                lines = f.readlines()
+                # Process from bottom (newest) to top
+                for line in reversed(lines):
+                    if not line.strip(): continue
+                    try:
+                        logs.append(json.loads(line))
+                        if len(logs) >= limit:
+                            return {"logs": logs}
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Error reading {filename}: {e}")
+            
+    return {"logs": logs}
