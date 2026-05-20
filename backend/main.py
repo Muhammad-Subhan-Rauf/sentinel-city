@@ -32,10 +32,12 @@ async def lifespan(app: FastAPI):
     """
     log = logging.getLogger("sentinel.lifespan")
 
-    if not os.environ.get("GEMINI_API_KEY"):
-        log.warning("GEMINI_API_KEY not set — skipping orchestrator startup.")
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project:
+        log.warning("GOOGLE_CLOUD_PROJECT not set — skipping orchestrator startup.")
         yield
         return
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 
     try:
         from google import genai
@@ -56,19 +58,23 @@ async def lifespan(app: FastAPI):
     api = SentinelAPIClient(base_url=base_url)
     state = AgentState(agent_id="agent-sentinel-core")
     audit = AuditLogger()
-    api_key = os.environ["GEMINI_API_KEY"]
-    client = genai.Client(api_key=api_key)
 
-    # Build the LangGraph ReAct agents. The monitoring agent is built with
-    # force_tool_use=True so Gemini cannot reply with "Would you like me to
-    # proceed?" without actually invoking a tool — the structural fix for
-    # the autonomy bug observed in commit 55830c7's logs.
-    log.info("Building LangGraph agents...")
+    # The genai.Client below is ONLY used by tools.ToolExecutor._resolve_target_via_gemini
+    # (a (0,0)-coordinate recovery helper). The main agent runs on Vertex AI.
+    # We keep the AI Studio key path so the helper still works if you have one;
+    # if not, target-resolution returns None and the LLM-provided target stands.
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
+
+    # Build the LangGraph ReAct agents on Vertex AI. The monitoring agent is
+    # built with force_tool_use=True so Gemini cannot reply with "Would you
+    # like me to proceed?" without actually invoking a tool.
+    log.info(f"Building LangGraph agents (Vertex AI: project={project}, location={location})...")
     tools_list = build_tools(api, audit, client, agent_id=state.agent_id)
     detection_prompt = await load_prompt("detection_prompt.md")
     monitoring_prompt = await load_prompt("monitoring_prompt.md")
-    detection_agent = build_agent(api_key, detection_prompt, tools_list, force_tool_use=False)
-    monitoring_agent = build_agent(api_key, monitoring_prompt, tools_list, force_tool_use=True)
+    detection_agent = build_agent(project, location, detection_prompt, tools_list, force_tool_use=False)
+    monitoring_agent = build_agent(project, location, monitoring_prompt, tools_list, force_tool_use=True)
 
     log.info(f"Starting orchestrator loops against {base_url}")
     detection_task = asyncio.create_task(detection_loop(api, state, audit, client, detection_agent))

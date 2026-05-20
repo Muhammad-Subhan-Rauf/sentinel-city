@@ -422,21 +422,22 @@ async def monitoring_supervisor(
 async def main():
     """Main entrypoint for the Sentinel-Core Orchestrator."""
     logger.info("Initializing Sentinel-City AI Orchestrator")
-    
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        logger.error("GEMINI_API_KEY environment variable is not set!")
-        # For development without the key, you might choose to return or proceed with dummy client.
-        # return
-        
-    # Initialize the Gemini SDK client
-    client = genai.Client(api_key=api_key)
-    
+
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project:
+        logger.error("GOOGLE_CLOUD_PROJECT not set — orchestrator requires Vertex AI config.")
+        return
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+    # Optional: AI Studio key for the (0,0)-target-recovery helper only.
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
+
     # Initialize SentinelCityAPI (SentinelAPIClient) and state
     api = SentinelAPIClient()
     state = AgentState(agent_id="agent-sentinel-core")
     audit = AuditLogger()
-    
+
     try:
         # Update AGENT_REGISTRY on startup
         logger.info("Registering agent as online...")
@@ -444,14 +445,13 @@ async def main():
 
         # Build the two ReAct agents (one per loop) sharing the same toolset
         # but bound to different system prompts. force_tool_use=True on the
-        # monitoring agent makes Gemini call SOME tool every turn — the
-        # structural fix for bug #1.
-        logger.info("Building LangGraph agents...")
+        # monitoring agent makes Gemini call SOME tool every turn.
+        logger.info(f"Building LangGraph agents (Vertex AI: project={project}, location={location})...")
         tools_list = build_tools(api, audit, client, agent_id=state.agent_id)
         detection_prompt = await load_prompt("detection_prompt.md")
         monitoring_prompt = await load_prompt("monitoring_prompt.md")
-        detection_agent = build_agent(api_key, detection_prompt, tools_list, force_tool_use=False)
-        monitoring_agent = build_agent(api_key, monitoring_prompt, tools_list, force_tool_use=True)
+        detection_agent = build_agent(project, location, detection_prompt, tools_list, force_tool_use=False)
+        monitoring_agent = build_agent(project, location, monitoring_prompt, tools_list, force_tool_use=True)
 
         logger.info("Starting background loops...")
         loop_a = asyncio.create_task(detection_loop(api, state, audit, client, detection_agent))
