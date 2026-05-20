@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import Dict, Any, List, Optional
 import asyncio
 
@@ -322,6 +323,36 @@ def _build_disaster_payload(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _circle_to_geojson_polygon(lat: float, lng: float, radius_m: float, vertices: int = 24) -> Dict[str, Any]:
+    """Approximate a circle (lat, lng, radius in meters) as a GeoJSON Polygon."""
+    if radius_m <= 0:
+        radius_m = 100.0
+    deg_per_m_lat = 1.0 / 111320.0
+    deg_per_m_lng = 1.0 / (111320.0 * max(math.cos(math.radians(lat)), 1e-6))
+    coords = []
+    for i in range(vertices):
+        theta = 2.0 * math.pi * i / vertices
+        coords.append([
+            lng + radius_m * math.cos(theta) * deg_per_m_lng,
+            lat + radius_m * math.sin(theta) * deg_per_m_lat,
+        ])
+    coords.append(coords[0])  # close the ring
+    return {"type": "Polygon", "coordinates": [coords]}
+
+
+def _build_cordon_payload(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate Gemini's create_cordon args into a CordonPayload body."""
+    center = args.get("center") or {}
+    lat = float(center.get("lat", 0.0))
+    lng = float(center.get("lng", 0.0))
+    radius = float(args.get("radius", 200.0))
+    return {
+        "geometry": _circle_to_geojson_polygon(lat, lng, radius),
+        "reason": args.get("reason", ""),
+        "event_id": args.get("incident_id") or args.get("event_id"),
+    }
+
+
 class ToolExecutor:
     """Executes Sentinel City tools, applying validation and audit logging."""
 
@@ -412,7 +443,8 @@ class ToolExecutor:
             for field in ["incident_id", "center", "radius", "reason"]:
                 if field not in args:
                     raise ValueError(f"Missing required field '{field}' in create_cordon")
-            return await self.api.cordon(args)
+            payload = _build_cordon_payload(args)
+            return await self.api.cordon(payload)
             
         elif tool_name == "clear_cordon":
             if "cordon_id" not in args:

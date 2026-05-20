@@ -52,6 +52,75 @@ def get_gemini_tools() -> Optional[list]:
     declarations = [types.FunctionDeclaration(**d) for d in raw]
     return [types.Tool(function_declarations=declarations)]
 
+
+def sync_state_with_disasters(state: AgentState, disasters: Any):
+    """
+    Synchronizes the local agent state with active disasters from the API.
+    """
+    if isinstance(disasters, dict) and "disasters" in disasters:
+        disasters_list = disasters["disasters"]
+    elif isinstance(disasters, list):
+        disasters_list = disasters
+    else:
+        disasters_list = []
+
+    active_disaster_ids = set()
+    for d in disasters_list:
+        # We only care about active disasters
+        if d.get("status") != "active":
+            continue
+            
+        disaster_id = d["id"]
+        active_disaster_ids.add(disaster_id)
+        
+        # Get coordinates
+        lng, lat = 0.0, 0.0
+        geom = d.get("area_geometry")
+        if geom and isinstance(geom, dict):
+            coords = geom.get("coordinates")
+            if coords and len(coords) >= 2:
+                lng, lat = coords[0], coords[1]
+                
+        # Determine severity string from number (or just keep string severity)
+        sev_val = d.get("severity", 4)
+        if isinstance(sev_val, str):
+            severity_str = sev_val
+        else:
+            if sev_val >= 8:
+                severity_str = "critical"
+            elif sev_val >= 6:
+                severity_str = "high"
+            elif sev_val >= 4:
+                severity_str = "medium"
+            else:
+                severity_str = "low"
+            
+        if disaster_id not in state.active_incidents:
+            # Create a new IncidentState
+            incident = IncidentState(
+                incident_id=disaster_id,
+                type=d.get("disaster_type", "unknown").lower(),
+                location={"lat": lat, "lng": lng},
+                severity=severity_str,
+                confidence=1.0,
+                description=d.get("notes", "") or "",
+                status="active"
+            )
+            state.add_incident(incident)
+        else:
+            # Update existing IncidentState
+            state.update_incident(
+                disaster_id,
+                severity=severity_str,
+                description=d.get("notes", "") or ""
+            )
+            
+    # Remove any incidents from state that are no longer active in the backend
+    for d_id in list(state.active_incidents.keys()):
+        if d_id not in active_disaster_ids:
+            state.remove_incident(d_id)
+
+
 async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: AuditLogger, client: genai.Client):
     """
     Loop A (Detection):
@@ -68,6 +137,7 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
         try:
             # Poll APIs for active data
             disasters = await api.get_disasters()
+            sync_state_with_disasters(state, disasters)
             weather = await api.get_weather()
             traffic = await api.get_traffic()
             reports = await api.get_citizen_reports()
@@ -85,6 +155,7 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
             
             prompt_content = f"Analyze the following current data:\n{context}"
             
+            logger.info("[Detection] Sending request to Gemini...")
             # Pass to Gemini via async client
             response = await client.aio.models.generate_content(
                 model='gemini-2.5-flash',
@@ -95,6 +166,7 @@ async def detection_loop(api: SentinelAPIClient, state: AgentState, audit: Audit
                     temperature=0.2
                 )
             )
+            logger.info("[Detection] Received response from Gemini.")
             
             # Extract tool calls and execute
             if response.function_calls:
@@ -143,6 +215,10 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
     
     while True:
         try:
+            # Fetch active disasters from database and sync state
+            disasters = await api.get_disasters()
+            sync_state_with_disasters(state, disasters)
+            
             # Only heavily monitor if there are active incidents
             if not state.active_incidents:
                 await asyncio.sleep(15)
@@ -160,6 +236,7 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
             
             prompt_content = f"Review the active incidents and current resources:\n{context}"
             
+            logger.info("[Monitoring] Sending request to Gemini...")
             response = await client.aio.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt_content,
@@ -169,6 +246,7 @@ async def monitoring_supervisor(api: SentinelAPIClient, state: AgentState, audit
                     temperature=0.2
                 )
             )
+            logger.info("[Monitoring] Received response from Gemini.")
             
             if response.function_calls:
                 for function_call in response.function_calls:
