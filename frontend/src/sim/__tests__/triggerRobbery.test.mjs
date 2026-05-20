@@ -294,6 +294,65 @@ test('retaskReturningPolice: returning officers are redirected to new patrol', (
   assert.equal(ids.has('manual-new'), true)
 })
 
+test('patrolling cops stay inside their patrol circle across many ticks (regression)', () => {
+  // Previously, advanceAlongPath's path-exhaustion fallback called
+  // retargetForState for any non-truck unit. retargetForState doesn't
+  // understand police_patrolling state and falls through to
+  // retarget(idx, getRandomNode()) — teleporting cops anywhere in the
+  // graph. After the fix, only kind===0 (citizens) take that fallback;
+  // cops re-target via their own PATROL handler and never leave the circle.
+  // Use a wide graph (≈1 km cells, 5x5) so the cop has many in-circle
+  // nodes to choose from — too tight a grid would collapse all options.
+  const wideGraph = makeStubGraph({ step: 0.005, rows: 5, cols: 5 })  // 5x5 grid, ~550 m cells
+  const reports = []
+  const engine = createCitizenEngine({
+    roadGraph: wideGraph,
+    count: 4,
+    reserve: 4,
+    getZones: () => [],
+    getNotifications: () => [],
+    getCordons: () => [],
+    onReport: (r) => reports.push(r),
+  })
+  // Station at grid centre (2,2) ≈ (40.79, -73.97).
+  const stationLat = 40.79
+  const stationLng = -73.97
+  const PATROL_RADIUS = 2000  // 2 km — wider than the inter-node spacing
+  engine.spawnPolice(
+    'manual-bounded',
+    { lat: stationLat, lng: stationLng },
+    { lat: stationLat, lng: stationLng, radius: PATROL_RADIUS },
+    1,
+    'station-A',
+  )
+  // Locate the cop slot.
+  const snap0 = engine.snapshot()
+  let copIdx = -1
+  for (let i = 0; i < snap0.count; i++) {
+    if (snap0.kind[i] === 3) { copIdx = i; break }
+  }
+  assert.ok(copIdx >= 0, 'cop should spawn')
+  // Run the engine forward and verify the cop NEVER drifts more than
+  // PATROL_RADIUS * 1.5 from the patrol centre (allow a little slack for
+  // routing along graph nodes that sit just outside the circle).
+  const tolerance = PATROL_RADIUS * 1.5
+  for (let t = 0; t < 200; t++) {
+    engine.tick(1)
+    const snap = engine.snapshot()
+    if (!snap.kind[copIdx]) continue  // despawned (shouldn't happen)
+    const lat = snap.lats[copIdx]
+    const lng = snap.lngs[copIdx]
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue
+    const dLat = (lat - stationLat) * 111111
+    const dLng = (lng - stationLng) * 111111 * Math.cos((stationLat * Math.PI) / 180)
+    const dist = Math.hypot(dLat, dLng)
+    assert.ok(
+      dist <= tolerance,
+      `tick ${t}: cop drifted ${Math.round(dist)} m from patrol centre — far outside the ${PATROL_RADIUS} m radius (would happen if retargetForState dumped them on a random node)`,
+    )
+  }
+})
+
 test('retaskReturningTrucks does NOT grab a truck currently EN_ROUTE or PATROLLING', () => {
   // Only RETURNING trucks should be re-taskable. Trucks still actively on
   // their original mission should be left alone.
@@ -312,6 +371,32 @@ test('retaskReturningTrucks does NOT grab a truck currently EN_ROUTE or PATROLLI
     5,
   )
   assert.equal(retasked, 0, 'no truck is returning, so nothing should be re-tasked')
+})
+
+test('prank calls fire on the configured cadence with non-persistable event_ids', async () => {
+  const { PRANK_CALL_INTERVAL_S } = await import('../../lib/config.js')
+  // Use the default tight grid so there are always walking citizens available.
+  const { engine, reports } = makeEngine({ count: 8 })
+  // Tick forward enough sim-seconds to span several prank intervals. Each
+  // tick advances 1 s. We expect roughly N pranks over N×interval sim-seconds.
+  const intervals = 4
+  for (let t = 0; t < PRANK_CALL_INTERVAL_S * intervals + 2; t++) {
+    engine.tick(1)
+  }
+  const prankCalls = reports.filter((r) => typeof r.event_id === 'string' && r.event_id.startsWith('prank:'))
+  // Allow ±1 tolerance — the very first prank fires exactly at
+  // PRANK_CALL_INTERVAL_S, then every interval after. Over `intervals`
+  // intervals we expect `intervals` pranks (give or take edge timing).
+  assert.ok(prankCalls.length >= intervals - 1, `expected ~${intervals} prank calls, got ${prankCalls.length}`)
+  assert.ok(prankCalls.length <= intervals + 1, `expected ~${intervals} prank calls, got ${prankCalls.length}`)
+  // Every prank must use the synthetic event_id form so the dashboard's
+  // UUID filter drops it on the DB write path.
+  for (const r of prankCalls) {
+    assert.equal(isPersistableEventId(r.event_id), false, `prank event_id ${r.event_id} must NOT be persistable`)
+    assert.match(r.event_id, /^prank:\d+:\d+$/)
+    assert.equal(r.report_kind, 'observation')
+    assert.ok(r.transcript && r.transcript.length > 0)
+  }
 })
 
 test('triggerRobbery dispatches a responding cop when nobody is in catch radius', () => {
