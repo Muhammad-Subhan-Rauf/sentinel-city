@@ -30,6 +30,7 @@ from tools import (
     _build_cordon_payload,
     _build_disaster_payload,
     _build_disaster_update_payload,
+    _build_notification_payload,
 )
 
 from metrics import inc as _metric_inc
@@ -555,10 +556,8 @@ def build_tools(
     # ─── Citizen alerts & cordons ───────────────────────────────────
 
     async def _publish_citizen_alert(args: Dict[str, Any]) -> Any:
-        ta = args.get("target_area")
-        if hasattr(ta, "model_dump"):
-            args = {**args, "target_area": ta.model_dump()}
-        return await api.notify(args)
+        payload = _build_notification_payload(args)
+        return await api.notify(payload)
 
     async def _retract_citizen_alert(args: Dict[str, Any]) -> Any:
         if not args.get("alert_id"):

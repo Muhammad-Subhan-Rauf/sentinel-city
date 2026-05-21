@@ -1,126 +1,114 @@
-# 🛡️ Sentinel-City
+# Sentinel-City
 
-> **Agentic Disaster Orchestration Platform** — Built for high-stakes hackathon competition.
-
-A full-stack platform that lets operators draw geospatial zones on a live map and trigger AI-orchestrated disaster response workflows, secured end-to-end with Supabase JWT authentication.
-
----
-
-## 🏗️ Architecture
+Agentic disaster-response platform. Operators draw zones and trigger events from a web dashboard; an AI orchestrator detects, declares, cordons, and dispatches; citizens and responders see the AI's reasoning and act on it from a mobile app.
 
 ```
 sentinel-city/
-├── frontend/   # React + Vite + Tailwind CSS + react-leaflet + Geoman
-└── backend/    # Python + FastAPI + Supabase + PyJWT
+├── backend/    FastAPI + PostgreSQL + LangGraph (Vertex AI Gemini)
+├── frontend/   React + Vite + Leaflet operator dashboard
+├── mobile/     Expo + React Native (citizen / worker / admin)
+├── db/         Postgres init + numbered migrations
+└── docker-compose.yml
 ```
 
 ---
 
-## 🚀 Quick Start
+## What it does
 
-### Prerequisites
-- Node.js 18+
-- Python 3.11+
-- A [Supabase](https://supabase.com) project with:
-  - A `disaster_events` table (columns: `id`, `triggered_by`, `disaster_type`, `severity`, `area_geometry`, `notes`, `status`, `created_at`)
-  - Email auth enabled
+- **Operator dashboard** ([frontend/](frontend/)) — draw geometry, trigger disasters, watch the AI's log stream, dispatch units manually, manage stations.
+- **AI orchestrator** ([backend/orchestrator.py](backend/orchestrator.py)) — two LangGraph ReAct agents on Vertex AI Gemini:
+  - *Detection Loop* — ingests citizen reports / weather / traffic, triangulates, declares incidents.
+  - *Monitoring Loop* — ranks nearest resources, dispatches fire/EMS/police, cordons no-entry zones, publishes citizen alerts, clears resolved events.
+  - Tool surface in [backend/agent_tools.py](backend/agent_tools.py); all writes go through [backend/api_client.py](backend/api_client.py) which stamps `source='ai'` so the mobile app can filter operator vs AI traffic.
+- **Mobile app** ([mobile/](mobile/)) — three roles:
+  - *Citizen* — AI-warned of nearby hazards, walking routes that avoid them, 911 calling from inside a zone.
+  - *Worker* (firefighter / paramedic / police) — driving routes around hazards, dispatch acknowledgment, call queue filtered by service.
+  - *Admin* — citywide oversight feed, dispatch + agents + savings telemetry.
+- **Backend** ([backend/main.py](backend/main.py)) — system of record. Disasters, citizen reports, responder field reports, 911 calls, fire/hospital/police stations, simulated weather + traffic that react to active events, savings metrics, audit logs.
 
 ---
 
-### 1. Backend
+## Mobile warnings: AI-only
+
+The mobile app consumes **`GET /api/warnings/nearby?lat=&lng=&radius_m=`** ([backend/main.py:2096](backend/main.py)) — a unified, AI-only nearby-warning feed aggregating five sources, server-filtered to `source='ai'` and proximity-trimmed:
+
+| Source              | AI tool                  | Surfaces as `kind` |
+| ------------------- | ------------------------ | ------------------ |
+| `notifications`     | `publish_citizen_alert`  | `alert`            |
+| `cordons`           | `create_cordon`          | `cordon`           |
+| `disaster_events`   | `declare_incident`       | `disaster`         |
+| `active_dispatches` | `dispatch_units`         | `dispatch`         |
+| weather alerts      | weather watcher          | `weather`          |
+
+Operator-drawn dashboard entries are hidden from mobile. Omitting `lat`/`lng` returns the citywide admin feed.
+
+---
+
+## Run locally with Docker
+
+```bash
+docker compose up --build
+# Dashboard → http://localhost:5173
+# Backend   → http://localhost:8000  (Swagger at /docs)
+# Postgres  → localhost:5432  (sentinel / sentinel)
+```
+
+`backend/.env` needs `GOOGLE_CLOUD_PROJECT` + `GOOGLE_CLOUD_LOCATION` for Vertex AI; the service-account JSON mounts from `backend/vertex-sa.json`. See [backend/Dockerfile](backend/Dockerfile) and [docker-compose.yml](docker-compose.yml).
+
+---
+
+## Run pieces individually
+
+### Backend
 
 ```bash
 cd backend
-python -m venv venv
-# Windows:
-venv\Scripts\activate
-# macOS/Linux:
-source venv/bin/activate
-
+python -m venv venv && venv\Scripts\activate    # Windows
 pip install -r requirements.txt
-
-# Copy and fill in your Supabase keys
-cp .env.example .env
-
+# DATABASE_URL must point at a Postgres instance (e.g. docker compose up db)
 uvicorn main:app --reload
-# → http://localhost:8000
-# → http://localhost:8000/docs  (Swagger UI)
 ```
 
-### 2. Frontend
+### Frontend
 
 ```bash
 cd frontend
-
-# Copy and fill in your Supabase keys
-cp .env.example .env
-
 npm install
-npm run dev
-# → http://localhost:5173
+npm run dev    # → http://localhost:5173
 ```
 
----
+### Mobile
 
-## 🔑 Environment Variables
-
-### `backend/.env`
-| Variable | Description |
-|---|---|
-| `SUPABASE_URL` | Your Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | Service role key (bypasses RLS for admin writes) |
-| `SUPABASE_JWT_SECRET` | JWT secret for verifying user tokens |
-
-### `frontend/.env`
-| Variable | Description |
-|---|---|
-| `VITE_SUPABASE_URL` | Your Supabase project URL |
-| `VITE_SUPABASE_ANON_KEY` | Public anon key (safe for client-side) |
-| `VITE_BACKEND_URL` | Backend URL (default: `http://localhost:8000`) |
-
----
-
-## 🗺️ Supabase Table Schema
-
-```sql
-create table disaster_events (
-  id            uuid primary key default gen_random_uuid(),
-  triggered_by  uuid references auth.users(id),
-  disaster_type text not null,
-  severity      int  not null check (severity between 1 and 10),
-  area_geometry jsonb,
-  notes         text,
-  status        text default 'active',
-  created_at    timestamptz default now()
-);
-
--- Enable RLS
-alter table disaster_events enable row level security;
-
--- Backend service key bypasses RLS automatically
+```bash
+cd mobile
+npm install
+# Dev — Metro + Expo Go
+npm run start
+# Production APK build (see also mobile/eas.json for cloud builds)
+npx expo prebuild --platform android
+cd android && ./gradlew assembleRelease
+# → mobile/android/app/build/outputs/apk/release/app-release.apk
 ```
 
----
-
-## 🤖 AI Agent Integration
-
-Look for the `[ANTIGRAVITY AI TRIGGER POINT]` comment block in `backend/main.py`. This is where agent logic plugs in after the event is validated and before it's written to the database.
+Configure backend URL for the APK via `EXPO_PUBLIC_BACKEND_URL`. The current build points at the deployed Cloud Run instance.
 
 ---
 
-## 🔒 Security Model
+## Database
 
-- Frontend uses the **anon key** — safe for public exposure; RLS controls data access
-- Backend uses the **service role key** — never exposed to client, only used server-side
-- Every request to the backend is verified against the **JWT secret** before any DB write
+Schema is bootstrapped by [db/init.sql](db/init.sql) plus the numbered migration files in [db/](db/). [backend/main.py](backend/main.py) lifespan also self-heals the schema via idempotent `ALTER TABLE … ADD COLUMN IF NOT EXISTS` calls — adding a column means appending one statement there, no migration runner needed.
+
+Key tables: `disaster_events`, `notifications`, `cordons`, `active_dispatches`, `citizen_reports`, `responder_reports`, `fire_stations`, `hospitals`, `police_stations`, `emergency_calls`, `audit_logs`.
 
 ---
 
-## 📦 Tech Stack
+## Tech stack
 
-| Layer | Technologies |
-|---|---|
-| Frontend | React 18, Vite, Tailwind CSS, react-leaflet, leaflet-geoman-free, @supabase/supabase-js, h3-js |
-| Backend | FastAPI, Uvicorn, Supabase Python SDK, PyJWT, Pydantic v2, python-dotenv |
-| Database | Supabase (PostgreSQL + PostGIS) |
-| Auth | Supabase Auth (JWT, email/password) |
+| Layer       | Stack                                                                                 |
+| ----------- | ------------------------------------------------------------------------------------- |
+| Backend     | FastAPI, Uvicorn, psycopg2, Pydantic v2, LangGraph, Vertex AI (Gemini 2.x)            |
+| Dashboard   | React 18, Vite, Tailwind, react-leaflet, leaflet-geoman-free                          |
+| Mobile      | React Native 0.76, Expo SDK 52, react-native-webview (Leaflet inside), expo-location |
+| Routing     | Stadia Maps hosted Valhalla (`avoid_polygons` for hazard-aware routes)                |
+| Database    | PostgreSQL 16 (JSONB geometry; no PostGIS dependency)                                 |
+| Container   | Docker Compose for local; backend deploys to Cloud Run                                |

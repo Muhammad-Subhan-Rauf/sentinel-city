@@ -383,6 +383,27 @@ def _build_cordon_payload(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _build_notification_payload(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate Gemini's publish_citizen_alert args into a NotificationPayload body.
+
+    AI surface: ``{target_area: {lat, lng, radius}, message, severity, incident_id}``.
+    Endpoint:   ``{geometry, reason, event_id}``. Without this translation the
+    POST /api/notify returns 422 and /api/warnings/nearby never sees the alert.
+    """
+    ta = args.get("target_area") or {}
+    if hasattr(ta, "model_dump"):
+        ta = ta.model_dump()
+    lat = float(ta.get("lat", 0.0))
+    lng = float(ta.get("lng", 0.0))
+    radius = float(ta.get("radius", 5000.0))
+    reason = args.get("message") or args.get("reason") or ""
+    return {
+        "geometry": _circle_to_geojson_polygon(lat, lng, radius),
+        "reason": reason,
+        "event_id": args.get("incident_id") or args.get("event_id"),
+    }
+
+
 class ToolExecutor:
     """Executes Sentinel City tools, applying validation and audit logging."""
 

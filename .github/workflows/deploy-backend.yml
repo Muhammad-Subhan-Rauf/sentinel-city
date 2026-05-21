@@ -53,7 +53,7 @@ jobs:
             --allow-unauthenticated \
             --service-account="cloud-run-sentinel@${{ env.PROJECT_ID }}.iam.gserviceaccount.com" \
             --set-secrets=DATABASE_URL=DATABASE_URL:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest \
-            --set-env-vars=SENTINEL_API_URL=http://localhost:8000 \
+            --set-env-vars=SENTINEL_API_URL=http://localhost:8000,GOOGLE_CLOUD_PROJECT=${{ env.PROJECT_ID }},GOOGLE_CLOUD_LOCATION=us-central1 \
             --min-instances=1 \
             --max-instances=1 \
             --memory=512Mi \
