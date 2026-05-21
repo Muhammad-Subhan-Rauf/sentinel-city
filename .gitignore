@@ -62,3 +62,5 @@ prompt.pdf
 
 # ─── Log files ────────────────────────────────────────────────
 *.log
+test.py
+backend/logs/

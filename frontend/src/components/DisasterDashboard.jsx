@@ -175,6 +175,9 @@ export default function DisasterDashboard() {
   const [engine, setEngine] = useState(null)
   const zonesRef = useRef(zones)
   const pendingReportsRef = useRef([])
+  // Responder field reports buffered from the engine — flushed every 2 s
+  // to POST /api/responder-report. Symmetric to pendingReportsRef.
+  const pendingResponderReportsRef = useRef([])
   const notificationsRef = useRef([])
   const cordonsRef = useRef([])
 
@@ -281,6 +284,9 @@ export default function DisasterDashboard() {
           getCordons: () => cordonsRef.current,
           onReport: (r) => {
             pendingReportsRef.current.push(r)
+          },
+          onResponderReport: (r) => {
+            pendingResponderReportsRef.current.push(r)
           },
           onZoneResolved: (zoneId) => {
             // Engine signalled a fire has been put out. Mirror to backend +
@@ -417,6 +423,44 @@ export default function DisasterDashboard() {
     }
 
     const id = setInterval(flush, 2000)
+    return () => clearInterval(id)
+  }, [])
+
+  // Batched flush of responder field reports (auto-detected casualties +
+  // fire_sighted corrections). Mirrors the citizen-report flush above.
+  // Failures are swallowed — the engine keeps buffering and the next flush
+  // will retry whatever the engine emits next; we don't try to re-send the
+  // current batch to avoid re-dispatching the same casualty twice.
+  useEffect(() => {
+    const flushResponder = async () => {
+      const batch = pendingResponderReportsRef.current
+      if (batch.length === 0) return
+      pendingResponderReportsRef.current = []
+      const persistable = batch.filter((r) =>
+        r && r.report_kind && r.location && isPersistableEventId(r.event_id),
+      )
+      if (persistable.length === 0) return
+      try {
+        await fetch(`${BACKEND_URL}/api/responder-report`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            reports: persistable.map((r) => ({
+              event_id: r.event_id,
+              responder_unit_id: r.responder_unit_id,
+              report_kind: r.report_kind,
+              location: r.location,
+              severity: r.severity ?? null,
+              is_correction: r.is_correction ?? false,
+              notes: r.notes ?? null,
+            })),
+          }),
+        })
+      } catch {
+        /* offline / backend down — drop silently */
+      }
+    }
+    const id = setInterval(flushResponder, 2000)
     return () => clearInterval(id)
   }, [])
 

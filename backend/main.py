@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -44,8 +44,8 @@ async def lifespan(app: FastAPI):
         from api_client import SentinelAPIClient
         from audit import AuditLogger
         from state import AgentState
-        from orchestrator import detection_loop, monitoring_supervisor, load_prompt
-        from agent_tools import build_tools
+        from orchestrator import detection_loop, monitoring_supervisor, load_prompt, set_tool_invoker
+        from agent_tools import build_tools, make_tool_invoker
         from agent_graph import build_agent
     except Exception as exc:
         log.warning(f"Orchestrator import failed ({exc}); API will run without AI loops.")
@@ -69,8 +69,15 @@ async def lifespan(app: FastAPI):
     # Build the LangGraph ReAct agents on Vertex AI. The monitoring agent is
     # built with force_tool_use=True so Gemini cannot reply with "Would you
     # like me to proceed?" without actually invoking a tool.
+    # Pre-register bus instances so wake-ups pushed before the loops start
+    # awaiting (e.g. an early POST /api/citizen-report) get queued, not dropped.
+    from wake_bus import WakeBus
+    WakeBus.for_label("detection")
+    WakeBus.for_label("monitoring")
+
     log.info(f"Building LangGraph agents (Vertex AI: project={project}, location={location})...")
-    tools_list = build_tools(api, audit, client, agent_id=state.agent_id)
+    tools_list = build_tools(api, audit, client, agent_id=state.agent_id, state=state)
+    set_tool_invoker(make_tool_invoker(tools_list))
     detection_prompt = await load_prompt("detection_prompt.md")
     monitoring_prompt = await load_prompt("monitoring_prompt.md")
     detection_agent = build_agent(project, location, detection_prompt, tools_list, force_tool_use=False)
@@ -80,13 +87,26 @@ async def lifespan(app: FastAPI):
     detection_task = asyncio.create_task(detection_loop(api, state, audit, client, detection_agent))
     monitoring_task = asyncio.create_task(monitoring_supervisor(api, state, audit, client, monitoring_agent))
 
+    # SLA watchdog: dispatch SLA + deadman heartbeat — forces a re-tick if
+    # the system goes silent or declares without dispatching.
+    from safety.sla import start_watchdog
+    sla_task = start_watchdog(audit)
+
+    # Wake-up watchers: turn polled APIs into bus events so the AI sleeps
+    # until something interesting actually changes.
+    from watchers import weather as _weather_watcher, traffic as _traffic_watcher
+    weather_task = _weather_watcher.start(api)
+    traffic_task = _traffic_watcher.start(api)
+
+    background_tasks = (detection_task, monitoring_task, sla_task, weather_task, traffic_task)
+
     try:
         yield
     finally:
         log.info("Shutting down orchestrator loops")
-        for t in (detection_task, monitoring_task):
+        for t in background_tasks:
             t.cancel()
-        for t in (detection_task, monitoring_task):
+        for t in background_tasks:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
@@ -268,8 +288,47 @@ def _bootstrap_schema() -> None:
                         created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                 """)
+                # Responder field reports — see plan §"Sentinel-City: Responder
+                # Field Reports". Two kinds in one table: 'casualty_*' emitted
+                # automatically as a fire's burning area recedes, and
+                # 'fire_sighted' for the en-route correction path.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS responder_reports (
+                        id                 UUID PRIMARY KEY,
+                        event_id           UUID,
+                        responder_unit_id  TEXT NOT NULL,
+                        report_kind        TEXT NOT NULL CHECK (report_kind IN (
+                            'casualty_injured', 'casualty_fainted',
+                            'casualty_critical', 'fire_sighted'
+                        )),
+                        location           JSONB NOT NULL,
+                        severity           INTEGER,
+                        is_correction      BOOLEAN NOT NULL DEFAULT FALSE,
+                        notes              TEXT,
+                        status             TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending', 'resolved')),
+                        reported_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        resolved_at        TIMESTAMPTZ
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_responder_reports_pending
+                        ON responder_reports (status, reported_at DESC)
+                        WHERE status = 'pending';
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_responder_reports_event
+                        ON responder_reports (event_id);
+                """)
+                # AI-visible corrected location (set by the fire_sighted
+                # correction path). Read by sync_state_with_disasters and
+                # surfaced into the agent's context via agent_view().
+                cur.execute("""
+                    ALTER TABLE disaster_events
+                    ADD COLUMN IF NOT EXISTS location_estimate JSONB;
+                """)
         conn.close()
-        print("[schema] citizen_reports ready.")
+        print("[schema] citizen_reports + responder_reports ready.")
     except Exception as exc:
         print(f"[schema] bootstrap warning: {exc}")
 
@@ -873,7 +932,7 @@ def trigger_disaster(payload: DisasterPayload):
 
 
 @app.post("/api/citizen-report", tags=["Citizen Reports"])
-def post_citizen_reports(batch: CitizenReportBatch):
+async def post_citizen_reports(batch: CitizenReportBatch):
     """
     Batch-ingest 911 reports from the citizen simulation. Each report references
     an existing disaster_events.id; rows for unknown event_ids are dropped silently
@@ -928,6 +987,25 @@ def post_citizen_reports(batch: CitizenReportBatch):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Citizen report write failed: {exc}",
         )
+
+    # Wake the AI: citizen call(s) just arrived. Push the centroid of the
+    # batch (median of the lat/lng pairs) so the bus can area-dedupe.
+    try:
+        from wake_bus import WakeBus
+        if batch.reports:
+            lats = [float(r.location.get("lat", 0)) for r in batch.reports if isinstance(r.location, dict)]
+            lngs = [float(r.location.get("lng", 0)) for r in batch.reports if isinstance(r.location, dict)]
+            area = None
+            if lats and lngs:
+                area = {"lat": sum(lats) / len(lats), "lng": sum(lngs) / len(lngs)}
+            await WakeBus.push_all(
+                "citizen_report",
+                area=area,
+                payload={"count": len(batch.reports), "inserted": inserted},
+            )
+    except Exception:
+        # Best-effort: never let the wake-up plumbing crash the ingest.
+        pass
 
     return {"inserted": inserted, "skipped": skipped}
 
@@ -985,6 +1063,472 @@ def get_citizen_reports(
             for r in rows
         ]
     }
+
+
+# ─── Responder field reports (casualty + fire_sighted) ──────────────────
+
+_RESPONDER_REPORT_KINDS = {
+    "casualty_injured", "casualty_fainted", "casualty_critical", "fire_sighted",
+}
+
+
+class ResponderReport(BaseModel):
+    event_id: Optional[str] = None
+    responder_unit_id: str = Field(..., min_length=1)
+    report_kind: Literal[
+        "casualty_injured", "casualty_fainted", "casualty_critical", "fire_sighted"
+    ]
+    location: Dict[str, float]
+    severity: Optional[int] = None
+    is_correction: bool = False
+    notes: Optional[str] = None
+
+
+class ResponderReportBatch(BaseModel):
+    reports: List[ResponderReport]
+
+
+def _nearest_resource(
+    target_lat: float,
+    target_lng: float,
+    kind: str,
+    *,
+    required_capacity: int = 1,
+) -> Optional[Dict[str, Any]]:
+    """Return the nearest hospital / fire_station / police_station to (lat,lng)
+    that has at least `required_capacity` available units.
+
+    Used by:
+      - Server-side auto-dispatch on casualty reports (instant ambulance routing)
+      - The orchestrator's monitoring context (precomputed nearest-station hints
+        so the AI doesn't have to do haversine in its head)
+
+    Pure server-side: reads from Postgres, ranks in Python. The station tables
+    are small (<= ~20 rows in demo) so an O(N) sort is fine.
+    """
+    table_meta = {
+        "hospital":       ("hospitals",       "ambulance_count", "ambulances_dispatched"),
+        "fire_station":   ("fire_stations",   "truck_count",     "trucks_dispatched"),
+        "police_station": ("police_stations", "police_count",    "police_dispatched"),
+    }.get(kind)
+    if table_meta is None:
+        return None
+    table, cap_col, dispatched_col = table_meta
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT id, name, lat, lng, {cap_col}, {dispatched_col} FROM {table};"
+                )
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        logging.getLogger("sentinel.nearest").warning(
+            f"_nearest_resource read failed for {kind}: {exc}"
+        )
+        return None
+
+    ranked = []
+    for rid, name, lat, lng, cap, dispatched in rows:
+        try:
+            available = int(cap or 0) - int(dispatched or 0)
+        except (TypeError, ValueError):
+            available = 0
+        if available < required_capacity:
+            continue
+        d = _distance_haversine(target_lat, target_lng, float(lat), float(lng))
+        ranked.append({
+            "id": str(rid),
+            "name": name,
+            "lat": float(lat),
+            "lng": float(lng),
+            "available": available,
+            "distance_m": round(d, 1),
+        })
+    ranked.sort(key=lambda r: r["distance_m"])
+    return ranked[0] if ranked else None
+
+
+def _nearest_resources(
+    target_lat: float,
+    target_lng: float,
+    kind: str,
+    *,
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Top-N nearest resources by distance, including those at capacity (so the
+    AI can see them and reason). Used to populate the monitoring context."""
+    table_meta = {
+        "hospital":       ("hospitals",       "ambulance_count", "ambulances_dispatched"),
+        "fire_station":   ("fire_stations",   "truck_count",     "trucks_dispatched"),
+        "police_station": ("police_stations", "police_count",    "police_dispatched"),
+    }.get(kind)
+    if table_meta is None:
+        return []
+    table, cap_col, dispatched_col = table_meta
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT id, name, lat, lng, {cap_col}, {dispatched_col} FROM {table};"
+                )
+                rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return []
+    out = []
+    for rid, name, lat, lng, cap, dispatched in rows:
+        try:
+            available = max(0, int(cap or 0) - int(dispatched or 0))
+        except (TypeError, ValueError):
+            available = 0
+        d = _distance_haversine(target_lat, target_lng, float(lat), float(lng))
+        out.append({
+            "id": str(rid),
+            "name": name,
+            "available": available,
+            "distance_m": round(d, 1),
+        })
+    out.sort(key=lambda r: r["distance_m"])
+    return out[:limit]
+
+
+def _enqueue_pending_dispatch(*, kind: str, units: int, target: Dict[str, float], station_id: str) -> str:
+    """Add a dispatch to PENDING_DISPATCHES for the frontend engine to consume.
+    Returns the dispatch_id. Mirrors the /api/dispatch endpoint's side effect
+    so we can fire dispatches from server-side code without going through HTTP."""
+    dispatch_id = str(uuid.uuid4())
+    PENDING_DISPATCHES.append({
+        "dispatch_id": dispatch_id,
+        "kind": kind,
+        "units": units,
+        "target": dict(target),
+        "station_id": station_id,
+    })
+    return dispatch_id
+
+
+@app.post("/api/responder-report", tags=["Responder Reports"])
+async def post_responder_reports(batch: ResponderReportBatch):
+    """Batch-ingest responder field reports (casualty detections + fire-sighted
+    corrections). Each report carries PRECISE GPS — no triangulation needed.
+
+    Side effects beyond persistence:
+      - For any report with `is_correction=true` (fire_sighted), updates the
+        referenced disaster's `location_estimate` column so the AI's next
+        wake sees the corrected coordinates.
+      - Pushes one WakeBus event per distinct `report_kind` (area-deduped)
+        so the monitoring loop wakes within DEBOUNCE_SECONDS.
+    """
+    if not batch.reports:
+        return {"inserted": 0}
+
+    rows = []
+    skipped = 0
+    correction_updates: List[Tuple[str, Dict[str, float]]] = []
+    for r in batch.reports:
+        try:
+            ev_uuid = None
+            if r.event_id:
+                # The casualty path always carries an event_id; fire_sighted
+                # corrections do too. Drop rows with non-UUID event_ids
+                # silently — synthetic ids from operator-triggered events
+                # (crime:idx:t) shouldn't reach this endpoint, but be safe.
+                ev_uuid = str(uuid.UUID(str(r.event_id)))
+        except (ValueError, AttributeError, TypeError):
+            skipped += 1
+            continue
+        rows.append((
+            str(uuid.uuid4()),
+            ev_uuid,
+            r.responder_unit_id,
+            r.report_kind,
+            json.dumps(r.location),
+            r.severity,
+            bool(r.is_correction),
+            r.notes,
+        ))
+        if r.is_correction and r.report_kind == "fire_sighted" and ev_uuid:
+            correction_updates.append((ev_uuid, r.location))
+
+    if not rows:
+        return {"inserted": 0, "skipped": skipped}
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO responder_reports
+                        (id, event_id, responder_unit_id, report_kind,
+                         location, severity, is_correction, notes)
+                    VALUES %s;
+                    """,
+                    rows,
+                )
+                inserted = cur.rowcount
+                # Apply correction location_estimate updates inside the same tx
+                for ev_id, loc in correction_updates:
+                    cur.execute(
+                        """
+                        UPDATE disaster_events
+                        SET location_estimate = %s
+                        WHERE id = %s;
+                        """,
+                        (json.dumps(loc), ev_id),
+                    )
+                # fire_sighted:correction reports self-resolve — the correction
+                # itself IS the action; the AI just needs to be informed.
+                cur.execute(
+                    """
+                    UPDATE responder_reports
+                    SET status = 'resolved', resolved_at = NOW()
+                    WHERE report_kind = 'fire_sighted' AND is_correction = TRUE
+                      AND status = 'pending';
+                    """
+                )
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Responder report write failed: {exc}",
+        )
+
+    # ── Server-side ambulance auto-dispatch (time-critical) ───────────────
+    # Bug observed: AI-mediated ambulance dispatch was arriving AFTER casualties
+    # had died (wake-bus debounce + LLM latency + ReAct cycles ≈ 30-90 seconds).
+    # Casualty reports are unambiguous: 1 ambulance to the precise GPS from the
+    # nearest hospital with capacity. No AI judgment needed. Fire-and-forget.
+    auto_dispatched = 0
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                for r in batch.reports:
+                    if not r.report_kind.startswith("casualty_"):
+                        continue
+                    try:
+                        lat = float(r.location.get("lat"))
+                        lng = float(r.location.get("lng"))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if abs(lat) < 0.001 and abs(lng) < 0.001:
+                        continue
+                    nearest = _nearest_resource(lat, lng, "hospital", required_capacity=1)
+                    if nearest is None:
+                        logging.getLogger("sentinel.auto_dispatch").warning(
+                            f"No hospital with available ambulance capacity for casualty "
+                            f"at ({lat:.5f},{lng:.5f}) — leaving pending for AI"
+                        )
+                        continue
+                    dispatch_id = _enqueue_pending_dispatch(
+                        kind="ambulance",
+                        units=1,
+                        target={"lat": lat, "lng": lng},
+                        station_id=nearest["id"],
+                    )
+                    # Mark the report resolved so the AI doesn't re-dispatch.
+                    cur.execute(
+                        """
+                        UPDATE responder_reports
+                        SET status = 'resolved',
+                            resolved_at = NOW(),
+                            notes = COALESCE(notes, '') ||
+                                    ' [auto-dispatched ambulance from ' || %s ||
+                                    ' (' || %s || 'm)]'
+                        WHERE event_id = %s
+                          AND status = 'pending'
+                          AND report_kind = %s
+                          AND (location->>'lat')::float = %s
+                          AND (location->>'lng')::float = %s;
+                        """,
+                        (
+                            str(nearest.get("name") or nearest["id"]),
+                            int(nearest["distance_m"]),
+                            r.event_id,
+                            r.report_kind,
+                            lat,
+                            lng,
+                        ),
+                    )
+                    auto_dispatched += 1
+        conn.close()
+    except Exception as exc:
+        logging.getLogger("sentinel.auto_dispatch").warning(
+            f"casualty auto-dispatch best-effort path failed: {exc}"
+        )
+
+    # Wake the AI per distinct report_kind so the agent context's wake_reason
+    # surfaces both casualties AND corrections when both arrive together.
+    try:
+        from wake_bus import WakeBus
+        by_kind: Dict[str, List[ResponderReport]] = {}
+        for r in batch.reports:
+            by_kind.setdefault(r.report_kind, []).append(r)
+        for kind, items in by_kind.items():
+            lats = [float(r.location.get("lat", 0)) for r in items]
+            lngs = [float(r.location.get("lng", 0)) for r in items]
+            area = None
+            if lats and lngs:
+                area = {"lat": sum(lats) / len(lats), "lng": sum(lngs) / len(lngs)}
+            await WakeBus.push_all(
+                f"responder:{kind}",
+                area=area,
+                payload={"count": len(items)},
+            )
+    except Exception:
+        pass
+
+    return {
+        "inserted": inserted,
+        "skipped": skipped,
+        "auto_dispatched_ambulances": auto_dispatched,
+    }
+
+
+@app.get("/api/responder-reports", tags=["Responder Reports"])
+def get_responder_reports(
+    status_filter: Optional[Literal["pending", "resolved"]] = Query(
+        "pending", alias="status",
+        description="Filter by report status. Defaults to 'pending' (the AI's working set).",
+    ),
+    since: Optional[datetime] = Query(None, description="Return reports newer than this timestamp."),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """Read recent responder reports — primary consumer is the AI orchestrator
+    (monitoring loop). Defaults to status=pending so the agent's context only
+    surfaces work that still needs an ambulance / acknowledgement."""
+    clauses = []
+    params: List[Any] = []
+    if status_filter is not None:
+        clauses.append("status = %s")
+        params.append(status_filter)
+    if since is not None:
+        clauses.append("reported_at > %s")
+        params.append(since)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT id, event_id, responder_unit_id, report_kind,
+                           location, severity, is_correction, notes,
+                           status, reported_at, resolved_at
+                    FROM responder_reports
+                    {where}
+                    ORDER BY reported_at DESC
+                    LIMIT %s;
+                    """,
+                    tuple(params),
+                )
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Responder report read failed: {exc}",
+        )
+
+    return {
+        "reports": [
+            {
+                "id": str(r[0]),
+                "event_id": str(r[1]) if r[1] else None,
+                "responder_unit_id": r[2],
+                "report_kind": r[3],
+                "location": r[4],
+                "severity": r[5],
+                "is_correction": r[6],
+                "notes": r[7],
+                "status": r[8],
+                "reported_at": r[9].isoformat(),
+                "resolved_at": r[10].isoformat() if r[10] else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/api/nearest-resources", tags=["Emergency Services"])
+def get_nearest_resources(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    kind: Literal["hospital", "fire_station", "police_station"] = Query(...),
+    limit: int = Query(3, ge=1, le=20),
+):
+    """Server-side nearest-resource ranking by haversine distance.
+
+    The AI monitoring loop calls this once per active incident to get a
+    pre-ranked list of stations, so it doesn't have to do geographic math
+    itself (LLMs are notoriously bad at that). Counts ambulances /
+    trucks / officers and excludes none — at-capacity stations are still
+    listed so the AI sees them but can prefer one with `available > 0`.
+    """
+    return {"resources": _nearest_resources(lat, lng, kind, limit=limit)}
+
+
+@app.post("/api/responder-reports/resolve-near", tags=["Responder Reports"])
+def resolve_responder_reports_near(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radius_m: float = Query(100, ge=10, le=2000),
+    report_kind_prefix: str = Query("casualty_", description="Only resolve reports whose kind starts with this prefix"),
+):
+    """Mark pending responder reports within `radius_m` of (lat, lng) as resolved.
+
+    Called by agent_tools._track_sla_event after a successful ambulance dispatch,
+    so the AI doesn't re-see the same casualty on its next monitoring tick.
+    Uses haversine; not perfectly indexable but the pending working set is small.
+    """
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                # Pull pending rows of the requested kind. The set is tiny in
+                # practice (few dozen at peak) so a Python-side filter is fine.
+                cur.execute(
+                    """
+                    SELECT id, location FROM responder_reports
+                    WHERE status = 'pending' AND report_kind LIKE %s
+                    """,
+                    (report_kind_prefix + "%",),
+                )
+                candidates = cur.fetchall()
+                to_resolve: List[str] = []
+                for row_id, loc in candidates:
+                    try:
+                        rlat = float(loc.get("lat"))
+                        rlng = float(loc.get("lng"))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if _distance_haversine(lat, lng, rlat, rlng) <= radius_m:
+                        to_resolve.append(str(row_id))
+                if to_resolve:
+                    cur.execute(
+                        """
+                        UPDATE responder_reports
+                        SET status = 'resolved', resolved_at = NOW()
+                        WHERE id = ANY(%s::uuid[]);
+                        """,
+                        (to_resolve,),
+                    )
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Responder report resolve failed: {exc}",
+        )
+
+    return {"resolved": len(to_resolve)}
 
 
 # Cache the detected geometry-column SQL expression for the lifetime of the
@@ -1388,6 +1932,10 @@ def _row_to_disaster(row) -> Dict[str, Any]:
         "people_inside": row[9],
         "safe_exit_pct": row[10],
         "created_at": row[11].isoformat() if row[11] is not None else None,
+        # Set by the fire_sighted correction path. None when no responder has
+        # ever corrected the location. The orchestrator pulls this into
+        # IncidentState.location_estimate so the AI sees the corrected coords.
+        "location_estimate": row[12] if len(row) > 12 else None,
     }
 
 
@@ -1407,7 +1955,7 @@ def list_disasters(status_filter: Optional[str] = Query(None, description="activ
                     f"""
                     SELECT id, disaster_type, severity, {geom_expr}, geometry_kind,
                            notes, status, cause, spread_speed, people_inside,
-                           safe_exit_pct, created_at
+                           safe_exit_pct, created_at, location_estimate
                     FROM disaster_events
                     {where}
                     ORDER BY created_at DESC;
@@ -1435,7 +1983,7 @@ def get_disaster(event_id: str):
                     f"""
                     SELECT id, disaster_type, severity, {geom_expr}, geometry_kind,
                            notes, status, cause, spread_speed, people_inside,
-                           safe_exit_pct, created_at
+                           safe_exit_pct, created_at, location_estimate
                     FROM disaster_events
                     WHERE id = %s;
                     """,
@@ -2796,3 +3344,28 @@ def get_audit_logs(limit: int = Query(100, ge=1, le=500)):
     items = list(GLOBAL_LOG_BUFFER)[-limit:]
     items.reverse()
     return {"logs": items}
+
+
+@app.delete("/api/logs", tags=["Logs"])
+def clear_audit_logs():
+    """Wipe the in-process audit ring buffer (what AILogsDrawer renders).
+
+    Does NOT touch the daily JSONL files on disk — those remain the durable
+    audit trail. This is purely a UI/demo convenience: after a wipe or
+    between scenarios you can clear the drawer to start fresh.
+    """
+    from audit import GLOBAL_LOG_BUFFER
+    n = len(GLOBAL_LOG_BUFFER)
+    GLOBAL_LOG_BUFFER.clear()
+    return {"cleared": n}
+
+
+@app.get("/api/metrics", tags=["Logs"])
+def get_metrics():
+    """Live counters/gauges from the safety+efficiency layer.
+
+    Surfaced in AILogsDrawer so a demo audience can see token-savings and
+    verifier verdicts in real time. Cheap; safe to poll every few seconds.
+    """
+    from metrics import snapshot
+    return snapshot()

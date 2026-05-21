@@ -201,6 +201,10 @@ export function createCitizenEngine({
   getNotifications,
   getCordons,
   onReport,
+  // Responder field reports (casualty auto-detection on fire recession +
+  // fire_sighted en-route corrections). Symmetric to onReport — the dashboard
+  // buffers and POSTs in batches to /api/responder-report.
+  onResponderReport,
   // Engine → app callbacks. onZoneResolved fires when extinguishing brings a
   // fire's intensity / wave radius to zero. onScheduledSpread fires when a
   // Building Fire's delayed-spread timer elapses and its (still-draft)
@@ -318,6 +322,11 @@ export function createCitizenEngine({
   const inPoliceCustody = new Int32Array(capacity)
   const hidden = new Uint8Array(capacity)
   const deadSinceS = new Float32Array(capacity)
+  // Last sim-time we emitted a responder casualty report for this citizen.
+  // Throttled to prevent spamming the ambulance pipeline for one victim that
+  // takes time to be picked up. Re-emitted after AMBULANCE_REREQUEST_S in
+  // case no ambulance ever came (lost in transit, no capacity, etc.).
+  const ambulanceRequestedAt = new Float32Array(capacity)
   for (let i = 0; i < capacity; i++) {
     health[i] = HP_MAX
     inAmbulanceIdx[i] = -1
@@ -333,6 +342,7 @@ export function createCitizenEngine({
     inPoliceCustody[idx] = -1
     hidden[idx] = 0
     deadSinceS[idx] = 0
+    ambulanceRequestedAt[idx] = 0
   }
 
   // ──────────────────────────────────────────────────────────────────
@@ -429,6 +439,11 @@ export function createCitizenEngine({
   const truckSearchLng = new Float32Array(capacity)
   const truckSearchRadiusM = new Float32Array(capacity)
   const truckPatrolStartedAt = new Float32Array(capacity)
+  // Fire-sighted correction: per-truck cooldown for the en-route sighting
+  // check, and a one-shot flag that disables the check once a correction
+  // has fired (so we don't re-emit each tick after pivoting).
+  const truckSightedCheckNextAt = new Float32Array(capacity)
+  const truckCorrected = new Uint8Array(capacity)
   // Capacity per truck — read by the fightRate accumulator. Mirrors
   // FIRE_TRUCK_CAPACITY from config; stored per-slot so future ambulance/
   // police kinds can vary without engine code changes.
@@ -1238,6 +1253,7 @@ export function createCitizenEngine({
       const ff = fightRate.get(zoneId) || 0
       const grow = state.spreadRate * state.spreadSpeed * dt
       const shrink = ff * EXTINGUISH_RATE_PER_FF_M_PER_S * dt
+      const prevRadius = state.radius   // capture BEFORE mutation — needed for casualty diff
       let r = state.radius + grow - shrink
       if (r > state.maxRadius) r = state.maxRadius
       if (r <= 0 && ff > 0) {
@@ -1248,6 +1264,79 @@ export function createCitizenEngine({
         r = 0
       }
       state.radius = r
+
+      // ── Auto-detected casualty registration on disaster recession ──────
+      // When firefighters push the burning / flooded area back, anyone who
+      // was inside the just-receded ring is auto-registered for ambulance
+      // dispatch. No search-for-survivors code path — the act of clearing
+      // the perimeter IS the detection event. Cap total emission at:
+      //   people_inside * (1 - safe_exit_pct/100)
+      // so a disaster never produces more casualties than the operator seeded.
+      if (r < prevRadius && state.maxRadius > 0) {
+        const zone = zones.find((z) => z.id === zoneId)
+        if (zone) {
+          // Lazily compute the per-event casualty cap on first recession.
+          if (state.casualtyCap === undefined) {
+            const pi = zone.peopleInside ?? zone.people_inside
+            const sep = zone.safeExitPct ?? zone.safe_exit_pct
+            if (pi != null && sep != null) {
+              state.casualtyCap = Math.max(0, Math.floor(Number(pi) * (1 - Number(sep) / 100)))
+            } else {
+              // Fallback when the zone wasn't tagged with people_inside —
+              // a small floor so demos still produce visible casualties.
+              state.casualtyCap = 6
+            }
+            state.casualtiesEmitted = 0
+          }
+          const remaining = state.casualtyCap - state.casualtiesEmitted
+          if (remaining > 0 && onResponderReport) {
+            const initialArea = Math.PI * state.maxRadius * state.maxRadius
+            const exposedArea = Math.PI * (prevRadius * prevRadius - r * r)
+            const rawN = Math.floor((exposedArea / initialArea) * state.casualtyCap)
+            const n = Math.max(0, Math.min(rawN, remaining))
+            for (let k = 0; k < n; k++) {
+              // Uniform random point in the ring [r, prevRadius]
+              const u = Math.random()
+              const rR = Math.sqrt(u * (prevRadius * prevRadius - r * r) + r * r)
+              const theta = Math.random() * Math.PI * 2
+              const dLat = (rR * Math.sin(theta)) / 111111
+              const dLng = (rR * Math.cos(theta)) /
+                (111111 * Math.cos((state.centroid.lat * Math.PI) / 180))
+              const sev = Number(zone.severity ?? 5)
+              // Higher-severity fires produce a heavier mix of critical cases.
+              let casKind
+              const roll = Math.random()
+              if (sev >= 7) {
+                casKind = roll < 0.4 ? 'casualty_critical'
+                       : roll < 0.8 ? 'casualty_injured'
+                                    : 'casualty_fainted'
+              } else {
+                casKind = roll < 0.55 ? 'casualty_injured'
+                       : roll < 0.85 ? 'casualty_fainted'
+                                     : 'casualty_critical'
+              }
+              const severityVal = casKind === 'casualty_critical' ? Math.max(7, sev)
+                                : casKind === 'casualty_fainted'  ? 4
+                                                                  : 3
+              try {
+                onResponderReport({
+                  event_id: zone.id,
+                  responder_unit_id: 'auto',
+                  report_kind: casKind,
+                  location: {
+                    lat: state.centroid.lat + dLat,
+                    lng: state.centroid.lng + dLng,
+                  },
+                  severity: severityVal,
+                  is_correction: false,
+                  notes: `Auto-detected on ${zone.type?.toLowerCase() ?? 'disaster'} recession (ring ${r.toFixed(0)}-${prevRadius.toFixed(0)}m)`,
+                })
+              } catch { /* never crash the integrator on a callback error */ }
+              state.casualtiesEmitted += 1
+            }
+          }
+        }
+      }
     }
 
     // Building_Fire intensity integrator + delayed-spread scheduler.
@@ -1394,6 +1483,57 @@ export function createCitizenEngine({
       // Affected → fainted promotion when HP drops below the faint threshold.
       if (s === 'affected' && health[i] < HP_FAINT_THRESHOLD) {
         transition(i, 'fainted')
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Casualty emission for citizens already out of the wave.
+    //
+    // The recession-based casualty emitter (in the spread integrator above)
+    // fires when a fire's burning area SHRINKS — modelling firefighters
+    // pushing the perimeter back. But citizens commonly get caught by the
+    // wave, transition to affected/fainted, then walk OUT of the perimeter
+    // (or the wave moves past them) WITHOUT recession. Those victims need
+    // ambulances too, and without this pass nobody calls one in.
+    //
+    // Throttled per-citizen via `ambulanceRequestedAt[idx]` so a single
+    // victim doesn't spam the dispatch pipeline. Re-emits after the
+    // re-request window in case the first ambulance never arrived (no
+    // capacity, lost in routing, etc.).
+    // ──────────────────────────────────────────────────────────────────
+    const AMBULANCE_REREQUEST_S = 120
+    if (onResponderReport) {
+      for (let i = 0; i < activeCount; i++) {
+        if (!alive[i]) continue
+        if (kind[i] !== 0) continue   // citizens only
+        const s = states[i]
+        if (s !== 'affected' && s !== 'fainted') continue
+        if (inAmbulanceIdx[i] >= 0) continue   // already being treated
+        if (ambulanceRequestedAt[i] > 0 &&
+            simTimeS - ambulanceRequestedAt[i] < AMBULANCE_REREQUEST_S) continue
+        // Only call for victims OUTSIDE the active wave. Inside-wave victims
+        // wait for firefighters to push back — the recession emitter picks
+        // them up as they're exposed. Sending an ambulance INTO a fire
+        // would just kill the paramedics.
+        if (isInsideActiveEvent(i, zones, activeIds)) continue
+        // Need at least a UUID-shaped event_id; injuryZoneId may be a
+        // 'crime:idx:t' synthetic that the backend will reject. Use whichever
+        // looks UUID-shaped, falling back to causeZoneId.
+        const evCandidate = injuryZoneId[i] || causeZoneId[i]
+        if (typeof evCandidate !== 'string' || !/^[0-9a-f-]{36}$/i.test(evCandidate)) continue
+        try {
+          onResponderReport({
+            event_id: evCandidate,
+            responder_unit_id: 'citizen-state-watcher',
+            report_kind: s === 'fainted' ? 'casualty_fainted' : 'casualty_injured',
+            location: { lat: lats[i], lng: lngs[i] },
+            severity: Math.max(2, Math.min(10,
+              Math.round(10 * (1 - health[i] / HP_MAX)))),
+            is_correction: false,
+            notes: `Citizen ${i} ${s} outside wave (HP=${Math.round(health[i])})`,
+          })
+          ambulanceRequestedAt[i] = simTimeS
+        } catch { /* never crash the tick on a callback error */ }
       }
     }
 
@@ -1902,6 +2042,8 @@ export function createCitizenEngine({
       truckSearchLng[idx] = targetLng
       truckSearchRadiusM[idx] = targetRadiusM
       truckPatrolStartedAt[idx] = 0
+      truckSightedCheckNextAt[idx] = 0
+      truckCorrected[idx] = 0
       truckCapacity[idx] = FIRE_TRUCK_CAPACITY
       // Anchor stuck-check at the station so the first window doesn't
       // mis-classify the departing truck as stuck.
@@ -1942,6 +2084,8 @@ export function createCitizenEngine({
       truckPatrolNextAt[i] = 0
       truckPerceptionNextAt[i] = 0
       truckPatrolStartedAt[i] = 0
+      truckSightedCheckNextAt[i] = 0
+      truckCorrected[i] = 0
       states[i] = 'truck_driving'
       retarget(i, targetNodeId)
       retasked++
@@ -1994,6 +2138,34 @@ export function createCitizenEngine({
   function tickFireTruck(idx, zoneIndex, zones, dtS) {
     const role = truckRole[idx]
 
+    // ── Direct engagement on contact ────────────────────────────────────
+    // If this truck is physically inside (or within reach of) ANY active
+    // fire, engage it immediately regardless of role. Otherwise a truck
+    // dispatched to area A that crosses through the actual fire at B on
+    // its way will refuse to fight B until it reaches A — which is exactly
+    // what the user observed: trucks driving past flames to "arrive first".
+    // Returning trucks are exempt (they've completed their assignment).
+    if (role !== TRUCK_ROLE_EXTINGUISHING && role !== TRUCK_ROLE_RETURNING) {
+      for (const zone of zones) {
+        if (zone.status !== 'active') continue
+        const profile = getProfile(zone.type)
+        if (!profile || (!profile.spreads && zone.type !== 'Building_Fire')) continue
+        const c = eventCenter(zone)
+        if (!c) continue
+        const d = distanceMeters(lats[idx], lngs[idx], c.lat, c.lng)
+        // Match the APPROACHING→EXTINGUISHING reach: live wave radius for
+        // spreading hazards, fixed 60 m fallback for point/building fires.
+        const waveR = zoneStates.get(zone.id)?.radius || 0
+        const reach = Math.max(waveR, TRUCK_EXTINGUISH_REACH_M)
+        if (d <= reach) {
+          truckTargetZoneId[idx] = zone.id
+          truckRole[idx] = TRUCK_ROLE_EXTINGUISHING
+          states[idx] = 'truck_extinguishing'
+          return
+        }
+      }
+    }
+
     if (role === TRUCK_ROLE_EN_ROUTE) {
       // "Arrived" = inside the search circle (or path stalled). Trucks may
       // cross the perimeter from any angle; once inside they start patrolling.
@@ -2004,9 +2176,84 @@ export function createCitizenEngine({
         states[idx] = 'truck_patrolling'
         truckPatrolNextAt[idx] = simTimeS  // pick a target this tick
         truckPatrolStartedAt[idx] = simTimeS
-      } else {
-        advanceAlongPath(idx, dtS, zones)
+        return
       }
+
+      // ── Opportunistic fire sighting + 1 km correction rule ────────────
+      // If the truck passes within sight of an active fire whose true
+      // centroid is within CORRECTION_RADIUS_M of the assigned search
+      // target, the AI's triangulation was off — pivot to the real fire
+      // and redirect every other en-route truck heading to the same bad
+      // coords. Per-unit cooldown + one-shot `truckCorrected` flag keep
+      // the emission to ONE report per pivot.
+      const SIGHT_RADIUS_M = 250
+      const CORRECTION_RADIUS_M = 1000
+      if (!truckCorrected[idx] && simTimeS >= truckSightedCheckNextAt[idx]) {
+        truckSightedCheckNextAt[idx] = simTimeS + 3   // re-check every 3s
+        for (const zone of zones) {
+          if (zone.status !== 'active') continue
+          const profile = getProfile(zone.type)
+          // Only fire-class hazards trigger sighting (matches what a
+          // firefighter would actually engage en-route).
+          if (!profile || (!profile.spreads && zone.type !== 'Building_Fire')) continue
+          const c = eventCenter(zone)
+          if (!c) continue
+          const dToFire = distanceMeters(lats[idx], lngs[idx], c.lat, c.lng)
+          if (dToFire > SIGHT_RADIUS_M) continue
+          const dFromAssigned = distanceMeters(c.lat, c.lng,
+                                               truckSearchLat[idx], truckSearchLng[idx])
+          if (dFromAssigned > CORRECTION_RADIUS_M) continue   // separate fire — out of scope
+
+          // Emit the correction report (event_id = the fire being engaged).
+          try {
+            onResponderReport?.({
+              event_id: zone.id,
+              responder_unit_id: `truck-${idx}`,
+              report_kind: 'fire_sighted',
+              location: { lat: c.lat, lng: c.lng },
+              severity: zone.severity ?? null,
+              is_correction: true,
+              notes: `En-route truck sighted active ${zone.type} at true centroid; ` +
+                     `${dFromAssigned.toFixed(0)}m from assigned search target — pivoting.`,
+            })
+          } catch { /* swallow */ }
+
+          // Capture the OLD search target before mutating, so we can
+          // identify other trucks heading to the same wrong coords.
+          const oldSearchLat = truckSearchLat[idx]
+          const oldSearchLng = truckSearchLng[idx]
+
+          // Pivot THIS truck to the sighted fire.
+          truckSearchLat[idx] = c.lat
+          truckSearchLng[idx] = c.lng
+          truckCorrected[idx] = 1
+          const newNodeId = roadGraph.findNearestNode(c.lat, c.lng)
+          if (newNodeId != null) retarget(idx, newNodeId)
+
+          // Redirect every OTHER en-route truck that was heading to the
+          // same (now-known-bad) search target. Tolerance is small — the
+          // dashboard's batch dispatch puts every truck within a few
+          // metres of the same lat/lng.
+          for (let j = 0; j < activeCount; j++) {
+            if (j === idx) continue
+            if (kind[j] !== 1) continue
+            if (truckRole[j] !== TRUCK_ROLE_EN_ROUTE) continue
+            if (truckCorrected[j]) continue
+            const sameDispatch = distanceMeters(
+              truckSearchLat[j], truckSearchLng[j], oldSearchLat, oldSearchLng,
+            ) <= 50   // metres
+            if (!sameDispatch) continue
+            truckSearchLat[j] = c.lat
+            truckSearchLng[j] = c.lng
+            truckCorrected[j] = 1
+            const njId = roadGraph.findNearestNode(c.lat, c.lng)
+            if (njId != null) retarget(j, njId)
+          }
+          break   // pivoted; no point checking more fires this tick
+        }
+      }
+
+      advanceAlongPath(idx, dtS, zones)
       return
     }
 
