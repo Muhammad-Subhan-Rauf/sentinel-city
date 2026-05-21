@@ -28,7 +28,13 @@
       },
       "permissions": [
         "ACCESS_COARSE_LOCATION",
-        "ACCESS_FINE_LOCATION"
+        "ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
       ]
     },
     "web": {
@@ -45,8 +51,19 @@
       "expo-asset"
     ],
     "extra": {
-      "backendUrl": "http://localhost:8000",
-      "valhallaUrl": "http://localhost:8002"
+      "backendUrl": "https://sentinel-backend-228162497559.me-central1.run.app",
+      "valhallaUrl": "https://api.stadiamaps.com",
+      "stadiaApiKey": "",
+      "eas": {
+        "projectId": "847c3e00-adcd-4c6e-8085-de993c81baf2"
+      }
+    },
+    "owner": "269subhan",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/847c3e00-adcd-4c6e-8085-de993c81baf2"
     }
   }
 }

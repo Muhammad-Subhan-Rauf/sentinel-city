@@ -1,0 +1,41 @@
+{
+  "cli": {
+    "version": ">= 5.9.0",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_BACKEND_URL": "https://sentinel-backend-228162497559.me-central1.run.app",
+        "EXPO_PUBLIC_VALHALLA_URL": "https://api.stadiamaps.com",
+        "EXPO_PUBLIC_STADIA_API_KEY": "e8e5b311-aca1-481c-ae7a-5ad05deefc4c"
+      }
+    },
+    "production": {
+      "channel": "production",
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "env": {
+        "EXPO_PUBLIC_BACKEND_URL": "https://sentinel-backend-228162497559.me-central1.run.app",
+        "EXPO_PUBLIC_VALHALLA_URL": "https://api.stadiamaps.com",
+        "EXPO_PUBLIC_STADIA_API_KEY": "e8e5b311-aca1-481c-ae7a-5ad05deefc4c"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}
