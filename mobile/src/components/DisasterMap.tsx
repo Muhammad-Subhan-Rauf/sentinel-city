@@ -39,6 +39,12 @@ type Props = {
   // Called whenever the active-disaster list changes, so the parent screen
   // can surface a DANGER banner or other in-zone alerts.
   onDisastersChange?: (disasters: Disaster[]) => void;
+  // When false, the map skips fetching/rendering raw /api/disasters polygons
+  // and shows only AI-issued zones (notifications + cordons). Citizen and
+  // worker screens default to false — they should not surface decisions the
+  // AI hasn't published. Admin keeps the default (true) for situational
+  // awareness.
+  showRawDisasters?: boolean;
 };
 
 type PolygonItem = {
@@ -231,6 +237,7 @@ export function DisasterMap({
   onPolygonPress,
   pins,
   onDisastersChange,
+  showRawDisasters = true,
 }: Props) {
   const webviewRef = useRef<WebViewType | null>(null);
   const [ready, setReady] = useState(false);
@@ -247,9 +254,10 @@ export function DisasterMap({
         const [notifs, cordons, disasters, citizens, workers] = await Promise.all([
           api.listNotifications().catch(() => []),
           api.listCordons().catch(() => []),
-          // Live disaster footprints — citizens see these to know where the
-          // danger actually is, not just the operator-drawn evacuation polygon.
-          api.listDisasters().catch(() => []),
+          // Citizen / worker maps only show AI-issued zones — disasters are
+          // hidden until the AI publishes an alert about them. Admin opts in
+          // via showRawDisasters for situational awareness.
+          showRawDisasters ? api.listDisasters().catch(() => []) : Promise.resolve([]),
           showOtherUsers ? api.listCitizens().catch(() => []) : Promise.resolve([]),
           showOtherUsers ? api.listWorkers().catch(() => []) : Promise.resolve([]),
         ]);
@@ -270,7 +278,7 @@ export function DisasterMap({
       cancelled = true;
       clearInterval(handle);
     };
-  }, [showOtherUsers]);
+  }, [showOtherUsers, showRawDisasters]);
 
   const polygons = useMemo<PolygonItem[]>(() => {
     const merged: PolygonItem[] = [];

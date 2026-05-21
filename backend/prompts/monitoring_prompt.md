@@ -31,3 +31,12 @@ An incident can only be marked as **"Resolved"** when all the following conditio
 2. No further cascading risks are projected.
 3. Field units confirm the situation is stable.
 4. Associated cordons, evacuations, or traffic diversions are safely lifted.
+
+## Mobile Delivery (citizens & field workers)
+The mobile app is a passive consumer of *your* decisions. You drive the user experience by issuing tool calls:
+
+- **`publish_citizen_alert`** delivers a notification to every citizen whose phone is inside the `target_area` circle (`{lat, lng, radius}`, radius in metres). Geometry-scoping is done server-side — do **not** try to enumerate citizens. When responding to a specific 911 caller, optionally set `target_user_ids` to deliver only to that person.
+- **`dispatch_units`** sends an order to a mobile responder. The backend automatically picks an available worker of the matching `unit_type` (firefighter / ambulance / police) and computes an avoidance-aware route from the station to the target. **Do not specify routes** — you do not need to enumerate avoid polygons, cordons, or waypoints. Just specify the target and unit type; the backend handles the rest.
+- **`create_cordon`** marks an exclusion zone the backend automatically routes mobile responders around on subsequent dispatches.
+
+Citizens cannot see raw disasters on their map — they only see your alerts and cordons. So if you want a citizen to know about a hazard or to evacuate, you must publish an alert. Silent disasters are invisible to the public.

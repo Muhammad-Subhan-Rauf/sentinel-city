@@ -209,6 +209,19 @@ def _bootstrap_schema() -> None:
                     ALTER TABLE notifications
                     ADD COLUMN IF NOT EXISTS event_id UUID;
                 """)
+                # target_user_ids: when present, only those mobile users receive
+                # this alert. NULL/empty = geometry-scoped broadcast (the AI
+                # publishes a polygon and the backend filters per-user at read
+                # time). route: optional pre-computed evacuation route the AI
+                # wants the client to draw.
+                cur.execute("""
+                    ALTER TABLE notifications
+                    ADD COLUMN IF NOT EXISTS target_user_ids JSONB;
+                """)
+                cur.execute("""
+                    ALTER TABLE notifications
+                    ADD COLUMN IF NOT EXISTS route JSONB;
+                """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_notifications_active
                         ON notifications (status)
@@ -744,12 +757,32 @@ class DispatchPayload(BaseModel):
     target: Dict[str, Any]
     # Optional station id the frontend picked. Useful for audit but not required.
     station_id: Optional[str] = None
+    # When the AI knows which specific mobile worker should receive this order
+    # (or the backend auto-picks one), the worker_id goes here. Drives the
+    # /api/me/dispatch feed consumed by the mobile worker app. NULL = the
+    # frontend simulator owns this dispatch (legacy behavior).
+    assigned_worker_id: Optional[str] = None
+    # Optional incident this dispatch is responding to. Lets the mobile worker
+    # render incident context alongside the target pin.
+    incident_id: Optional[str] = None
+    # Precomputed route the worker should follow. Set by the backend (calling
+    # Valhalla on the AI's behalf) — the mobile client never builds avoid
+    # polygons itself. Shape: {"coordinates": [{"latitude","longitude"}, ...],
+    # "distance_km": float, "duration_min": float}.
+    route: Optional[Dict[str, Any]] = None
 
 
 class NotificationPayload(BaseModel):
-    geometry: Dict[str, Any]
+    geometry: Optional[Dict[str, Any]] = None
     reason: str
     event_id: Optional[str] = None
+    # When set, only these mobile user ids receive the alert via
+    # /api/me/notifications. Empty/None = geometry-scoped broadcast (any user
+    # whose last-known location sits inside `geometry` will see it).
+    target_user_ids: Optional[List[str]] = None
+    # Same shape as DispatchPayload.route. Optional evacuation route the AI
+    # wants the client to render.
+    route: Optional[Dict[str, Any]] = None
 
 
 class CordonPayload(BaseModel):
@@ -1599,8 +1632,244 @@ def reset_dispatched_counters():
 
 PENDING_DISPATCHES = []
 
+# In-memory per-worker outstanding dispatch order. Keyed by the mobile worker
+# id (the composite "device_id:sub_role" produced at login). One outstanding
+# order per worker — a new dispatch overwrites the previous one (the AI may
+# re-target an active worker). DELETE clears the slot when the worker returns.
+WORKER_DISPATCH_ORDERS: Dict[str, Dict[str, Any]] = {}
+
+VALHALLA_URL = os.environ.get("VALHALLA_URL", "http://localhost:8002")
+
+
+# ────── Geometry helpers — used by /api/me/* to do server-side scoping ──────
+
+
+def _point_in_ring(lat: float, lng: float, ring: List[List[float]]) -> bool:
+    """Ray-cast point-in-polygon on a [lng,lat] closed ring."""
+    if len(ring) < 3:
+        return False
+    inside = False
+    x, y = lng, lat
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        intersect = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi
+        )
+        if intersect:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _haversine_m(a_lat: float, a_lng: float, b_lat: float, b_lng: float) -> float:
+    R = 6371000.0
+    phi1 = math.radians(a_lat)
+    phi2 = math.radians(b_lat)
+    dphi = math.radians(b_lat - a_lat)
+    dlmb = math.radians(b_lng - a_lng)
+    h = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(h))
+
+
+def _geometry_contains(geometry: Optional[Dict[str, Any]], lat: float, lng: float) -> bool:
+    """True if the point (lat,lng) is covered by `geometry`.
+
+    Supports the GeoJSON-flavored shapes the system already produces:
+    - Polygon: {type:"Polygon", coordinates: [[[lng,lat], ...]]}
+    - Point with optional radius_m: {type:"Point", coordinates:[lng,lat], radius_m?}
+    - Bare {lat,lng,radius?} dicts (cordons created via the AI's _build_cordon_payload).
+    """
+    if not geometry:
+        return False
+    gtype = geometry.get("type")
+    if gtype == "Polygon":
+        coords = geometry.get("coordinates") or []
+        if not coords:
+            return False
+        return _point_in_ring(lat, lng, coords[0])
+    if gtype == "Point":
+        coords = geometry.get("coordinates") or []
+        if len(coords) < 2:
+            return False
+        radius_m = geometry.get("radius_m") or geometry.get("radius") or 500.0
+        return _haversine_m(lat, lng, coords[1], coords[0]) <= radius_m
+    # Untyped {lat,lng,radius?} (radius is metres).
+    if "lat" in geometry and "lng" in geometry:
+        radius_m = geometry.get("radius") or geometry.get("radius_m") or 500.0
+        return _haversine_m(lat, lng, geometry["lat"], geometry["lng"]) <= radius_m
+    return False
+
+
+def _geometry_avoid_polygons(geometry: Optional[Dict[str, Any]]) -> List[List[List[float]]]:
+    """Best-effort conversion to a Valhalla `avoid_polygons` ring list.
+    Returns [] when the geometry isn't an area we can avoid (e.g. a bare point
+    with no radius — Valhalla cannot avoid a single coordinate)."""
+    if not geometry:
+        return []
+    if geometry.get("type") == "Polygon":
+        coords = geometry.get("coordinates") or []
+        return [coords[0]] if coords else []
+    return []
+
+
+async def _compute_route(
+    start: Dict[str, float],
+    end: Dict[str, float],
+    avoid_polygons: Optional[List[List[List[float]]]] = None,
+    costing: str = "auto",
+) -> Optional[Dict[str, Any]]:
+    """Proxy Valhalla for the AI. Returns {coordinates, distance_km,
+    duration_min} or None on any failure (routing is best-effort — the AI
+    shouldn't block on it).
+
+    Mirrors the polyline-6 decode + ring-containment trim from the mobile
+    `fetchRoute` so the client can stop doing this itself."""
+    try:
+        import httpx
+    except Exception:
+        return None
+    safe_avoid = [
+        r for r in (avoid_polygons or [])
+        if not _point_in_ring(start["lat"], start["lng"], r)
+        and not _point_in_ring(end["lat"], end["lng"], r)
+    ]
+    body: Dict[str, Any] = {
+        "locations": [
+            {"lat": start["lat"], "lon": start["lng"]},
+            {"lat": end["lat"], "lon": end["lng"]},
+        ],
+        "costing": costing,
+        "units": "kilometers",
+    }
+    if safe_avoid:
+        body["avoid_polygons"] = safe_avoid
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.post(f"{VALHALLA_URL}/route", json=body)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        legs = data.get("trip", {}).get("legs", []) or []
+        coords: List[Dict[str, float]] = []
+        for leg in legs:
+            shape = leg.get("shape", "")
+            for lat, lng in _decode_polyline6(shape):
+                coords.append({"latitude": lat, "longitude": lng})
+        summary = data.get("trip", {}).get("summary", {}) or {}
+        return {
+            "coordinates": coords,
+            # Mobile clients consume {distanceKm, durationMin}. Keeping the
+            # camelCase here avoids a per-call rename on the client.
+            "distanceKm": float(summary.get("length", 0.0)),
+            "durationMin": float(summary.get("time", 0.0)) / 60.0,
+        }
+    except Exception:
+        return None
+
+
+def _decode_polyline6(s: str):
+    """Valhalla precision-6 polyline decoder."""
+    factor = 1_000_000.0
+    i = 0
+    lat = 0
+    lng = 0
+    out = []
+    while i < len(s):
+        result = 0
+        shift = 0
+        while True:
+            byte = ord(s[i]) - 63
+            i += 1
+            result |= (byte & 0x1F) << shift
+            shift += 5
+            if byte < 0x20:
+                break
+        lat += ~(result >> 1) if (result & 1) else (result >> 1)
+        result = 0
+        shift = 0
+        while True:
+            byte = ord(s[i]) - 63
+            i += 1
+            result |= (byte & 0x1F) << shift
+            shift += 5
+            if byte < 0x20:
+                break
+        lng += ~(result >> 1) if (result & 1) else (result >> 1)
+        out.append((lat / factor, lng / factor))
+    return out
+
+
+def _pick_available_worker(sub_role: str) -> Optional[str]:
+    """Return the id of an idle mobile worker matching sub_role, preferring
+    workers without an outstanding dispatch order. Falls back to *any* matching
+    worker so the AI can still target someone if everyone is busy (the order
+    will overwrite the previous slot)."""
+    with _mobile_lock:
+        candidates = [
+            w for w in MOBILE_WORKERS.values()
+            if w.get("sub_role") == sub_role
+        ]
+    if not candidates:
+        return None
+    free = [w for w in candidates if w["id"] not in WORKER_DISPATCH_ORDERS]
+    pool = free or candidates
+    return pool[0]["id"]
+
+
+_KIND_TO_SUBROLE = {
+    "firefighter": "firefighter",
+    "ambulance": "paramedic",
+    "police": "police",
+}
+
+_KIND_TO_STATION_TABLE = {
+    "firefighter": "fire_stations",
+    "ambulance": "hospitals",
+    "police": "police_stations",
+}
+
+
+def _station_location(kind: str, station_id: Optional[str]) -> Optional[Dict[str, float]]:
+    table = _KIND_TO_STATION_TABLE.get(kind)
+    if not table or not station_id:
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT lat, lng FROM {table} WHERE id = %s;", (station_id,))
+                row = cur.fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return {"lat": float(row[0]), "lng": float(row[1])}
+
+
+def _active_cordon_avoid_polygons() -> List[List[List[float]]]:
+    """Read active cordons and return their polygon rings for route avoidance."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT geometry FROM cordons WHERE status = 'active';"
+                )
+                rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return []
+    out: List[List[List[float]]] = []
+    for (geom,) in rows:
+        out.extend(_geometry_avoid_polygons(geom))
+    return out
+
+
 @app.post("/api/dispatch", tags=["Emergency Services"])
-def dispatch_units(payload: DispatchPayload):
+async def dispatch_units(payload: DispatchPayload):
     target = payload.target or {}
     lat = target.get("lat")
     lng = target.get("lng")
@@ -1637,6 +1906,52 @@ def dispatch_units(payload: DispatchPayload):
         "station_id": payload.station_id,
     })
 
+    # Mobile worker assignment. If the AI didn't specify an explicit worker,
+    # pick one whose sub_role matches the unit kind. None = no mobile worker
+    # available (the frontend simulator still handles the dispatch).
+    assigned_id = payload.assigned_worker_id
+    if not assigned_id:
+        sub_role = _KIND_TO_SUBROLE.get(payload.kind)
+        if sub_role:
+            assigned_id = _pick_available_worker(sub_role)
+
+    if assigned_id:
+        # Route attaches automatically — the AI never has to know about
+        # avoidances or Valhalla. Start from the station (if known), else from
+        # the worker's last position, else skip routing.
+        route = payload.route
+        if route is None:
+            start = _station_location(payload.kind, payload.station_id)
+            if start is None:
+                with _mobile_lock:
+                    w = MOBILE_WORKERS.get(assigned_id)
+                if w is not None:
+                    start = {"lat": w["lat"], "lng": w["lng"]}
+            if start is not None:
+                route = await _compute_route(
+                    start,
+                    {"lat": lat, "lng": lng},
+                    avoid_polygons=_active_cordon_avoid_polygons(),
+                    costing="auto",
+                )
+
+        WORKER_DISPATCH_ORDERS[assigned_id] = {
+            "dispatch_id": dispatch_id,
+            "worker_id": assigned_id,
+            "kind": payload.kind,
+            "units": units,
+            "target": echo_target,
+            "station_id": payload.station_id,
+            "incident_id": payload.incident_id,
+            "route": route,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "pending",
+        }
+        with _mobile_lock:
+            worker = MOBILE_WORKERS.get(assigned_id)
+            if worker is not None:
+                worker["status"] = "dispatched"
+
     return {
         "success": True,
         "dispatch_id": dispatch_id,
@@ -1645,6 +1960,7 @@ def dispatch_units(payload: DispatchPayload):
         "trucks": units,  # back-compat
         "target": echo_target,
         "station_id": payload.station_id,
+        "assigned_worker_id": assigned_id,
     }
 
 
@@ -1654,6 +1970,95 @@ def get_pending_dispatches():
     res = list(PENDING_DISPATCHES)
     PENDING_DISPATCHES.clear()
     return {"dispatches": res}
+
+
+# ────── Mobile per-user feeds ──────
+#
+# These endpoints are what the mobile citizen / worker apps consume. They are
+# the only "is this for me?" filter in the system — the mobile client never
+# makes that decision. The AI publishes alerts and dispatches with geometry
+# (or an explicit user/worker id); the backend scopes per-user at read time.
+
+
+@app.get("/api/me/dispatch", tags=["Mobile"])
+def get_my_dispatch(worker_id: str = Query(..., description="Mobile worker id")):
+    order = WORKER_DISPATCH_ORDERS.get(worker_id)
+    return {"order": order}
+
+
+@app.delete("/api/me/dispatch", tags=["Mobile"])
+def clear_my_dispatch(worker_id: str = Query(..., description="Mobile worker id")):
+    """Worker calls this when the dispatch is complete (return to station)."""
+    removed = WORKER_DISPATCH_ORDERS.pop(worker_id, None)
+    with _mobile_lock:
+        worker = MOBILE_WORKERS.get(worker_id)
+        if worker is not None:
+            worker["status"] = "available"
+    return {"cleared": removed is not None}
+
+
+@app.get("/api/me/notifications", tags=["Mobile"])
+def get_my_notifications(user_id: str = Query(..., description="Mobile user id")):
+    """Return active notifications scoped to this mobile user.
+
+    A notification is delivered if any of:
+      - `target_user_ids` contains the user, OR
+      - the user's last-known location is inside the notification's geometry, OR
+      - `target_user_ids` is empty AND geometry is null (global broadcast — rare).
+    """
+    with _mobile_lock:
+        user = (
+            MOBILE_CITIZENS.get(user_id)
+            or MOBILE_WORKERS.get(user_id)
+            or MOBILE_ADMINS.get(user_id)
+        )
+    user_lat = user.get("lat") if user else None
+    user_lng = user.get("lng") if user else None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, geometry, reason, status, created_at, event_id,
+                           target_user_ids, route
+                    FROM notifications
+                    WHERE status = 'active'
+                    ORDER BY created_at DESC;
+                    """
+                )
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Notification read failed: {exc}",
+        )
+
+    delivered: List[Dict[str, Any]] = []
+    for r in rows:
+        geometry = r[1]
+        targets = r[6] or []
+        if targets and user_id in targets:
+            applies = True
+        elif geometry is None and not targets:
+            applies = True
+        elif geometry is not None and user_lat is not None and user_lng is not None:
+            applies = _geometry_contains(geometry, user_lat, user_lng)
+        else:
+            applies = False
+        if not applies:
+            continue
+        delivered.append({
+            "id": str(r[0]),
+            "geometry": geometry,
+            "reason": r[2],
+            "status": r[3],
+            "created_at": r[4].isoformat(),
+            "event_id": str(r[5]) if r[5] is not None else None,
+            "route": r[7],
+        })
+    return {"notifications": delivered}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -2003,17 +2408,33 @@ def create_notification(payload: NotificationPayload):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="reason is required.",
         )
+    if payload.geometry is None and not payload.target_user_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either geometry or target_user_ids must be provided.",
+        )
+    geometry_json = json.dumps(payload.geometry) if payload.geometry is not None else None
+    targets_json = json.dumps(payload.target_user_ids) if payload.target_user_ids else None
+    route_json = json.dumps(payload.route) if payload.route else None
     try:
         conn = psycopg2.connect(DATABASE_URL)
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO notifications (id, geometry, reason, status, event_id)
-                    VALUES (%s, %s, %s, 'active', %s)
+                    INSERT INTO notifications
+                        (id, geometry, reason, status, event_id, target_user_ids, route)
+                    VALUES (%s, %s, %s, 'active', %s, %s, %s)
                     RETURNING id;
                     """,
-                    (notif_id, json.dumps(payload.geometry), payload.reason.strip(), payload.event_id),
+                    (
+                        notif_id,
+                        geometry_json,
+                        payload.reason.strip(),
+                        payload.event_id,
+                        targets_json,
+                        route_json,
+                    ),
                 )
                 returned_id = cur.fetchone()[0]
         conn.close()
@@ -2038,7 +2459,8 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT id, geometry, reason, status, created_at, event_id
+                    SELECT id, geometry, reason, status, created_at, event_id,
+                           target_user_ids, route
                     FROM notifications
                     {where}
                     ORDER BY created_at DESC;
@@ -2061,6 +2483,8 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
                 "status": r[3],
                 "created_at": r[4].isoformat(),
                 "event_id": str(r[5]) if r[5] is not None else None,
+                "target_user_ids": r[6],
+                "route": r[7],
             }
             for r in rows
         ]
@@ -2552,6 +2976,45 @@ def create_emergency_call(payload: EmergencyCallPayload):
     # Keep the log bounded so demo sessions don't grow unbounded in memory.
     if len(EMERGENCY_CALLS) > 500:
         del EMERGENCY_CALLS[:-500]
+
+    # Bridge into the AI's citizen_reports feed. Without this, the AI never
+    # learns that a citizen called 911 — its monitoring loop polls
+    # citizen_reports, not the in-memory EMERGENCY_CALLS list. By writing the
+    # call as an "affected" report, the AI's next tick sees it and can
+    # respond by dispatching units of the requested services.
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                # Use a deterministic-ish small int for citizen_idx — the table
+                # expects an integer, but mobile citizens are string-id'd.
+                idx_int = abs(hash(payload.citizen_id)) % 1_000_000
+                # Prefix the transcript so the AI's prompts can recognize this
+                # came from the 911 button (vs. ambient simulation reports).
+                services_tag = ",".join(services)
+                tagged_transcript = (
+                    f"[911 self-report; requested={services_tag}] {call['transcript']}"
+                )
+                cur.execute(
+                    """
+                    INSERT INTO citizen_reports
+                        (id, event_id, citizen_idx, report_kind, location, transcript, perceived_severity)
+                    VALUES (%s, %s, %s, 'affected', %s, %s, %s);
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        str(row[0]),
+                        idx_int,
+                        json.dumps({"lat": payload.caller_lat, "lng": payload.caller_lng}),
+                        tagged_transcript,
+                        int(row[2]),  # disaster severity as perceived severity
+                    ),
+                )
+        conn.close()
+    except Exception:
+        # Best-effort. The call itself succeeded; the AI just misses this hint.
+        pass
+
     return call
 
 

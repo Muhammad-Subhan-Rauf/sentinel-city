@@ -1,8 +1,7 @@
-// Worker-side 911 call log. Each worker sub-role (police / firefighter /
-// paramedic) sees only the calls whose requested_services include their
-// service. When a worker taps "Acknowledge", we PATCH the backend AND push
-// a dispatch target into the local pub-sub — the worker's Map tab subscribes
-// and auto-routes them to the caller's location.
+// Worker-side 911 call log. Read-only view of citizen-placed emergency calls
+// scoped by service. Acknowledging a call is just a status update — the AI
+// monitoring loop owns the actual dispatch decision and pushes orders via
+// /api/me/dispatch (consumed by WorkerMapScreen). This screen does NOT route.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -18,7 +17,6 @@ import {
 } from 'react-native';
 import { Swipeable, GestureHandlerRootView } from 'react-native-gesture-handler';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useNavigation } from '@react-navigation/native';
 import { Screen } from '@/components/Screen';
 import {
   api,
@@ -28,7 +26,6 @@ import {
 } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { colors } from '@/lib/colors';
-import { setDispatchTarget, scopeKeyFor } from '@/lib/dispatchTarget';
 
 const POLL_MS = 4000;
 
@@ -60,7 +57,6 @@ function formatTime(iso: string): string {
 
 export default function WorkerCallLogsScreen() {
   const { session } = useAuth();
-  const navigation = useNavigation<any>();
   const [calls, setCalls] = useState<EmergencyCall[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -160,9 +156,11 @@ export default function WorkerCallLogsScreen() {
     return () => clearInterval(handle);
   }, [load]);
 
-  // Acknowledge then push a dispatch target so the Map tab routes to the
-  // caller. Also jumps the user to the Map tab so they can see their route.
-  const acknowledgeAndRoute = async (call: EmergencyCall) => {
+  // Status updates only. The worker tells the system "I see this call" — the
+  // actual dispatch (target, route, units) is the AI's call and arrives via
+  // /api/me/dispatch on the Map tab. This avoids the client picking which
+  // worker takes which call.
+  const acknowledge = async (call: EmergencyCall) => {
     if (!session) return;
     setBusyId(call.id);
     try {
@@ -172,25 +170,6 @@ export default function WorkerCallLogsScreen() {
         sub_role: subRole as 'paramedic' | 'police' | 'firefighter',
       });
       setCalls((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
-      // Per-(device + sub_role) latch — firefighters / paramedics / police
-      // on the same phone each have their own slot, so signing into another
-      // sub-role doesn't inherit this dispatch.
-      const scope = scopeKeyFor(session.userId, subRole);
-      setDispatchTarget(scope, {
-        callId: updated.id,
-        lat: updated.caller_lat,
-        lng: updated.caller_lng,
-        label: `${updated.citizen_name} · ${updated.disaster_type.replace(/_/g, ' ')} sev ${updated.severity}`,
-        caller_name: updated.citizen_name,
-        disaster_type: updated.disaster_type,
-        severity: updated.severity,
-      });
-      // Switch to Map so the responding worker sees the live route.
-      try {
-        navigation.navigate('Map');
-      } catch {
-        /* not in a nav context; fine */
-      }
     } catch {
       /* surface inline later */
     } finally {
@@ -204,10 +183,6 @@ export default function WorkerCallLogsScreen() {
     try {
       const updated = await api.updateEmergencyCall(call.id, { status: 'closed' });
       setCalls((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
-      // Only clear *this* worker's dispatch latch — other sub-roles on the
-      // same device keep their own state.
-      const scope = scopeKeyFor(session.userId, subRole);
-      setDispatchTarget(scope, null);
     } catch {
       /* ignore */
     } finally {
@@ -441,10 +416,10 @@ export default function WorkerCallLogsScreen() {
                   {!meAcknowledged && (
                     <Pressable
                       disabled={busy}
-                      onPress={() => acknowledgeAndRoute(item)}
+                      onPress={() => acknowledge(item)}
                       style={[styles.actionBtn, styles.ackBtn, busy && styles.actionBtnDisabled]}
                     >
-                      <Text style={styles.actionBtnText}>Acknowledge + Route to caller</Text>
+                      <Text style={styles.actionBtnText}>Acknowledge</Text>
                     </Pressable>
                   )}
                   {meAcknowledged && (

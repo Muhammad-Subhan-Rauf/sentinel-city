@@ -116,6 +116,25 @@ export type Notification = {
   status: 'active' | 'cleared';
   created_at: string;
   event_id: string | null;
+  // AI-attached fields. Present on AI-issued alerts (publish_citizen_alert).
+  // Operator-drawn legacy alerts may omit them.
+  route?: Route | null;
+  target_user_ids?: string[] | null;
+};
+
+// Per-worker dispatch order issued by the AI's dispatch_units tool.
+// Delivered to the assigned mobile worker via GET /api/me/dispatch?worker_id=X.
+export type DispatchOrder = {
+  dispatch_id: string;
+  worker_id: string;
+  kind: 'firefighter' | 'ambulance' | 'police';
+  units: number;
+  target: { lat: number; lng: number; radius?: number };
+  station_id: string | null;
+  incident_id: string | null;
+  route: Route | null;
+  created_at: string;
+  status: 'pending' | 'acknowledged' | 'completed';
 };
 
 // Emergency service types a citizen can request when placing a 911 call.
@@ -238,7 +257,9 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  // Hazards & alerts
+  // Hazards & alerts (ADMIN-ONLY — citizen/worker screens MUST use the
+  // per-user `getMyNotifications` feed instead; raw lists leak AI decisions
+  // to clients that shouldn't be making them).
   listNotifications: () =>
     request<{ notifications: Notification[] }>('/api/notifications?status_filter=active').then(
       (r) => r.notifications
@@ -246,10 +267,28 @@ export const api = {
   listCordons: () =>
     request<{ cordons: Cordon[] }>('/api/cordons?status_filter=active').then((r) => r.cordons),
 
-  // Disasters
+  // Disasters (ADMIN-ONLY — see note above).
   listDisasters: () =>
     request<{ disasters: Disaster[] }>('/api/disasters').then((r) => r.disasters),
   getDisaster: (id: string) => request<Disaster>(`/api/disasters/${id}`),
+
+  // Mobile per-user feeds. These are the *only* sources of AI-issued alerts
+  // and dispatch orders for citizen/worker screens — the backend scopes per
+  // user (geometry intersection + explicit target lists) so the client never
+  // decides "is this for me?".
+  getMyNotifications: (userId: string) =>
+    request<{ notifications: Notification[] }>(
+      `/api/me/notifications?user_id=${encodeURIComponent(userId)}`
+    ).then((r) => r.notifications),
+  getMyDispatch: (workerId: string) =>
+    request<{ order: DispatchOrder | null }>(
+      `/api/me/dispatch?worker_id=${encodeURIComponent(workerId)}`
+    ).then((r) => r.order),
+  clearMyDispatch: (workerId: string) =>
+    request<{ cleared: boolean }>(
+      `/api/me/dispatch?worker_id=${encodeURIComponent(workerId)}`,
+      { method: 'DELETE' }
+    ),
 
   // Citizen reports (admin Calls screen)
   listCitizenReports: (limit = 100) =>

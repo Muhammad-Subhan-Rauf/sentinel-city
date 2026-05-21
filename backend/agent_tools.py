@@ -28,6 +28,7 @@ from tools import (
     _build_cordon_payload,
     _build_disaster_payload,
     _build_disaster_update_payload,
+    _circle_to_geojson_polygon,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,14 @@ class PublishCitizenAlertArgs(_AllowExtra):
     incident_id: str
     message: str
     severity: str
+    # Circular area the alert applies to. Citizens whose last-known location
+    # falls inside this circle will receive the alert via /api/me/notifications.
     target_area: Optional[_LatLngRadius] = None
+    # Optional: deliver only to these specific mobile user ids (e.g. when
+    # responding to a 911 caller). When set, target_area is used purely for
+    # rendering the affected zone on the recipient's map — geometry-based
+    # broadcast scoping is skipped.
+    target_user_ids: Optional[List[str]] = None
 
 
 class RetractCitizenAlertArgs(_AllowExtra):
@@ -105,6 +113,10 @@ class DispatchUnitsArgs(_AllowExtra):
     unit_type: str = Field(..., description="firefighter, ambulance, or police")
     count: int
     target: _LatLng = Field(..., description="Dispatch target {lat, lng}")
+    # Optional mobile worker id (the composite "device_id:sub_role" produced
+    # at login) that should receive this dispatch order on their phone. Omit
+    # to let the backend pick an available worker of the matching sub_role.
+    assigned_worker_id: Optional[str] = None
 
 
 class _DispatchItem(_AllowExtra):
@@ -234,10 +246,30 @@ def build_tools(api: Any, audit_logger: Any, gemini_client: Any, agent_id: str) 
     # ─── Citizen alerts & cordons ───────────────────────────────────
 
     async def _publish_citizen_alert(args: Dict[str, Any]) -> Any:
+        # The agent calls this with {incident_id, message, severity,
+        # target_area?, target_user_ids?}. Translate into the backend's
+        # NotificationPayload {geometry, reason, event_id, target_user_ids,
+        # route} so the mobile clients can render it without doing any
+        # filtering themselves — the backend's /api/me/notifications takes
+        # care of scoping per user.
         ta = args.get("target_area")
         if hasattr(ta, "model_dump"):
-            args = {**args, "target_area": ta.model_dump()}
-        return await api.notify(args)
+            ta = ta.model_dump()
+        geometry: Optional[Dict[str, Any]] = None
+        if ta and "lat" in ta and "lng" in ta:
+            radius = float(ta.get("radius") or 500.0)
+            geometry = _circle_to_geojson_polygon(
+                float(ta["lat"]), float(ta["lng"]), radius
+            )
+        targets = args.get("target_user_ids") or None
+        payload: Dict[str, Any] = {
+            "geometry": geometry,
+            "reason": args.get("message") or "",
+            "event_id": args.get("incident_id"),
+        }
+        if targets:
+            payload["target_user_ids"] = list(targets)
+        return await api.notify(payload)
 
     async def _retract_citizen_alert(args: Dict[str, Any]) -> Any:
         if not args.get("alert_id"):
@@ -282,7 +314,10 @@ def build_tools(api: Any, audit_logger: Any, gemini_client: Any, agent_id: str) 
             "units": args["count"],
             "target": target,
             "station_id": args["station_id"],
+            "incident_id": args.get("incident_id"),
         }
+        if args.get("assigned_worker_id"):
+            payload["assigned_worker_id"] = args["assigned_worker_id"]
         return await api.dispatch(payload)
 
     async def _multi_station_dispatch(args: Dict[str, Any]) -> Any:
@@ -305,6 +340,7 @@ def build_tools(api: Any, audit_logger: Any, gemini_client: Any, agent_id: str) 
                 "units": d["count"],
                 "target": target,
                 "station_id": d["station_id"],
+                "incident_id": incident_id,
             })
             results.append(res)
         return results
@@ -345,14 +381,24 @@ _DESCRIPTIONS: Dict[str, str] = {
     "declare_incident": "Declare a new incident or disaster. Use only when no matching incident already exists.",
     "update_incident": "Update an existing incident (status, severity, or notes).",
     "clear_incident": "Mark an incident as resolved and remove it.",
-    "publish_citizen_alert": "Publish a public alert to citizens about an incident.",
+    "publish_citizen_alert": (
+        "Publish a public alert to citizens about an incident. Provide a "
+        "target_area {lat, lng, radius_m} circle — every citizen whose phone "
+        "is inside this circle receives the alert on their mobile app. "
+        "Optionally provide target_user_ids to deliver to specific recipients "
+        "(e.g. a 911 caller). The backend handles all per-user delivery — "
+        "do not try to enumerate citizens yourself."
+    ),
     "retract_citizen_alert": "Retract an existing citizen alert.",
     "create_cordon": "Create a circular cordon (exclusion zone) around an incident location.",
     "clear_cordon": "Clear an existing cordon.",
     "dispatch_units": (
-        "Dispatch emergency units (firefighter, ambulance, or police) to an incident "
-        "from a single station. The target must be the incident's real coordinates, "
-        "never {lat:0, lng:0}."
+        "Dispatch emergency units (firefighter, ambulance, or police) to an "
+        "incident from a single station. The target must be the incident's "
+        "real coordinates, never {lat:0, lng:0}. The backend assigns the "
+        "order to an available mobile worker of the matching sub-role and "
+        "attaches an avoidance-aware route automatically — you do not need to "
+        "specify routes or which specific worker should respond."
     ),
     "multi_station_dispatch": (
         "Dispatch units from multiple stations simultaneously to one incident. "
