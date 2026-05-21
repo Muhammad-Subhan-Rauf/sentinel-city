@@ -43,35 +43,20 @@ services:
       - orchestrator_logs:/app/logs
       - ./backend/vertex-sa.json:/app/vertex-sa.json:ro
 
-  # ── Valhalla routing engine ─────────────────────────────────
-  # Place one or more .osm.pbf files in ./valhalla/data/ before first launch.
-  # The container detects new PBFs and rebuilds tiles on startup.
-  valhalla:
-    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
-    restart: unless-stopped
-    environment:
-      tile_urls: ""              # disable auto-download; we supply local PBFs
-      use_tiles_ignore_pbf: True # reuse tiles built from previously-seen PBFs
-      build_admins: True
-      build_elevation: False
-      build_time_zones: False
-      server_threads: 2
-    volumes:
-      - ./valhalla/data:/custom_files
-    ports:
-      - "8002:8002"
-
   # ── Nginx-served React SPA ──────────────────────────────────
+  # Routing is delegated to Stadia Maps' hosted Valhalla service. The API
+  # key is passed as a build arg (read from the host env or a .env file
+  # at the project root) so it doesn't get committed to source control.
   frontend:
     build:
       context: ./frontend
       args:
         VITE_BACKEND_URL: ""
-        VITE_VALHALLA_URL: "/valhalla"
+        VITE_VALHALLA_URL: "https://api.stadiamaps.com"
+        VITE_STADIA_API_KEY: "${VITE_STADIA_API_KEY:-}"
     restart: unless-stopped
     depends_on:
       - backend
-      - valhalla
     ports:
       - "8080:80"
 

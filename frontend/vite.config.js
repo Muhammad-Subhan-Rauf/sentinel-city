@@ -11,13 +11,8 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
-      // Valhalla routing engine (running on host via Docker).
-      // Strip the /valhalla prefix so the upstream sees /route, /status, etc.
-      '/valhalla': {
-        target: 'http://localhost:8002',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/valhalla/, ''),
-      },
+      // Routing now goes directly to Stadia Maps (api.stadiamaps.com) —
+      // no local proxy needed. See VITE_VALHALLA_URL in .env.
     },
   },
 })

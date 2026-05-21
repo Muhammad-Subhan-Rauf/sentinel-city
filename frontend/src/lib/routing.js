@@ -1,10 +1,13 @@
-// ─── Routing helper for self-hosted Valhalla ───────────────────
-// Targets a local Valhalla server (defaults to http://localhost:8002).
-// Override via VITE_VALHALLA_URL in .env.
+// ─── Routing helper (Stadia Maps Valhalla) ─────────────────────
+// Targets Stadia's hosted Valhalla service. Override via VITE_VALHALLA_URL
+// + VITE_STADIA_API_KEY in .env. The API key is appended as a query param
+// on the route call — it'll be visible in the bundle (Stadia's standard
+// client-side model), so don't reuse this key for anything sensitive.
 
 import { getBlockingRadius } from './disasterProfiles'
 
-const VALHALLA_URL = import.meta.env.VITE_VALHALLA_URL ?? '/valhalla'
+const VALHALLA_URL = import.meta.env.VITE_VALHALLA_URL ?? 'https://api.stadiamaps.com'
+const STADIA_API_KEY = import.meta.env.VITE_STADIA_API_KEY ?? ''
 
 // Decode a Valhalla polyline (precision 6 by default — Valhalla uses polyline6).
 export function decodePolyline(encoded, precision = 6) {
@@ -122,9 +125,9 @@ export async function requestRoute({ start, end, zones = [], signal }) {
     directions_options: { units: 'kilometers' },
   }
   const avoid = zonesToAvoidPolygons(zones)
-  if (avoid.length > 0) body.avoid_polygons = avoid
+  if (avoid.length > 0) body.exclude_polygons = avoid
 
-  const res = await fetch(`${VALHALLA_URL}/route`, {
+  const res = await fetch(`${VALHALLA_URL}/route/v1?api_key=${STADIA_API_KEY}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

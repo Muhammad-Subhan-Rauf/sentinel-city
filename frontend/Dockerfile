@@ -3,13 +3,16 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Build-time env vars baked into the bundle. Empty BACKEND_URL +
-# /valhalla prefix mean every API call is relative to the page origin,
-# which nginx then proxies internally to the right service.
+# Build-time env vars baked into the bundle. Empty BACKEND_URL keeps
+# backend calls relative to the page origin (nginx proxies internally).
+# Routing now hits Stadia Maps directly with an API key — supply it via
+# the VITE_STADIA_API_KEY build arg or it'll be missing from the bundle.
 ARG VITE_BACKEND_URL=""
-ARG VITE_VALHALLA_URL="/valhalla"
+ARG VITE_VALHALLA_URL="https://api.stadiamaps.com"
+ARG VITE_STADIA_API_KEY=""
 ENV VITE_BACKEND_URL=$VITE_BACKEND_URL \
-    VITE_VALHALLA_URL=$VITE_VALHALLA_URL
+    VITE_VALHALLA_URL=$VITE_VALHALLA_URL \
+    VITE_STADIA_API_KEY=$VITE_STADIA_API_KEY
 
 COPY package*.json ./
 RUN npm ci

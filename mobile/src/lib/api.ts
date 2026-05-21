@@ -38,9 +38,16 @@ const BACKEND_URL: string =
 
 const VALHALLA_URL: string =
   (process.env.EXPO_PUBLIC_VALHALLA_URL as string | undefined) ??
-  (devHost ? `http://${devHost}:8002` : undefined) ??
   (Constants.expoConfig?.extra as any)?.valhallaUrl ??
-  'http://localhost:8002';
+  'https://api.stadiamaps.com';
+
+// Stadia API key — appended as a query param on the route call. Public
+// (will end up in the APK bundle). Stadia's security model is rate-limits
+// + optional origin allow-list, not key secrecy.
+const STADIA_API_KEY: string =
+  (process.env.EXPO_PUBLIC_STADIA_API_KEY as string | undefined) ??
+  (Constants.expoConfig?.extra as any)?.stadiaApiKey ??
+  '';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
@@ -396,18 +403,18 @@ export async function fetchRoute(
     ],
     costing,
     units: 'kilometers',
-    ...(safeAvoid.length > 0 ? { avoid_polygons: safeAvoid } : {}),
+    ...(safeAvoid.length > 0 ? { exclude_polygons: safeAvoid } : {}),
   };
   let res: Response;
   try {
-    res = await fetch(`${VALHALLA_URL}/route`, {
+    res = await fetch(`${VALHALLA_URL}/route/v1?api_key=${STADIA_API_KEY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
   } catch (e: any) {
     throw new Error(
-      `Cannot reach routing service at ${VALHALLA_URL}. Start the Valhalla container (\`docker compose up valhalla\`) and ensure port 8002 is reachable from your phone. (${e?.message ?? 'network error'})`,
+      `Cannot reach routing service at ${VALHALLA_URL}. Verify EXPO_PUBLIC_STADIA_API_KEY is set and your network is reachable. (${e?.message ?? 'network error'})`,
     );
   }
   if (!res.ok) {
