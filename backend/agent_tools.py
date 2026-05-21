@@ -496,24 +496,30 @@ def build_tools(
             args = {**args, "location": loc.model_dump()}
         payload = _build_disaster_payload(args)
 
-        # Dedup: if there's already an active disaster of the same type
-        # within DECLARE_DEDUP_RADIUS_M of this location, surface IT instead
-        # of creating a new one. The AI's triangulation tends to land within
-        # a few hundred metres of an existing event whose citizen-report
-        # cluster the AI just rediscovered.
+        # Dedup: block this declare if there's already an active same-type
+        # incident within DECLARE_DEDUP_RADIUS_M, OR a recently-cleared one
+        # within the cool-down window. The second case prevents the
+        # "AI re-spawns the fire the operator just cleared" failure mode —
+        # citizen reports stay in the buffer for a while after clearance and
+        # the AI's triangulator would otherwise resurrect them.
         DECLARE_DEDUP_RADIUS_M = 800.0
+        DECLARE_POST_CLEAR_COOLDOWN_S = 1800.0  # 30 min
         try:
+            from datetime import datetime as _dt, timezone as _tz
             new_lat = float(args["location"]["lat"])
             new_lng = float(args["location"]["lng"])
             new_type = str(payload.get("disaster_type", "")).strip().lower()
-            existing = await api.get_disasters()
+            # Pull all disasters (active + cleared) for the cool-down check.
+            existing = await api._request("GET", "/api/disasters?status_filter=all")
             existing_list = existing if isinstance(existing, list) else (existing or {}).get("disasters", [])
             from routing.coord_fallback import _coords_from_geometry as _xy
             from baseline.rule_engine import haversine as _hav
+            now = _dt.now(_tz.utc)
             for d in existing_list or []:
                 if not isinstance(d, dict):
                     continue
-                if d.get("status") != "active":
+                d_status = d.get("status")
+                if d_status not in ("active", "cleared"):
                     continue
                 # Match same disaster type to avoid suppressing a legitimate
                 # different incident in the same area (e.g. fire + accident).
@@ -523,18 +529,43 @@ def build_tools(
                 if not coords:
                     continue
                 dist = _hav(new_lat, new_lng, float(coords["lat"]), float(coords["lng"]))
-                if dist <= DECLARE_DEDUP_RADIUS_M:
+                if dist > DECLARE_DEDUP_RADIUS_M:
+                    continue
+                # Cleared incidents only dedup inside the cool-down window;
+                # active ones always dedup.
+                if d_status == "cleared":
+                    created = d.get("created_at")
+                    try:
+                        created_dt = _dt.fromisoformat(str(created).replace("Z", "+00:00"))
+                        age_s = (now - created_dt).total_seconds()
+                    except Exception:
+                        age_s = 0.0
+                    if age_s > DECLARE_POST_CLEAR_COOLDOWN_S:
+                        continue
                     logger.warning(
-                        f"declare_incident DEDUP: a {new_type} incident already exists "
-                        f"{dist:.0f}m away (id={d.get('id')}). Returning existing record."
+                        f"declare_incident DEDUP (post-clear cooldown): a {new_type} "
+                        f"incident was cleared {age_s:.0f}s ago at {dist:.0f}m. "
+                        f"Refusing to re-declare (cooldown {DECLARE_POST_CLEAR_COOLDOWN_S:.0f}s)."
                     )
-                    _metric_inc("declare_incident.dedup_hit")
+                    _metric_inc("declare_incident.dedup_post_clear")
                     return {
-                        "id": d.get("id"),
                         "deduped": True,
+                        "reason": "post_clear_cooldown",
+                        "cleared_incident_id": d.get("id"),
+                        "cleared_seconds_ago": round(age_s, 1),
                         "distance_m": round(dist, 1),
-                        "existing_disaster_type": d.get("disaster_type"),
                     }
+                logger.warning(
+                    f"declare_incident DEDUP: a {new_type} incident already exists "
+                    f"{dist:.0f}m away (id={d.get('id')}). Returning existing record."
+                )
+                _metric_inc("declare_incident.dedup_hit")
+                return {
+                    "id": d.get("id"),
+                    "deduped": True,
+                    "distance_m": round(dist, 1),
+                    "existing_disaster_type": d.get("disaster_type"),
+                }
         except Exception as dedup_exc:
             logger.debug(f"declare_incident dedup probe failed: {dedup_exc}")
             # Fall through to the original create — dedup is best-effort.
@@ -811,13 +842,14 @@ def build_tools(
         _wrap("get_world_state", _NoArgs, _get_world_state),
         _wrap("get_active_notifications", _NoArgs, _get_active_notifications),
         _wrap("get_active_cordons", _NoArgs, _get_active_cordons),
-        # declare_incident intentionally REMOVED from the AI's toolset.
-        # Per operator decision, the AI cannot spawn new disasters — only the
-        # human operator (dashboard "Trigger Disaster" → POST /api/trigger-disaster)
-        # can. The AI's job is dispatching, cordoning, alerting, updating, and
-        # clearing — not creating. The _declare_incident fn + dedup logic are
-        # kept above as dead code in case we ever re-enable it for a subset of
-        # disaster_types.
+        # declare_incident is re-enabled but heavily fenced: the _declare_incident
+        # implementation dedups against (a) active same-type incidents within
+        # 800m and (b) same-type incidents that were cleared in the last
+        # DECLARE_POST_CLEAR_COOLDOWN_S window — so when an operator clears a
+        # fire, the AI can't immediately re-spawn it from stale citizen reports
+        # still in the buffer. The detection_prompt also tightens when the AI
+        # is allowed to call this (operator-confirmed clusters only).
+        _wrap("declare_incident", DeclareIncidentArgs, _declare_incident),
         _wrap("update_incident", UpdateIncidentArgs, _update_incident),
         _wrap("clear_incident", IncidentIdOnly, _clear_incident),
         _wrap("publish_citizen_alert", PublishCitizenAlertArgs, _publish_citizen_alert),
