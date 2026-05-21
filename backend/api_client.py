@@ -51,11 +51,49 @@ class SentinelAPIClient:
     async def get_weather(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/api/weather")
 
+    async def get_weather_regions(self) -> Dict[str, Any]:
+        return await self._request("GET", "/api/weather/regions")
+
     async def get_traffic(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/api/traffic")
 
     async def get_citizen_reports(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/api/citizen-reports")
+
+    async def get_responder_reports(self, status: str = "pending") -> Dict[str, Any]:
+        """Pull responder field reports (casualty + fire_sighted corrections).
+
+        Defaults to status='pending' so the AI's monitoring context only
+        surfaces work still requiring action.
+        """
+        return await self._request("GET", f"/api/responder-reports?status={status}")
+
+    async def get_nearest_resources(
+        self, lat: float, lng: float, kind: str = "fire_station", limit: int = 3,
+    ) -> Dict[str, Any]:
+        """Server-ranked nearest stations (hospital/fire_station/police_station)
+        with available capacity. Used by the orchestrator to spare the AI from
+        haversine arithmetic."""
+        return await self._request(
+            "GET",
+            f"/api/nearest-resources?lat={lat}&lng={lng}&kind={kind}&limit={limit}",
+        )
+
+    async def resolve_responder_reports_near(
+        self, lat: float, lng: float, radius_m: float = 100.0,
+        report_kind_prefix: str = "casualty_",
+    ) -> Dict[str, Any]:
+        """Mark pending responder reports within radius of (lat, lng) as resolved.
+
+        Called by agent_tools after a successful ambulance dispatch so the AI
+        doesn't see the same casualty twice.
+        """
+        return await self._request(
+            "POST",
+            "/api/responder-reports/resolve-near",
+            params={"lat": lat, "lng": lng, "radius_m": radius_m,
+                    "report_kind_prefix": report_kind_prefix},
+        )
 
     async def get_fire_stations(self) -> List[Dict[str, Any]]:
         return await self._request("GET", "/api/fire-stations")

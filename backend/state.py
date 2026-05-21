@@ -8,10 +8,16 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 class IncidentState(BaseModel):
-    """Tracks the state of an active incident."""
+    """Tracks the state of an active incident.
+
+    Note: `location` is GROUND TRUTH — never shown to the AI. The agent must
+    call `triangulate_incident` to get an approximate `location_estimate`,
+    which is cached here after the first triangulation.
+    """
     incident_id: str
     type: str
-    location: Dict[str, float]
+    location: Dict[str, float]  # GROUND TRUTH — server-side only
+    location_estimate: Optional[Dict[str, float]] = None  # AI-visible, noisy
     severity: str
     confidence: float
     description: str
@@ -20,6 +26,12 @@ class IncidentState(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     history: List[Dict[str, Any]] = Field(default_factory=list)
+
+    def agent_view(self) -> Dict[str, Any]:
+        """Serialize for the agent context — strips ground-truth location."""
+        d = self.model_dump()
+        d.pop("location", None)
+        return d
 
     def update_state(self, **kwargs) -> None:
         """Update fields and record the update in history."""
