@@ -42,11 +42,15 @@ function ToastCard({ toast, onDismiss }: { toast: GeofenceToast; onDismiss: () =
   }, [slide]);
 
   const accent =
-    toast.kind === 'disaster'
+    toast.kind === 'disaster' || toast.kind === 'alert'
       ? colors.danger
       : toast.kind === 'cordon'
         ? colors.hazardCordon
-        : colors.hazardNotification;
+        : toast.kind === 'weather'
+          ? colors.hazardNotification
+          : toast.kind === 'dispatch'
+            ? colors.info
+            : colors.hazardNotification;
 
   return (
     <Animated.View

@@ -80,6 +80,18 @@ class Wakeup:
         total = sum(e.merged_count for e in self.events)
         return f"{total} event(s) from {srcs}; {len(self.events)} clusters"
 
+    @property
+    def change_driven(self) -> bool:
+        """True when at least one source already did its own change-detection
+        (weather/traffic watchers, SLA watchdog). Such wakes should bypass
+        the orchestrator's fingerprint dedup — the fingerprint hashes only
+        disasters+reports, so a real weather/traffic change leaves it
+        unchanged and the agent would never run otherwise."""
+        for s in self.sources:
+            if s.startswith(("weather:", "traffic:", "sla:")):
+                return True
+        return False
+
 
 class WakeBus:
     """Per-loop wake-up queue with debounce + dedup."""

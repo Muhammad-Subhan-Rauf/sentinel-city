@@ -1,7 +1,7 @@
 // Persistent notification feed for every role. Mirrors what the in-app
-// toast queue surfaced (operator-drawn notifications/cordons for citizens,
-// plus the role-appropriate disaster set for everyone) so the user has a
-// scrollable history of what they've been alerted about. Refreshes every 5 s.
+// toast queue surfaced (citizen alerts, cordons, disasters, dispatches and
+// weather alerts — all AI-only) so the user has a scrollable history of
+// what they've been alerted about. Refreshes every 5 s.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, FlatList, RefreshControl, StyleSheet, Text, View, Pressable } from 'react-native';
@@ -12,14 +12,11 @@ import {
   api,
   MobileCitizen,
   MobileWorker,
-  Notification,
-  Cordon,
-  Disaster,
+  NearbyWarning,
 } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { colors } from '@/lib/colors';
-import { geometryCentroid, haversineMeters, KM_20_M } from '@/lib/geo';
-import { describeDisasterForRole, ruleFor } from '@/lib/geofence';
+import { describeWarningForRole, ruleFor } from '@/lib/geofence';
 
 // Storage key for dismissed alert IDs. Scoped by (device_id + role + sub_role)
 // — the same phone signed in as citizen vs firefighter has *different* user
@@ -27,23 +24,15 @@ import { describeDisasterForRole, ruleFor } from '@/lib/geofence';
 // invalidate any v1 keys left over from the device-id-only era.
 const DISMISSED_KEY_PREFIX = 'sentinel.alerts.dismissed.v2:';
 
-type AlertItem =
-  | {
-      id: string;
-      kind: 'notification' | 'cordon';
-      reason: string;
-      distanceM: number;
-      createdAt: string;
-    }
-  | {
-      id: string;
-      kind: 'disaster';
-      title: string;
-      body: string;
-      severity: number;
-      distanceM: number;
-      createdAt: string;
-    };
+type AlertItem = {
+  id: string;
+  kind: NearbyWarning['kind'];
+  title: string;
+  body: string;
+  severity: number;
+  distanceM: number;
+  createdAt: string;
+};
 
 async function fetchMe(
   role: 'citizen' | 'worker',
@@ -129,91 +118,52 @@ export default function NotificationsScreen() {
   }, [storageKey]);
 
   const load = async () => {
-    if (!session) return;
+    if (!session || !rule) return;
     setRefreshing(true);
     try {
-      // Citizens/workers fetch their own "me" so distance can be computed.
-      // Admins skip — their rule uses Infinity radius so distance is irrelevant.
-      const me =
-        session.role === 'citizen' || session.role === 'worker'
-          ? await fetchMe(session.role, session.userId)
-          : null;
-
-      const wantsOperatorOverlays = session.role === 'citizen';
-      const [notifs, cordons, disasters] = await Promise.all([
-        wantsOperatorOverlays ? api.listNotifications().catch(() => [] as Notification[]) : Promise.resolve([] as Notification[]),
-        wantsOperatorOverlays ? api.listCordons().catch(() => [] as Cordon[]) : Promise.resolve([] as Cordon[]),
-        api.listDisasters().catch(() => [] as Disaster[]),
-      ]);
+      // Citizens/workers fetch their own "me" so we can ask the AI feed for
+      // warnings near them. Admins request the citywide (no position) feed.
+      let warnings: NearbyWarning[] = [];
+      if (Number.isFinite(rule.radiusKm)) {
+        const me =
+          session.role === 'citizen' || session.role === 'worker'
+            ? await fetchMe(session.role, session.userId)
+            : null;
+        if (!me) {
+          setAlerts([]);
+          setTooFarCount(0);
+          return;
+        }
+        warnings = await api
+          .listNearbyWarnings(me.lat, me.lng, rule.radiusKm * 1000)
+          .catch(() => []);
+      } else {
+        warnings = await api.listNearbyWarnings(null, null, 50000).catch(() => []);
+      }
 
       const combined: AlertItem[] = [];
-      let far = 0;
-
-      // Operator overlays (citizens only).
-      if (me && wantsOperatorOverlays) {
-        const consider = (
-          list: Array<Notification | Cordon>,
-          kind: 'notification' | 'cordon',
-        ) => {
-          for (const item of list) {
-            const center = geometryCentroid(item.geometry);
-            if (!center) continue;
-            const d = haversineMeters({ lat: me.lat, lng: me.lng }, center);
-            if (d <= KM_20_M) {
-              combined.push({
-                id: `${kind}-${item.id}`,
-                kind,
-                reason: item.reason ?? (kind === 'cordon' ? 'Cordoned area' : 'Alert'),
-                distanceM: d,
-                createdAt: item.created_at,
-              });
-            } else {
-              far++;
-            }
-          }
-        };
-        consider(notifs, 'notification');
-        consider(cordons, 'cordon');
+      for (const w of warnings) {
+        if (w.severity < rule.severityFloor) continue;
+        const { title, body } = describeWarningForRole(w, session);
+        combined.push({
+          id: w.id,
+          kind: w.kind,
+          title,
+          body,
+          severity: w.severity,
+          distanceM: w.distance_m,
+          createdAt: w.created_at,
+        });
       }
 
-      // Disasters — filtered by the role's alert rule (same rule the toast
-      // queue uses, so this screen matches what the user has been hearing).
-      if (rule) {
-        for (const d of disasters) {
-          if (d.status !== 'active') continue;
-          if (d.severity < rule.severityFloor) continue;
-          if (!(rule.types.includes('*') || rule.types.includes(d.disaster_type))) continue;
-
-          let distanceM = 0;
-          if (Number.isFinite(rule.radiusKm)) {
-            if (!me) continue;
-            const centroid = geometryCentroid(d.area_geometry);
-            if (!centroid) continue;
-            distanceM = haversineMeters({ lat: me.lat, lng: me.lng }, centroid);
-            if (distanceM / 1000 > rule.radiusKm) {
-              far += 1;
-              continue;
-            }
-          }
-
-          const { title, body } = describeDisasterForRole(d, distanceM / 1000, session);
-          combined.push({
-            id: `disaster-${d.id}`,
-            kind: 'disaster',
-            title,
-            body,
-            severity: d.severity,
-            distanceM,
-            createdAt: d.created_at,
-          });
-        }
-      }
-
+      // Server already returns most-severe-first, then closest. Re-sort by
+      // distance so the screen matches the "near me" reading order — but
+      // citywide entries (distance_m=0) still bubble to the top.
       combined.sort((a, b) => a.distanceM - b.distanceM);
-      // Hide anything the user has already swiped away. Re-pinning happens
-      // when they tap "Show dismissed" in the footer.
       setAlerts(combined.filter((a) => !dismissed.has(a.id)));
-      setTooFarCount(far);
+      // "tooFarCount" was based on a client-side radius filter that no longer
+      // applies — the server has already trimmed the list to the role radius.
+      setTooFarCount(0);
     } finally {
       setRefreshing(false);
     }
@@ -282,11 +232,13 @@ export default function NotificationsScreen() {
           }
           renderItem={({ item }) => {
             const accent =
-              item.kind === 'disaster'
+              item.kind === 'cordon' || item.kind === 'disaster'
                 ? colors.danger
-                : item.kind === 'cordon'
+                : item.kind === 'weather'
                   ? colors.warning
-                  : colors.danger;
+                  : item.kind === 'dispatch'
+                    ? colors.info
+                    : colors.danger;
             const distanceText =
               item.distanceM === 0
                 ? 'citywide'
@@ -304,7 +256,6 @@ export default function NotificationsScreen() {
                 rightThreshold={60}
                 overshootRight={false}
                 onSwipeableWillOpen={() => {
-                  // Close any other open row so only one is open at a time.
                   if (openSwipeRef.current && openSwipeRef.current !== swipeRefs.current.get(item.id)) {
                     openSwipeRef.current.close();
                   }
@@ -314,18 +265,10 @@ export default function NotificationsScreen() {
               >
                 <View style={[styles.card, { borderLeftColor: accent }]}>
                   <View style={styles.cardHeader}>
-                    <Text style={styles.cardKind}>
-                      {item.kind === 'disaster'
-                        ? item.title
-                        : item.kind === 'cordon'
-                          ? '🚧 Cordon'
-                          : '🚨 Evacuation Alert'}
-                    </Text>
+                    <Text style={styles.cardKind}>{item.title}</Text>
                     <Text style={styles.cardDistance}>{distanceText}</Text>
                   </View>
-                  <Text style={styles.cardReason}>
-                    {item.kind === 'disaster' ? item.body : item.reason}
-                  </Text>
+                  <Text style={styles.cardReason}>{item.body}</Text>
                   <Text style={styles.cardTime}>
                     {item.createdAt ? new Date(item.createdAt).toLocaleTimeString() : ''}
                   </Text>

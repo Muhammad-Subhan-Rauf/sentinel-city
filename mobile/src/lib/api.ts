@@ -114,6 +114,9 @@ export type Disaster = {
   people_inside: number | null;
   safe_exit_pct: number | null;
   created_at: string;
+  // 'ai' | 'operator'. Mobile-side map/routing code filters to 'ai' so the
+  // citizen path-planner only avoids hazards the orchestrator declared.
+  source?: 'ai' | 'operator';
 };
 
 export type Notification = {
@@ -123,6 +126,25 @@ export type Notification = {
   status: 'active' | 'cleared';
   created_at: string;
   event_id: string | null;
+  // 'ai' | 'operator' — written server-side. Mobile UI only renders
+  // source='ai' entries; see /api/warnings/nearby.
+  source?: 'ai' | 'operator';
+};
+
+// Unified shape returned by /api/warnings/nearby. The five kinds reflect the
+// five upstream sources the backend aggregates and proximity-filters.
+export type NearbyWarning = {
+  id: string;
+  kind: 'alert' | 'cordon' | 'disaster' | 'dispatch' | 'weather';
+  severity: number;
+  title: string;
+  message: string;
+  geometry: any | null;
+  distance_m: number;
+  bearing: string;
+  event_id: string | null;
+  source: 'ai';
+  created_at: string;
 };
 
 // Emergency service types a citizen can request when placing a 911 call.
@@ -246,12 +268,29 @@ export const api = {
     }),
 
   // Hazards & alerts
+  //
+  // listNotifications / listCordons return the raw operator+AI rows. They are
+  // kept for admin tooling (e.g. AdminCallsScreen) that may still need to see
+  // every warning the system has issued. Every user-facing warning surface
+  // (citizen + worker maps, the alerts list, geofence banners) now consumes
+  // listNearbyWarnings instead, which is server-filtered to source='ai' and
+  // proximity-trimmed.
   listNotifications: () =>
     request<{ notifications: Notification[] }>('/api/notifications?status_filter=active').then(
       (r) => r.notifications
     ),
   listCordons: () =>
     request<{ cordons: Cordon[] }>('/api/cordons?status_filter=active').then((r) => r.cordons),
+  // lat / lng can be null to request the citywide (admin) feed — the backend
+  // returns every active AI warning unfiltered when position is absent.
+  listNearbyWarnings: (lat: number | null, lng: number | null, radiusM: number) => {
+    const q: string[] = [`radius_m=${Math.round(radiusM)}`];
+    if (lat !== null && Number.isFinite(lat)) q.push(`lat=${lat}`);
+    if (lng !== null && Number.isFinite(lng)) q.push(`lng=${lng}`);
+    return request<{ warnings: NearbyWarning[] }>(`/api/warnings/nearby?${q.join('&')}`).then(
+      (r) => r.warnings,
+    );
+  },
 
   // Disasters
   listDisasters: () =>

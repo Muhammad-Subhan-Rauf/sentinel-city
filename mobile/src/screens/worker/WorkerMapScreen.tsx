@@ -180,10 +180,12 @@ export default function WorkerMapScreen() {
     let cancelled = false;
     const tick = async () => {
       try {
+        // AI-only — responders shouldn't be routed around operator-drawn
+        // dashboard polygons that the orchestrator never confirmed.
         const [notifs, cordons, disasters] = await Promise.all([
-          api.listNotifications().catch(() => [] as Notification[]),
-          api.listCordons().catch(() => [] as Cordon[]),
-          api.listDisasters().catch(() => [] as Disaster[]),
+          api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Notification[]),
+          api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Cordon[]),
+          api.listDisasters().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Disaster[]),
         ]);
         if (cancelled) return;
         const sig = JSON.stringify([

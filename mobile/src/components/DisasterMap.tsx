@@ -244,12 +244,13 @@ export function DisasterMap({
     let cancelled = false;
     const tick = async () => {
       try {
+        // Mobile map renders only AI-originated warnings — operator-drawn
+        // dashboard rows are hidden. The list endpoints still return
+        // everything; we filter client-side on the `source` field.
         const [notifs, cordons, disasters, citizens, workers] = await Promise.all([
-          api.listNotifications().catch(() => []),
-          api.listCordons().catch(() => []),
-          // Live disaster footprints — citizens see these to know where the
-          // danger actually is, not just the operator-drawn evacuation polygon.
-          api.listDisasters().catch(() => []),
+          api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => []),
+          api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => []),
+          api.listDisasters().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => []),
           showOtherUsers ? api.listCitizens().catch(() => []) : Promise.resolve([]),
           showOtherUsers ? api.listWorkers().catch(() => []) : Promise.resolve([]),
         ]);

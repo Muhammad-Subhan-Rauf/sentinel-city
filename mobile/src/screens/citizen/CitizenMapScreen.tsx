@@ -220,10 +220,15 @@ export default function CitizenMapScreen() {
       setRouting(true);
       setRouteError(null);
       try {
+        // Mobile-side hazard data is AI-only — operator-drawn dashboard rows
+        // must not influence routing or the in-app map. Both the source
+        // field and any future server-side filter let us narrow client-side
+        // for now; once every device is on the new schema we can move this
+        // to a query parameter.
         const [notifs, cordons, disastersNow] = await Promise.all([
-          api.listNotifications().catch(() => [] as Notification[]),
-          api.listCordons().catch(() => [] as Cordon[]),
-          api.listDisasters().catch(() => [] as Disaster[]),
+          api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Notification[]),
+          api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Cordon[]),
+          api.listDisasters().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Disaster[]),
         ]);
         const avoid = [
           ...notifsToAvoidPolygons([...notifs, ...cordons]),
@@ -261,10 +266,15 @@ export default function CitizenMapScreen() {
       const latest = meRef.current;
       if (!latest) return;
       try {
+        // Mobile-side hazard data is AI-only — operator-drawn dashboard rows
+        // must not influence routing or the in-app map. Both the source
+        // field and any future server-side filter let us narrow client-side
+        // for now; once every device is on the new schema we can move this
+        // to a query parameter.
         const [notifs, cordons, disastersNow] = await Promise.all([
-          api.listNotifications().catch(() => [] as Notification[]),
-          api.listCordons().catch(() => [] as Cordon[]),
-          api.listDisasters().catch(() => [] as Disaster[]),
+          api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Notification[]),
+          api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Cordon[]),
+          api.listDisasters().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Disaster[]),
         ]);
         const sig = JSON.stringify([
           ...notifsToAvoidPolygons([...notifs, ...cordons]),

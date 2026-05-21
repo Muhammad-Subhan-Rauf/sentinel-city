@@ -397,8 +397,15 @@ async def detection_loop(
             reports = await api.get_citizen_reports()
 
             # Defense-in-depth: fingerprint dedup still applies, in case the
-            # wake-up came from a spurious source. SLA still forces.
-            forced = _sla.should_force_tick("detection") or wakeup.fallback
+            # wake-up came from a spurious source. SLA still forces. Watcher-
+            # driven wakes (weather/traffic) also force — the fingerprint
+            # hashes only disasters+reports, so a real weather change leaves
+            # it unchanged and the dedup would otherwise swallow the wake.
+            forced = (
+                _sla.should_force_tick("detection")
+                or wakeup.fallback
+                or wakeup.change_driven
+            )
             fingerprint = _signal_fingerprint(disasters, reports, state)
             if not forced and fingerprint == last_fingerprint:
                 logger.info("[Detection] Wake fired but world fingerprint unchanged; skipping agent invocation.")
@@ -495,7 +502,11 @@ async def monitoring_supervisor(
                 logger.info("[Monitoring] No active incidents; nothing to do.")
                 continue
 
-            forced = _sla.should_force_tick("monitoring") or wakeup.fallback
+            forced = (
+                _sla.should_force_tick("monitoring")
+                or wakeup.fallback
+                or wakeup.change_driven
+            )
             fingerprint = _signal_fingerprint(disasters, [], state)
             if not forced and fingerprint == last_fingerprint:
                 logger.info("[Monitoring] Wake fired but world fingerprint unchanged; skipping agent invocation.")

@@ -113,7 +113,12 @@ class SentinelAPIClient:
     # --- Actions ---
 
     async def trigger_disaster(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        return await self._request("POST", "/api/trigger-disaster", json=data)
+        # This client is the AI orchestrator's voice into the public API.
+        # Every disaster declared via here is by definition AI-originated, so
+        # stamp source='ai' for /api/warnings/nearby to pick it up. Callers
+        # that pre-set 'source' (rare) win.
+        payload = {"source": "ai", **data}
+        return await self._request("POST", "/api/trigger-disaster", json=payload)
 
     async def update_disaster(self, disaster_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return await self._request("PATCH", f"/api/disasters/{disaster_id}", json=data)
@@ -122,13 +127,16 @@ class SentinelAPIClient:
         return await self._request("DELETE", f"/api/disasters/{disaster_id}")
 
     async def notify(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        return await self._request("POST", "/api/notify", json=data)
+        payload = {"source": "ai", **data}
+        return await self._request("POST", "/api/notify", json=payload)
 
     async def cordon(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        return await self._request("POST", "/api/cordons", json=data)
+        payload = {"source": "ai", **data}
+        return await self._request("POST", "/api/cordons", json=payload)
 
     async def dispatch(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        return await self._request("POST", "/api/dispatch", json=data)
+        payload = {"source": "ai", **data}
+        return await self._request("POST", "/api/dispatch", json=payload)
 
     async def dispatch_ack(self, dispatch_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         unit_type = data.get("unit_type")

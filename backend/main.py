@@ -258,6 +258,42 @@ def _bootstrap_schema() -> None:
                         ON cordons (status)
                         WHERE status = 'active';
                 """)
+                # source column distinguishes AI-generated warnings (the
+                # orchestrator's publish_citizen_alert/create_cordon/declare_incident
+                # tools) from operator-drawn dashboard entries. The mobile app
+                # filters to source='ai'; the dashboard reads everything.
+                cur.execute("""
+                    ALTER TABLE notifications
+                    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'operator';
+                """)
+                cur.execute("""
+                    ALTER TABLE cordons
+                    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'operator';
+                """)
+                cur.execute("""
+                    ALTER TABLE disaster_events
+                    ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'operator';
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS active_dispatches (
+                        id           UUID PRIMARY KEY,
+                        event_id     UUID,
+                        service_type TEXT NOT NULL,
+                        target_lat   DOUBLE PRECISION NOT NULL,
+                        target_lng   DOUBLE PRECISION NOT NULL,
+                        radius_m     DOUBLE PRECISION NOT NULL DEFAULT 1500,
+                        unit_count   INTEGER,
+                        status       TEXT NOT NULL DEFAULT 'active',
+                        source       TEXT NOT NULL DEFAULT 'ai',
+                        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        expires_at   TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '2 hours'
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_active_dispatches_live
+                        ON active_dispatches (status, expires_at)
+                        WHERE status = 'active';
+                """)
                 cur.execute("""
                     ALTER TABLE fire_stations
                     ADD COLUMN IF NOT EXISTS truck_count INTEGER NOT NULL DEFAULT 4;
@@ -761,6 +797,9 @@ class DisasterPayload(BaseModel):
     # timer on the parent fire and asks the dashboard to PATCH children to
     # status='active' once it elapses, *unless* the parent has been extinguished.
     spread_in_seconds: Optional[int] = Field(None, ge=1, le=600)
+    # 'ai' when written by the orchestrator's declare_incident tool, 'operator'
+    # for dashboard writes. Used by /api/warnings/nearby to filter AI-only feeds.
+    source: Optional[Literal["ai", "operator"]] = None
 
 
 class FireStationPayload(BaseModel):
@@ -809,18 +848,28 @@ class DispatchPayload(BaseModel):
     target: Dict[str, Any]
     # Optional station id the frontend picked. Useful for audit but not required.
     station_id: Optional[str] = None
+    # Optional incident this dispatch responds to. Persisted on active_dispatches
+    # so /api/warnings/nearby can correlate with the linked event.
+    event_id: Optional[str] = None
+    # 'ai' when the orchestrator (api_client.dispatch) issues this; 'operator'
+    # for manual dashboard dispatches. Drives /api/warnings/nearby visibility.
+    source: Optional[Literal["ai", "operator"]] = None
 
 
 class NotificationPayload(BaseModel):
     geometry: Dict[str, Any]
     reason: str
     event_id: Optional[str] = None
+    # 'ai' when emitted by the orchestrator's publish_citizen_alert tool;
+    # 'operator' when drawn from the dashboard. See /api/warnings/nearby.
+    source: Optional[Literal["ai", "operator"]] = None
 
 
 class CordonPayload(BaseModel):
     geometry: Dict[str, Any]
     reason: Optional[str] = None
     event_id: Optional[str] = None
+    source: Optional[Literal["ai", "operator"]] = None
 
 
 class LoginPayload(BaseModel):
@@ -894,8 +943,9 @@ def trigger_disaster(payload: DisasterPayload):
                     INSERT INTO disaster_events
                         (id, disaster_type, severity, area_geometry, geometry_kind,
                          notes, status, cause, spread_speed,
-                         people_inside, safe_exit_pct, parent_id, spread_in_seconds)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         people_inside, safe_exit_pct, parent_id, spread_in_seconds,
+                         source)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
@@ -912,6 +962,7 @@ def trigger_disaster(payload: DisasterPayload):
                         payload.safe_exit_pct,
                         payload.parent_id,
                         payload.spread_in_seconds,
+                        payload.source or "operator",
                     ),
                 )
                 returned_id = cur.fetchone()[0]
@@ -963,46 +1014,49 @@ async def post_citizen_reports(batch: CitizenReportBatch):
             r.transcript,
             r.perceived_severity,
         ))
-    if not rows:
-        return {"inserted": 0, "skipped": skipped}
-
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        with conn:
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(
-                    cur,
-                    """
-                    INSERT INTO citizen_reports
-                        (id, event_id, citizen_idx, report_kind, location, transcript, perceived_severity)
-                    VALUES %s
-                    ON CONFLICT DO NOTHING;
-                    """,
-                    rows,
-                )
-                inserted = cur.rowcount
-        conn.close()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Citizen report write failed: {exc}",
-        )
+    inserted = 0
+    if rows:
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            with conn:
+                with conn.cursor() as cur:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """
+                        INSERT INTO citizen_reports
+                            (id, event_id, citizen_idx, report_kind, location, transcript, perceived_severity)
+                        VALUES %s
+                        ON CONFLICT DO NOTHING;
+                        """,
+                        rows,
+                    )
+                    inserted = cur.rowcount
+            conn.close()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Citizen report write failed: {exc}",
+            )
 
     # Wake the AI: citizen call(s) just arrived. Push the centroid of the
     # batch (median of the lat/lng pairs) so the bus can area-dedupe.
+    # All-skipped batches (every event_id non-UUID → rows empty, typically
+    # the citizen sim's prank-call noise) still wake the AI with a
+    # `citizen_report:prank` source, so the orchestrator's audit records
+    # the inbound noise without persisting it.
     try:
         from wake_bus import WakeBus
-        if batch.reports:
-            lats = [float(r.location.get("lat", 0)) for r in batch.reports if isinstance(r.location, dict)]
-            lngs = [float(r.location.get("lng", 0)) for r in batch.reports if isinstance(r.location, dict)]
-            area = None
-            if lats and lngs:
-                area = {"lat": sum(lats) / len(lats), "lng": sum(lngs) / len(lngs)}
-            await WakeBus.push_all(
-                "citizen_report",
-                area=area,
-                payload={"count": len(batch.reports), "inserted": inserted},
-            )
+        lats = [float(r.location.get("lat", 0)) for r in batch.reports if isinstance(r.location, dict)]
+        lngs = [float(r.location.get("lng", 0)) for r in batch.reports if isinstance(r.location, dict)]
+        area = None
+        if lats and lngs:
+            area = {"lat": sum(lats) / len(lats), "lng": sum(lngs) / len(lngs)}
+        source = "citizen_report:prank" if not rows else "citizen_report"
+        await WakeBus.push_all(
+            source,
+            area=area,
+            payload={"count": len(batch.reports), "inserted": inserted, "skipped": skipped},
+        )
     except Exception:
         # Best-effort: never let the wake-up plumbing crash the ingest.
         pass
@@ -1936,6 +1990,7 @@ def _row_to_disaster(row) -> Dict[str, Any]:
         # ever corrected the location. The orchestrator pulls this into
         # IncidentState.location_estimate so the AI sees the corrected coords.
         "location_estimate": row[12] if len(row) > 12 else None,
+        "source": (row[13] if len(row) > 13 else None) or "operator",
     }
 
 
@@ -1955,7 +2010,7 @@ def list_disasters(status_filter: Optional[str] = Query(None, description="activ
                     f"""
                     SELECT id, disaster_type, severity, {geom_expr}, geometry_kind,
                            notes, status, cause, spread_speed, people_inside,
-                           safe_exit_pct, created_at, location_estimate
+                           safe_exit_pct, created_at, location_estimate, source
                     FROM disaster_events
                     {where}
                     ORDER BY created_at DESC;
@@ -1983,7 +2038,7 @@ def get_disaster(event_id: str):
                     f"""
                     SELECT id, disaster_type, severity, {geom_expr}, geometry_kind,
                            notes, status, cause, spread_speed, people_inside,
-                           safe_exit_pct, created_at, location_estimate
+                           safe_exit_pct, created_at, location_estimate, source
                     FROM disaster_events
                     WHERE id = %s;
                     """,
@@ -1999,6 +2054,268 @@ def get_disaster(event_id: str):
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Disaster not found.")
     return _row_to_disaster(row)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# /api/warnings/nearby — AI-only nearby warning feed for the mobile app.
+#
+# Aggregates five spatially-filtered AI sources into one ordered list:
+#   1. notifications  (publish_citizen_alert tool)
+#   2. cordons        (create_cordon tool)
+#   3. disaster_events(declare_incident tool)
+#   4. active_dispatches (ai-issued dispatches with target + radius)
+#   5. weather alerts (synthesised from regions that overlap the user buffer)
+#
+# All entries are stamped source='ai' (set via api_client). Operator-drawn
+# rows from the dashboard never appear here. Proximity is a conservative
+# buffer test using existing centroid + radius helpers — over-include rather
+# than miss.
+# ──────────────────────────────────────────────────────────────────────
+
+_COMPASS_POINTS = ["N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"]
+
+
+def _compass_bearing(lat1: float, lng1: float, lat2: float, lng2: float) -> str:
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dl = math.radians(lng2 - lng1)
+    y = math.sin(dl) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dl)
+    deg = (math.degrees(math.atan2(y, x)) + 360) % 360
+    return _COMPASS_POINTS[int((deg + 22.5) // 45)]
+
+
+def _service_label(kind: str) -> str:
+    return {
+        "firefighter": "Fire response",
+        "ambulance": "Medical response",
+        "police": "Police response",
+    }.get(kind, "Emergency response")
+
+
+@app.get("/api/warnings/nearby", tags=["Mobile"])
+def warnings_nearby(
+    lat: Optional[float] = Query(None, description="User latitude — omit for citywide (admin) feed"),
+    lng: Optional[float] = Query(None, description="User longitude — omit for citywide (admin) feed"),
+    radius_m: float = Query(5000.0, gt=0, le=50000, description="Search radius in metres"),
+):
+    # Admin / citywide callers omit lat+lng and get every active AI warning,
+    # unfiltered by distance. distance_m and bearing default to placeholders.
+    citywide = lat is None or lng is None
+    if citywide:
+        lat = 0.0
+        lng = 0.0
+    out: List[Dict[str, Any]] = []
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                # 1. AI notifications (citizen alerts)
+                cur.execute(
+                    """
+                    SELECT id, geometry, reason, event_id, created_at
+                    FROM notifications
+                    WHERE status = 'active' AND source = 'ai'
+                    ORDER BY created_at DESC;
+                    """
+                )
+                for r in cur.fetchall():
+                    geom = _coerce_geojson(r[1])
+                    centroid = _geometry_centroid(geom)
+                    if centroid is None:
+                        continue
+                    d = _distance_haversine(lat, lng, centroid["lat"], centroid["lng"])
+                    buffer_m = (_geometry_radius_m(geom, centroid) or 0.0) + radius_m
+                    if not citywide and d > buffer_m:
+                        continue
+                    out.append({
+                        "id": f"notif:{r[0]}",
+                        "kind": "alert",
+                        "severity": 3,
+                        "title": "Citizen alert",
+                        "message": r[2],
+                        "geometry": geom,
+                        "distance_m": round(d, 0),
+                        "bearing": _compass_bearing(lat, lng, centroid["lat"], centroid["lng"]),
+                        "event_id": str(r[3]) if r[3] is not None else None,
+                        "source": "ai",
+                        "created_at": r[4].isoformat(),
+                    })
+
+                # 2. AI cordons (no-entry zones)
+                cur.execute(
+                    """
+                    SELECT id, geometry, reason, event_id, created_at
+                    FROM cordons
+                    WHERE status = 'active' AND source = 'ai'
+                    ORDER BY created_at DESC;
+                    """
+                )
+                for r in cur.fetchall():
+                    geom = _coerce_geojson(r[1])
+                    centroid = _geometry_centroid(geom)
+                    if centroid is None:
+                        continue
+                    d = _distance_haversine(lat, lng, centroid["lat"], centroid["lng"])
+                    buffer_m = (_geometry_radius_m(geom, centroid) or 0.0) + radius_m
+                    if not citywide and d > buffer_m:
+                        continue
+                    out.append({
+                        "id": f"cordon:{r[0]}",
+                        "kind": "cordon",
+                        "severity": 4,
+                        "title": "Avoid area",
+                        "message": r[2] or "No-entry zone — do not approach.",
+                        "geometry": geom,
+                        "distance_m": round(d, 0),
+                        "bearing": _compass_bearing(lat, lng, centroid["lat"], centroid["lng"]),
+                        "event_id": str(r[3]) if r[3] is not None else None,
+                        "source": "ai",
+                        "created_at": r[4].isoformat(),
+                    })
+
+                # 3. AI-declared disasters
+                geom_expr = _geometry_select_expr(cur)
+                cur.execute(
+                    f"""
+                    SELECT id, disaster_type, severity, {geom_expr}, geometry_kind, created_at
+                    FROM disaster_events
+                    WHERE status = 'active' AND source = 'ai';
+                    """
+                )
+                for r in cur.fetchall():
+                    geom = _coerce_geojson(r[3])
+                    gkind = r[4]
+                    centroid = _geometry_centroid(geom)
+                    # Citywide events with no geometry — surface unconditionally
+                    if centroid is None:
+                        if gkind == "city":
+                            out.append({
+                                "id": f"disaster:{r[0]}",
+                                "kind": "disaster",
+                                "severity": int(r[2]),
+                                "title": str(r[1]).replace("_", " "),
+                                "message": f"Citywide {r[1].replace('_',' ').lower()} in effect.",
+                                "geometry": None,
+                                "distance_m": 0,
+                                "bearing": "N",
+                                "event_id": str(r[0]),
+                                "source": "ai",
+                                "created_at": r[5].isoformat(),
+                            })
+                        continue
+                    d = _distance_haversine(lat, lng, centroid["lat"], centroid["lng"])
+                    buffer_m = (_geometry_radius_m(geom, centroid) or 0.0) + radius_m
+                    if not citywide and d > buffer_m:
+                        continue
+                    out.append({
+                        "id": f"disaster:{r[0]}",
+                        "kind": "disaster",
+                        "severity": int(r[2]),
+                        "title": str(r[1]).replace("_", " "),
+                        "message": f"{r[1].replace('_',' ')} active — severity {r[2]}.",
+                        "geometry": geom,
+                        "distance_m": round(d, 0),
+                        "bearing": _compass_bearing(lat, lng, centroid["lat"], centroid["lng"]),
+                        "event_id": str(r[0]),
+                        "source": "ai",
+                        "created_at": r[5].isoformat(),
+                    })
+
+                # 4. Active AI dispatches
+                cur.execute(
+                    """
+                    SELECT id, event_id, service_type, target_lat, target_lng,
+                           radius_m, unit_count, created_at
+                    FROM active_dispatches
+                    WHERE status = 'active'
+                      AND source = 'ai'
+                      AND expires_at > NOW();
+                    """
+                )
+                for r in cur.fetchall():
+                    d = _distance_haversine(lat, lng, float(r[3]), float(r[4]))
+                    buffer_m = float(r[5] or 0) + radius_m
+                    if not citywide and d > buffer_m:
+                        continue
+                    bearing = _compass_bearing(lat, lng, float(r[3]), float(r[4]))
+                    label = _service_label(r[2])
+                    out.append({
+                        "id": f"dispatch:{r[0]}",
+                        "kind": "dispatch",
+                        "severity": 2,
+                        "title": label,
+                        "message": f"{label} active {int(d)} m {bearing} of you.",
+                        "geometry": None,
+                        "distance_m": round(d, 0),
+                        "bearing": bearing,
+                        "event_id": str(r[1]) if r[1] is not None else None,
+                        "source": "ai",
+                        "created_at": r[7].isoformat(),
+                    })
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Warnings read failed: {exc}",
+        )
+
+    # 5. Weather alerts. The weather regions endpoint already computes
+    # severity-tagged alert lists for every active weather-bending disaster.
+    # Reuse that machinery so the danger thresholds stay in one place.
+    try:
+        weather_rows = _fetch_weather_driving_events()
+    except Exception:
+        weather_rows = []
+
+    for event_id, disaster_type, severity, cause, geom, gkind in weather_rows:
+        weather = _regional_weather(disaster_type, severity, cause, str(event_id))
+        if not weather:
+            continue
+        alerts = weather.get("alerts") or []
+        if not alerts:
+            continue
+        geom_dict = _coerce_geojson(geom)
+        # Citywide weather (heatwave etc.) — relevant to every user.
+        if gkind == "city" or geom_dict is None:
+            distance = 0.0
+            bearing = "—"
+        else:
+            centroid = _geometry_centroid(geom_dict)
+            if centroid is None:
+                continue
+            distance = _distance_haversine(lat, lng, centroid["lat"], centroid["lng"])
+            buffer_m = (_geometry_radius_m(geom_dict, centroid) or 0.0) + radius_m
+            if not citywide and distance > buffer_m:
+                continue
+            bearing = _compass_bearing(lat, lng, centroid["lat"], centroid["lng"])
+        # Surface each alert as its own entry so heat + air-quality don't get
+        # collapsed into one row. The _alert() helper writes severity as a
+        # band string ('minor'|'moderate'|'severe'|'extreme'); drop 'minor'.
+        sev_band = {"minor": 1, "moderate": 3, "severe": 4, "extreme": 5}
+        for idx, alert in enumerate(alerts):
+            raw_sev = alert.get("severity")
+            sev = sev_band.get(str(raw_sev), 2) if isinstance(raw_sev, str) else int(raw_sev or 2)
+            if sev < 2:
+                continue
+            out.append({
+                "id": f"weather:{event_id}:{alert.get('type','wx')}:{idx}",
+                "kind": "weather",
+                "severity": sev,
+                "title": weather.get("label") or "Weather alert",
+                "message": alert.get("headline") or alert.get("message") or weather.get("detail") or "Hazardous weather nearby.",
+                "geometry": geom_dict,
+                "distance_m": round(distance, 0),
+                "bearing": bearing,
+                "event_id": str(event_id),
+                "source": "ai",
+                "created_at": alert.get("start") or datetime.now(timezone.utc).isoformat(),
+            })
+
+    # Most severe first, then closest.
+    out.sort(key=lambda w: (-int(w.get("severity") or 0), float(w.get("distance_m") or 0)))
+    return {"warnings": out}
 
 
 @app.get("/api/stats/injured", tags=["Admin"])
@@ -2190,6 +2507,32 @@ def dispatch_units(payload: DispatchPayload):
         "target": echo_target,
         "station_id": payload.station_id,
     })
+
+    # Persist for /api/warnings/nearby. The ephemeral PENDING_DISPATCHES list
+    # above is consumed once by /api/dispatch/pending; the active_dispatches
+    # table lives until the row expires or is closed, so mobile clients
+    # polling /api/warnings/nearby can still surface "fire response 800m N".
+    src = payload.source or "operator"
+    radius_m = float(radius) if radius is not None else 1500.0
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO active_dispatches
+                        (id, event_id, service_type, target_lat, target_lng,
+                         radius_m, unit_count, status, source)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s);
+                    """,
+                    (dispatch_id, payload.event_id, payload.kind,
+                     float(lat), float(lng), radius_m, int(units), src),
+                )
+        conn.close()
+    except Exception as exc:
+        # Don't fail the dispatch if the persistence side errors — the engine
+        # still does the visible work via PENDING_DISPATCHES.
+        print(f"[active_dispatches] insert warning: {exc}")
 
     return {
         "success": True,
@@ -2563,11 +2906,12 @@ def create_notification(payload: NotificationPayload):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO notifications (id, geometry, reason, status, event_id)
-                    VALUES (%s, %s, %s, 'active', %s)
+                    INSERT INTO notifications (id, geometry, reason, status, event_id, source)
+                    VALUES (%s, %s, %s, 'active', %s, %s)
                     RETURNING id;
                     """,
-                    (notif_id, json.dumps(payload.geometry), payload.reason.strip(), payload.event_id),
+                    (notif_id, json.dumps(payload.geometry), payload.reason.strip(),
+                     payload.event_id, payload.source or "operator"),
                 )
                 returned_id = cur.fetchone()[0]
         conn.close()
@@ -2592,7 +2936,7 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT id, geometry, reason, status, created_at, event_id
+                    SELECT id, geometry, reason, status, created_at, event_id, source
                     FROM notifications
                     {where}
                     ORDER BY created_at DESC;
@@ -2615,6 +2959,7 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
                 "status": r[3],
                 "created_at": r[4].isoformat(),
                 "event_id": str(r[5]) if r[5] is not None else None,
+                "source": r[6] or "operator",
             }
             for r in rows
         ]
@@ -2656,11 +3001,13 @@ def create_cordon(payload: CordonPayload):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO cordons (id, geometry, reason, status, event_id)
-                    VALUES (%s, %s, %s, 'active', %s)
+                    INSERT INTO cordons (id, geometry, reason, status, event_id, source)
+                    VALUES (%s, %s, %s, 'active', %s, %s)
                     RETURNING id;
                     """,
-                    (cordon_id, json.dumps(payload.geometry), (payload.reason or "").strip() or None, payload.event_id),
+                    (cordon_id, json.dumps(payload.geometry),
+                     (payload.reason or "").strip() or None,
+                     payload.event_id, payload.source or "operator"),
                 )
                 returned_id = cur.fetchone()[0]
         conn.close()
@@ -2685,7 +3032,7 @@ def list_cordons(status_filter: Optional[str] = Query("active", description="act
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT id, geometry, reason, status, created_at, event_id
+                    SELECT id, geometry, reason, status, created_at, event_id, source
                     FROM cordons
                     {where}
                     ORDER BY created_at DESC;
@@ -2708,6 +3055,7 @@ def list_cordons(status_filter: Optional[str] = Query("active", description="act
                 "status": r[3],
                 "created_at": r[4].isoformat(),
                 "event_id": str(r[5]) if r[5] is not None else None,
+                "source": r[6] or "operator",
             }
             for r in rows
         ]
