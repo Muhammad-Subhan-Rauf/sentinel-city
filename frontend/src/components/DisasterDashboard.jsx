@@ -94,7 +94,7 @@ export default function DisasterDashboard() {
   const [severity, setSeverity] = useState(3)
   const [notes, setNotes] = useState('')
   const [cause, setCause] = useState('infrastructure') // 'weather' | 'infrastructure'
-  const [spreadSpeed, setSpreadSpeed] = useState(1)     // 0.25× – 4× multiplier
+  const [spreadSpeed, setSpreadSpeed] = useState(0.25)  // 0.25× – 0.5× multiplier
   const [peopleInside, setPeopleInside] = useState(50)  // Building_Fire
   const [safeExitPct, setSafeExitPct] = useState(70)    // Building_Fire (0-100)
   const [spreadInSeconds, setSpreadInSeconds] = useState(30)  // Building_Fire delayed spread
@@ -1554,7 +1554,7 @@ export default function DisasterDashboard() {
               <input
                 type="range"
                 min="0.25"
-                max="4"
+                max="0.5"
                 step="0.05"
                 value={spreadSpeed}
                 onChange={(e) => setSpreadSpeed(parseFloat(e.target.value))}
@@ -1562,8 +1562,7 @@ export default function DisasterDashboard() {
               />
               <div className="flex justify-between text-[10px] text-zinc-600 mt-1">
                 <span>0.25× slow</span>
-                <span>1× normal</span>
-                <span>4× extreme</span>
+                <span>0.5× max</span>
               </div>
             </section>
           )}
