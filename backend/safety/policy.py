@@ -1,137 +1,139 @@
-"""ActionReversibilityIndex — decides which tool calls need a Verifier pass.
+"""Deterministic policy validators for the single-pass NLU pipeline.
 
-Pure function of (tool_name, args) → (impact_tier, needs_verifier, needs_lint,
-reversibility_seconds). No LLM, no I/O. Hot-tune the thresholds here without
-touching the orchestrator.
+This module replaces the old LLM Verifier (deleted) with pure-Python
+bounds checks. Each ``validate_*`` function takes a typed action and
+returns a ``ValidationResult`` — approved or denied with a structured
+reason. Called by ``pipeline.execute`` BEFORE opening any DB transaction.
 
-Tier semantics:
-  0  read-only or trivially reversible (no extra checks)
-  1  small mutation, low blast radius (audit only; no verifier)
-  2  high impact, reversible within minutes (verifier required)
-  3  high impact, irreversible or city-wide (verifier + linter required)
+Hard limits enforced here, with the matching policy table:
+  - dispatch.count   ≤ SEVERITY_DISPATCH_CAP[severity]  AND ≤ station_available
+  - cordon.radius_m  ≤ MAX_CORDON_RADIUS_M
+  - alert.message    contains a directive verb for warning/evacuation
+  - declare.severity ∈ {low, medium, high, critical}
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Dict, Optional
+
+
+# Maximum trucks per incident at any given severity. Mirrors
+# pipeline.decide.FIRE_UNITS_BY_SEVERITY ceilings + a 50% headroom buffer.
+SEVERITY_DISPATCH_CAP: Dict[str, int] = {
+    "low": 2,
+    "medium": 4,
+    "high": 6,
+    "critical": 8,
+}
+
+# Maximum cordon radius in meters. Larger than this is almost certainly a
+# bug — Sentinel-City scenarios are city-block scale, not regional.
+MAX_CORDON_RADIUS_M = 2000
+
+# Citizen alert text caps — keep messages short and unambiguous.
+MAX_ALERT_MESSAGE_LEN = 280
+
+
+_DIRECTIVE_VERBS = {"evacuate", "shelter", "avoid", "stay", "leave"}
+_PANIC_WORDS = {"catastrophe", "apocalypse", "doomed", "everyone is dead"}
 
 
 @dataclass(frozen=True)
-class Decision:
-    tool: str
-    tier: int
-    needs_verifier: bool
-    needs_lint: bool
-    reversibility_seconds: float  # math.inf = read-only, 0 = irreversible
-    reason: str
+class ValidationResult:
+    """The output of a validator. Never None; either approved or denied with reason."""
+    approved: bool
+    reason: str = ""
+
+    @classmethod
+    def approve(cls, reason: str = "") -> "ValidationResult":
+        return cls(True, reason)
+
+    @classmethod
+    def deny(cls, reason: str) -> "ValidationResult":
+        return cls(False, reason)
 
 
-# Tuneable thresholds (the plan's "T_check_seconds" lives here too).
-DISPATCH_SMALL_MAX_UNITS = 2
-MULTI_STATION_BIG_THRESHOLD_UNITS = 6
-CORDON_LARGE_RADIUS_M = 500  # > π·(500m)² ≈ 0.785 km²
-CITIZEN_ALERT_HIGH_SEVERITIES = {"warning", "evacuation", "high", "critical"}
-
-# Auto-rollback check delays per tool (seconds)
-ROLLBACK_DELAY_SECONDS: Dict[str, float] = {
-    "dispatch_units": 90.0,
-    "multi_station_dispatch": 90.0,
-    "create_cordon": 120.0,
-    "publish_citizen_alert": 60.0,
-    "declare_incident": 45.0,
-}
-
-
-_READ_TOOLS = {
-    "get_weather", "get_traffic", "get_citizen_reports",
-    "get_world_state", "get_active_notifications", "get_active_cordons",
-    "triangulate_incident",
-}
-
-
-def _coerce_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
+def validate_dispatch(
+    count: int,
+    severity: str,
+    station_available: int,
+) -> ValidationResult:
+    """Bounds + capacity check for a single fire-truck dispatch order."""
+    if count <= 0:
+        return ValidationResult.deny(f"non-positive dispatch count {count}")
+    sev = (severity or "").lower()
+    cap = SEVERITY_DISPATCH_CAP.get(sev)
+    if cap is None:
+        return ValidationResult.deny(f"unknown severity '{severity}'")
+    if count > cap:
+        return ValidationResult.deny(
+            f"dispatch count {count} exceeds {sev} cap of {cap}"
+        )
+    if station_available < count:
+        return ValidationResult.deny(
+            f"station has {station_available} available; requested {count}"
+        )
+    return ValidationResult.approve()
 
 
-def _as_dict(d: Any) -> Dict[str, Any]:
-    """Tolerate Pydantic models or plain dicts. Returns {} for unknown shapes."""
-    if isinstance(d, dict):
-        return d
-    if hasattr(d, "model_dump"):
-        try:
-            return d.model_dump()
-        except Exception:
-            return {}
-    if hasattr(d, "__dict__"):
-        return dict(d.__dict__)
-    return {}
+def validate_cordon(radius_m: int, severity: Optional[str] = None) -> ValidationResult:
+    """Bounds check on a cordon order."""
+    if radius_m <= 0:
+        return ValidationResult.deny(f"non-positive cordon radius {radius_m}")
+    if radius_m > MAX_CORDON_RADIUS_M:
+        return ValidationResult.deny(
+            f"cordon radius {radius_m}m exceeds max {MAX_CORDON_RADIUS_M}m"
+        )
+    return ValidationResult.approve()
 
 
-def _coerce_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
+def validate_alert(severity: str, message: str) -> ValidationResult:
+    """Wording check on a citizen alert.
+
+    Replaces the old LLM Verifier's panic-tone check + the linter's
+    directive-verb check, in plain Python.
+    """
+    if not message or not message.strip():
+        return ValidationResult.deny("empty alert message")
+    if len(message) > MAX_ALERT_MESSAGE_LEN:
+        return ValidationResult.deny(
+            f"alert message {len(message)} chars exceeds max {MAX_ALERT_MESSAGE_LEN}"
+        )
+    sev = (severity or "").lower()
+    if sev not in {"info", "advisory", "warning", "evacuation"}:
+        return ValidationResult.deny(f"unknown alert severity '{severity}'")
+    if sev in {"warning", "evacuation"}:
+        if not any(v in message.lower() for v in _DIRECTIVE_VERBS):
+            return ValidationResult.deny(
+                f"{sev} alert missing directive verb (one of: {sorted(_DIRECTIVE_VERBS)})"
+            )
+    msg_lower = message.lower()
+    for w in _PANIC_WORDS:
+        if w in msg_lower:
+            return ValidationResult.deny(f"panic-inducing language: '{w}'")
+    return ValidationResult.approve()
 
 
-def evaluate(tool: str, args: Dict[str, Any]) -> Decision:
-    """Map a tool call to its safety tier and required checks."""
+def validate_declare(
+    incident_type: str,
+    severity: str,
+    n_reports: int,
+    derived_confidence: float,
+) -> ValidationResult:
+    """Sanity-check a declare_incident order before persistence.
 
-    # Tier 0 — pure reads
-    if tool in _READ_TOOLS:
-        return Decision(tool, 0, False, False, math.inf, "read-only")
-
-    # Tier 1 — trivial mutations
-    if tool == "return_units":
-        return Decision(tool, 1, False, False, math.inf, "recall: trivially reversible")
-    if tool == "update_incident":
-        # Status changes vs. note tweaks aren't worth distinguishing in the demo
-        return Decision(tool, 1, False, False, math.inf, "incident notes/status")
-    if tool == "retract_citizen_alert":
-        return Decision(tool, 1, False, False, math.inf, "retraction of prior alert")
-    if tool == "clear_cordon":
-        return Decision(tool, 1, False, False, math.inf, "lift cordon")
-
-    # Tier 2/3 — high-impact mutations
-    if tool == "declare_incident":
-        return Decision(tool, 2, True, False, 45.0, "creates new incident record")
-
-    if tool == "dispatch_units":
-        count = _coerce_int(args.get("count"), 1)
-        if count <= DISPATCH_SMALL_MAX_UNITS:
-            return Decision(tool, 2, True, False, 120.0, f"single-station dispatch ({count} units)")
-        return Decision(tool, 3, True, True, 120.0, f"large single-station dispatch ({count} units)")
-
-    if tool == "multi_station_dispatch":
-        total = sum(_coerce_int(_as_dict(d).get("count"), 0) for d in (args.get("dispatches") or []))
-        if total <= MULTI_STATION_BIG_THRESHOLD_UNITS:
-            return Decision(tool, 2, True, False, 120.0, f"multi-station dispatch ({total} units)")
-        return Decision(tool, 3, True, True, 120.0, f"large multi-station dispatch ({total} units)")
-
-    if tool == "create_cordon":
-        radius = _coerce_float(args.get("radius"), 0.0)
-        if radius < CORDON_LARGE_RADIUS_M:
-            return Decision(tool, 2, True, False, math.inf, f"cordon radius {radius:.0f}m")
-        return Decision(tool, 3, True, True, math.inf, f"large cordon radius {radius:.0f}m")
-
-    if tool == "publish_citizen_alert":
-        sev = str(args.get("severity", "")).strip().lower()
-        if sev in CITIZEN_ALERT_HIGH_SEVERITIES:
-            return Decision(tool, 3, True, True, 0.0, f"high-severity citizen alert ({sev})")
-        return Decision(tool, 2, True, True, 0.0, f"citizen alert ({sev})")
-
-    if tool == "clear_incident":
-        return Decision(tool, 3, True, False, 0.0, "marks incident resolved")
-
-    # Unknown / new tools default to tier 2 with verifier — fail safe.
-    return Decision(tool, 2, True, False, math.inf, f"unknown tool '{tool}' — default verify")
-
-
-def rollback_delay_for(tool: str) -> float | None:
-    """Seconds to wait before RollbackChecker re-evaluates. None = no rollback."""
-    return ROLLBACK_DELAY_SECONDS.get(tool)
+    Last-line-of-defense check that decide.should_declare's thresholds
+    weren't bypassed somehow. Mirrors the same gates but is callable
+    standalone (e.g. from execute.py, from a manual operator-triggered
+    declare path).
+    """
+    if incident_type not in {"building_fire", "wildfire", "flood", "medical", "other"}:
+        return ValidationResult.deny(f"unknown incident_type '{incident_type}'")
+    if severity not in SEVERITY_DISPATCH_CAP:
+        return ValidationResult.deny(f"unknown severity '{severity}'")
+    if n_reports < 1:
+        return ValidationResult.deny(f"n_reports={n_reports} below minimum 1")
+    if not (0.0 <= derived_confidence <= 1.0):
+        return ValidationResult.deny(f"confidence {derived_confidence} outside [0, 1]")
+    return ValidationResult.approve()

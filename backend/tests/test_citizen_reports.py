@@ -33,6 +33,13 @@ def _make_test_client():
     return TestClient(main.app), main
 
 
+async def _noop_process_report(_report_id):
+    """Stand-in for pipeline.execute.process_report so the BackgroundTask
+    scheduled by POST /api/citizen-report doesn't try to hit a real DB
+    during these handler-focused tests."""
+    return {"stage": "test_stub"}
+
+
 def _capture_rows_mock():
     """Returns (conn_mock, captured_rows_list). The mock replaces
     psycopg2.connect so the route's `with conn: with conn.cursor() as cur:`
@@ -44,6 +51,12 @@ def _capture_rows_mock():
     def fake_execute_values(cur, sql, rows, *args, **kwargs):
         captured.extend(rows)
         cur.rowcount = len(rows)
+        # The pipeline rewrite added RETURNING id so the new handler can
+        # schedule per-row background tasks. With fetch=True, execute_values
+        # returns the result rows. Each row tuple's first element is the UUID.
+        if kwargs.get("fetch"):
+            return [(r[0],) for r in rows]
+        return None
 
     cursor_ctx = MagicMock()
     cursor_ctx.__enter__ = MagicMock(return_value=cursor)
@@ -74,7 +87,8 @@ def test_only_valid_uuids_are_inserted():
         ],
     }
     with patch.object(main_mod.psycopg2, "connect", return_value=conn), \
-         patch.object(main_mod.psycopg2.extras, "execute_values", side_effect=fake_exec):
+         patch.object(main_mod.psycopg2.extras, "execute_values", side_effect=fake_exec), \
+         patch("pipeline.execute.process_report", side_effect=_noop_process_report):
         res = client.post("/api/citizen-report", json=payload)
     assert res.status_code == 200, res.text
     body = res.json()
@@ -104,7 +118,8 @@ def test_crime_synthetic_event_id_is_dropped_silently_not_500():
         ],
     }
     with patch.object(main_mod.psycopg2, "connect", return_value=conn), \
-         patch.object(main_mod.psycopg2.extras, "execute_values", side_effect=fake_exec):
+         patch.object(main_mod.psycopg2.extras, "execute_values", side_effect=fake_exec), \
+         patch("pipeline.execute.process_report", side_effect=_noop_process_report):
         res = client.post("/api/citizen-report", json=payload)
     assert res.status_code == 200, res.text
     body = res.json()
@@ -150,7 +165,8 @@ def test_mixed_batch_keeps_valid_drops_invalid():
         ],
     }
     with patch.object(main_mod.psycopg2, "connect", return_value=conn), \
-         patch.object(main_mod.psycopg2.extras, "execute_values", side_effect=fake_exec):
+         patch.object(main_mod.psycopg2.extras, "execute_values", side_effect=fake_exec), \
+         patch("pipeline.execute.process_report", side_effect=_noop_process_report):
         res = client.post("/api/citizen-report", json=payload)
     assert res.status_code == 200, res.text
     body = res.json()

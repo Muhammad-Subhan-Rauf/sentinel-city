@@ -12,7 +12,7 @@ import psycopg2
 import psycopg2.extras
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -23,95 +23,17 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Boot the AI orchestrator's detection + monitoring loops alongside the API.
+    """FastAPI lifespan — no-op.
 
-    Both loops talk to this same process via http://localhost:8000 (loopback,
-    microseconds of overhead), keeping the orchestrator code's HTTP-based
-    SentinelAPIClient unchanged. AuditLogger writes into the GLOBAL_LOG_BUFFER
-    that /api/logs reads from, so AI logs work end-to-end in the deployed UI.
+    The legacy ReAct orchestrator (Detection + Monitoring loops, SLA watchdog,
+    weather/traffic watchers, wake bus) has been removed. AI activity is
+    fully event-driven: POST /api/citizen-report → BackgroundTask →
+    pipeline.execute.process_report. No polling, no heartbeat, no LLM
+    activity unless a citizen report arrives.
     """
     log = logging.getLogger("sentinel.lifespan")
-
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    if not project:
-        log.warning("GOOGLE_CLOUD_PROJECT not set — skipping orchestrator startup.")
-        yield
-        return
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
-
-    try:
-        from google import genai
-        from api_client import SentinelAPIClient
-        from audit import AuditLogger
-        from state import AgentState
-        from orchestrator import detection_loop, monitoring_supervisor, load_prompt, set_tool_invoker
-        from agent_tools import build_tools, make_tool_invoker
-        from agent_graph import build_agent
-    except Exception as exc:
-        log.warning(f"Orchestrator import failed ({exc}); API will run without AI loops.")
-        yield
-        return
-
-    # The orchestrator hits its own backend over loopback. Production env can
-    # override via SENTINEL_API_URL (e.g. https://sentinel-backend-...run.app).
-    base_url = os.environ.get("SENTINEL_API_URL", "http://localhost:8000")
-    api = SentinelAPIClient(base_url=base_url)
-    state = AgentState(agent_id="agent-sentinel-core")
-    audit = AuditLogger()
-
-    # The genai.Client below is ONLY used by tools.ToolExecutor._resolve_target_via_gemini
-    # (a (0,0)-coordinate recovery helper). The main agent runs on Vertex AI.
-    # We keep the AI Studio key path so the helper still works if you have one;
-    # if not, target-resolution returns None and the LLM-provided target stands.
-    gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
-
-    # Build the LangGraph ReAct agents on Vertex AI. The monitoring agent is
-    # built with force_tool_use=True so Gemini cannot reply with "Would you
-    # like me to proceed?" without actually invoking a tool.
-    # Pre-register bus instances so wake-ups pushed before the loops start
-    # awaiting (e.g. an early POST /api/citizen-report) get queued, not dropped.
-    from wake_bus import WakeBus
-    WakeBus.for_label("detection")
-    WakeBus.for_label("monitoring")
-
-    log.info(f"Building LangGraph agents (Vertex AI: project={project}, location={location})...")
-    tools_list = build_tools(api, audit, client, agent_id=state.agent_id, state=state)
-    set_tool_invoker(make_tool_invoker(tools_list))
-    detection_prompt = await load_prompt("detection_prompt.md")
-    monitoring_prompt = await load_prompt("monitoring_prompt.md")
-    detection_agent = build_agent(project, location, detection_prompt, tools_list, force_tool_use=False)
-    monitoring_agent = build_agent(project, location, monitoring_prompt, tools_list, force_tool_use=True)
-
-    log.info(f"Starting orchestrator loops against {base_url}")
-    detection_task = asyncio.create_task(detection_loop(api, state, audit, client, detection_agent))
-    monitoring_task = asyncio.create_task(monitoring_supervisor(api, state, audit, client, monitoring_agent))
-
-    # SLA watchdog: dispatch SLA + deadman heartbeat — forces a re-tick if
-    # the system goes silent or declares without dispatching.
-    from safety.sla import start_watchdog
-    sla_task = start_watchdog(audit)
-
-    # Wake-up watchers: turn polled APIs into bus events so the AI sleeps
-    # until something interesting actually changes.
-    from watchers import weather as _weather_watcher, traffic as _traffic_watcher
-    weather_task = _weather_watcher.start(api)
-    traffic_task = _traffic_watcher.start(api)
-
-    background_tasks = (detection_task, monitoring_task, sla_task, weather_task, traffic_task)
-
-    try:
-        yield
-    finally:
-        log.info("Shutting down orchestrator loops")
-        for t in background_tasks:
-            t.cancel()
-        for t in background_tasks:
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
-        await api.close()
+    log.info("Sentinel-City API ready. AI pipeline is event-driven via POST /api/citizen-report.")
+    yield
 
 
 app = FastAPI(
@@ -168,6 +90,76 @@ def _bootstrap_schema() -> None:
                 cur.execute("""
                     ALTER TABLE citizen_reports
                     DROP CONSTRAINT IF EXISTS citizen_reports_event_id_fkey;
+                """)
+
+                # Pipeline schema (migration db/009_pipeline.sql, idempotent).
+                # PostGIS for spatial clustering, geom column on citizen_reports,
+                # nlu_extraction + declared_incident_id stamps, nlu_cache memo.
+                cur.execute("CREATE EXTENSION IF NOT EXISTS postgis;")
+                cur.execute("""
+                    ALTER TABLE citizen_reports
+                    ADD COLUMN IF NOT EXISTS geom geography(Point, 4326);
+                """)
+                cur.execute("""
+                    UPDATE citizen_reports
+                    SET geom = ST_SetSRID(
+                        ST_MakePoint(
+                            (location->>'lng')::double precision,
+                            (location->>'lat')::double precision
+                        ),
+                        4326
+                    )::geography
+                    WHERE geom IS NULL
+                      AND location ? 'lat'
+                      AND location ? 'lng'
+                      AND (location->>'lat') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                      AND (location->>'lng') ~ '^-?[0-9]+(\\.[0-9]+)?$';
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_citizen_reports_geom
+                        ON citizen_reports USING GIST (geom);
+                """)
+                cur.execute("""
+                    ALTER TABLE citizen_reports
+                    ADD COLUMN IF NOT EXISTS declared_incident_id UUID;
+                """)
+                cur.execute("""
+                    ALTER TABLE citizen_reports
+                    ADD COLUMN IF NOT EXISTS nlu_extraction JSONB;
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_citizen_reports_undeclared
+                        ON citizen_reports (reported_at)
+                        WHERE declared_incident_id IS NULL;
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS nlu_cache (
+                        transcript_hash TEXT PRIMARY KEY,
+                        model_version   TEXT NOT NULL,
+                        extraction      JSONB NOT NULL,
+                        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_nlu_cache_created
+                        ON nlu_cache (created_at);
+                """)
+                # Make sure disaster_events has the location_estimate column
+                # the pipeline writes when declaring an incident.
+                cur.execute("""
+                    ALTER TABLE disaster_events
+                    ADD COLUMN IF NOT EXISTS location_estimate JSONB;
+                """)
+                # Link cordons to the incident they were raised for so
+                # DELETE /api/disasters/{id} can also clear them.
+                cur.execute("""
+                    ALTER TABLE cordons
+                    ADD COLUMN IF NOT EXISTS event_id UUID;
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_cordons_event
+                        ON cordons (event_id)
+                        WHERE event_id IS NOT NULL;
                 """)
                 # Self-heal disaster_events schema for DBs (e.g. Supabase) that
                 # don't run the db/*.sql migration files. Idempotent.
@@ -983,7 +975,10 @@ def trigger_disaster(payload: DisasterPayload):
 
 
 @app.post("/api/citizen-report", tags=["Citizen Reports"])
-async def post_citizen_reports(batch: CitizenReportBatch):
+async def post_citizen_reports(
+    batch: CitizenReportBatch,
+    background_tasks: BackgroundTasks,
+):
     """
     Batch-ingest 911 reports from the citizen simulation. Each report references
     an existing disaster_events.id; rows for unknown event_ids are dropped silently
@@ -993,6 +988,11 @@ async def post_citizen_reports(batch: CitizenReportBatch):
     silently — the engine emits synthetic ids like 'crime:<idx>:<t>' for
     operator-triggered robberies which aren't real disaster rows. Dropping them
     keeps the batch from failing on a Postgres UUID parse error.
+
+    When SENTINEL_PIPELINE_MODE=new is set, each inserted report is scheduled
+    onto a FastAPI BackgroundTask running pipeline.execute.process_report, which
+    drives the single-pass NLU → cluster → decide → execute path. Otherwise the
+    legacy wake_bus path runs.
     """
     if not batch.reports:
         return {"inserted": 0}
@@ -1015,22 +1015,27 @@ async def post_citizen_reports(batch: CitizenReportBatch):
             r.perceived_severity,
         ))
     inserted = 0
+    inserted_ids: list[str] = []
     if rows:
         try:
             conn = psycopg2.connect(DATABASE_URL)
             with conn:
                 with conn.cursor() as cur:
-                    psycopg2.extras.execute_values(
-                        cur,
-                        """
-                        INSERT INTO citizen_reports
-                            (id, event_id, citizen_idx, report_kind, location, transcript, perceived_severity)
-                        VALUES %s
-                        ON CONFLICT DO NOTHING;
-                        """,
-                        rows,
-                    )
-                    inserted = cur.rowcount
+                    inserted_ids = [
+                        str(row[0]) for row in psycopg2.extras.execute_values(
+                            cur,
+                            """
+                            INSERT INTO citizen_reports
+                                (id, event_id, citizen_idx, report_kind, location, transcript, perceived_severity)
+                            VALUES %s
+                            ON CONFLICT DO NOTHING
+                            RETURNING id;
+                            """,
+                            rows,
+                            fetch=True,
+                        )
+                    ]
+                    inserted = len(inserted_ids)
             conn.close()
         except Exception as exc:
             raise HTTPException(
@@ -1038,28 +1043,21 @@ async def post_citizen_reports(batch: CitizenReportBatch):
                 detail=f"Citizen report write failed: {exc}",
             )
 
-    # Wake the AI: citizen call(s) just arrived. Push the centroid of the
-    # batch (median of the lat/lng pairs) so the bus can area-dedupe.
-    # All-skipped batches (every event_id non-UUID → rows empty, typically
-    # the citizen sim's prank-call noise) still wake the AI with a
-    # `citizen_report:prank` source, so the orchestrator's audit records
-    # the inbound noise without persisting it.
-    try:
-        from wake_bus import WakeBus
-        lats = [float(r.location.get("lat", 0)) for r in batch.reports if isinstance(r.location, dict)]
-        lngs = [float(r.location.get("lng", 0)) for r in batch.reports if isinstance(r.location, dict)]
-        area = None
-        if lats and lngs:
-            area = {"lat": sum(lats) / len(lats), "lng": sum(lngs) / len(lngs)}
-        source = "citizen_report:prank" if not rows else "citizen_report"
-        await WakeBus.push_all(
-            source,
-            area=area,
-            payload={"count": len(batch.reports), "inserted": inserted, "skipped": skipped},
-        )
-    except Exception:
-        # Best-effort: never let the wake-up plumbing crash the ingest.
-        pass
+    # Pipeline trigger: schedule one BackgroundTask per inserted row. The
+    # mobile/web client gets a 200 OK immediately; the LLM extraction +
+    # clustering + dispatch happen out-of-band. This is the only AI entry
+    # point — there is no polling loop, no heartbeat.
+    if inserted_ids:
+        try:
+            from pipeline.execute import process_report as _pipeline_process
+            for rid in inserted_ids:
+                background_tasks.add_task(_pipeline_process, rid)
+        except Exception as exc:
+            # Never block the ingest if the pipeline import fails; the row is
+            # already persisted and can be retried.
+            logging.getLogger(__name__).warning(
+                f"pipeline trigger failed: {exc}"
+            )
 
     return {"inserted": inserted, "skipped": skipped}
 
@@ -1416,27 +1414,6 @@ async def post_responder_reports(batch: ResponderReportBatch):
         logging.getLogger("sentinel.auto_dispatch").warning(
             f"casualty auto-dispatch best-effort path failed: {exc}"
         )
-
-    # Wake the AI per distinct report_kind so the agent context's wake_reason
-    # surfaces both casualties AND corrections when both arrive together.
-    try:
-        from wake_bus import WakeBus
-        by_kind: Dict[str, List[ResponderReport]] = {}
-        for r in batch.reports:
-            by_kind.setdefault(r.report_kind, []).append(r)
-        for kind, items in by_kind.items():
-            lats = [float(r.location.get("lat", 0)) for r in items]
-            lngs = [float(r.location.get("lng", 0)) for r in items]
-            area = None
-            if lats and lngs:
-                area = {"lat": sum(lats) / len(lats), "lng": sum(lngs) / len(lngs)}
-            await WakeBus.push_all(
-                f"responder:{kind}",
-                area=area,
-                payload={"count": len(items)},
-            )
-    except Exception:
-        pass
 
     return {
         "inserted": inserted,
@@ -1954,10 +1931,33 @@ def delete_all_disasters():
 
 @app.delete("/api/disasters/{event_id}", tags=["Disasters"])
 def delete_disaster(event_id: str):
+    """Resolve an incident: close any cordons + dispatches tied to it, then
+    delete the disaster row. Called by the operator dashboard's
+    onZoneResolved hook when firefighters extinguish a fire (the wave radius
+    hits zero and the engine signals resolution).
+    """
     try:
         conn = psycopg2.connect(DATABASE_URL)
         with conn:
             with conn.cursor() as cur:
+                # 1. Close any cordons raised for this incident so they
+                #    don't linger on the map after the fire is out.
+                cur.execute(
+                    "UPDATE cordons SET status = 'cleared' "
+                    "WHERE event_id = %s::uuid AND status = 'active';",
+                    (event_id,),
+                )
+                # 2. Mark outstanding active_dispatches done. The truck
+                #    engine recalls trucks via its own onZoneResolved path
+                #    (and posts return_ack to decrement station counters);
+                #    this row update keeps /api/warnings/nearby honest for
+                #    mobile clients still pointing at the row.
+                cur.execute(
+                    "UPDATE active_dispatches SET status = 'completed' "
+                    "WHERE event_id = %s::uuid AND status = 'active';",
+                    (event_id,),
+                )
+                # 3. Remove the disaster.
                 cur.execute("DELETE FROM disaster_events WHERE id = %s;", (event_id,))
         conn.close()
     except Exception as exc:

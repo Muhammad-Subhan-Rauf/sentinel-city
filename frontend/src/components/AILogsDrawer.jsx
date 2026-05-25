@@ -74,33 +74,64 @@ export default function AILogsDrawer({
     }
   }
 
+  const [copyState, setCopyState] = useState('idle')  // 'idle' | 'copied' | 'failed'
+  const handleCopyLogs = async () => {
+    // Serialize the same filtered slice the user is looking at, plus the
+    // current metrics snapshot so a paste into Slack / a bug report is
+    // self-contained. Newest first matches the on-screen order.
+    const filtered = logs.filter(l => filter === 'all' || l.event_type === filter)
+    const payload = {
+      copied_at: new Date().toISOString(),
+      filter,
+      metric_counters: metrics?.counters || {},
+      logs: filtered,
+    }
+    const text = JSON.stringify(payload, null, 2)
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        // Older browsers / non-secure contexts fall back to a hidden textarea.
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        document.body.removeChild(ta)
+      }
+      setCopyState('copied')
+      setTimeout(() => setCopyState('idle'), 1500)
+    } catch (err) {
+      console.error("Failed to copy logs", err)
+      setCopyState('failed')
+      setTimeout(() => setCopyState('idle'), 1500)
+    }
+  }
+
   const stats = useMemo(() => {
     const c = metrics?.counters || {}
-    const detInvokes = c['agent.invoke.detection'] || 0
-    const monInvokes = c['agent.invoke.monitoring'] || 0
-    const llmCalls = detInvokes + monInvokes
-    const cacheHits = c['agent_cache.hit_total'] || 0
-    const readHits = c['cache.read.hit_total'] || 0
-    const readMisses = c['cache.read.miss_total'] || 0
-    const totalReads = readHits + readMisses
-    const readHitPct = totalReads > 0 ? Math.round((readHits / totalReads) * 100) : 0
+    // Pipeline metrics (single-pass NLU architecture).
+    const llmCalls = c['extract.calls_total'] || 0
+    const reportsProcessed = c['pipeline.report_processed'] || 0
+    const cacheHits = c['pipeline.nlu_cache_hit'] || 0
+    const cacheMisses = c['pipeline.nlu_cache_miss'] || 0
+    const totalNlu = cacheHits + cacheMisses
+    const cacheHitPct = totalNlu > 0 ? Math.round((cacheHits / totalNlu) * 100) : 0
 
-    const verifierApprove = c['verifier.verdict.approve'] || 0
-    const verifierModify = c['verifier.verdict.modify'] || 0
-    const verifierDeny = c['verifier.verdict.deny'] || 0
-    const linterMod = sumWithPrefix(c, 'linter.modify')
-    const linterBlock = sumWithPrefix(c, 'linter.block')
-    const rollbacksFired = sumWithPrefix(c, 'rollback.executed')
-    const coordResolved = c['coord_fallback.resolved'] || 0
+    const incidentsDeclared = c['pipeline.incident_declared'] || 0
+    const dispatchesExecuted = c['pipeline.dispatch_executed'] || 0
+    const cordonsCreated = c['pipeline.cordon_created'] || 0
+    const alertsPublished = c['pipeline.alert_published'] || 0
 
-    const slaBreaches = c['sla.dispatch_breach'] || 0
-    const deadmanTrips = sumWithPrefix(c, 'sla.deadman_trip')
+    const extractErrors = sumWithPrefix(c, 'extract.error')
+    const extractTimeouts = c['extract.timeout'] || 0
 
     return {
-      llmCalls, cacheHits, readHits, readHitPct,
-      verifierApprove, verifierModify, verifierDeny,
-      linterMod, linterBlock, rollbacksFired, coordResolved,
-      slaBreaches, deadmanTrips,
+      llmCalls, reportsProcessed, cacheHits, cacheHitPct,
+      incidentsDeclared, dispatchesExecuted, cordonsCreated, alertsPublished,
+      extractErrors, extractTimeouts,
     }
   }, [metrics])
 
@@ -148,6 +179,14 @@ export default function AILogsDrawer({
             </select>
             <button
               type="button"
+              onClick={handleCopyLogs}
+              className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-[11px] rounded px-2 py-1 border border-zinc-700 transition-colors"
+              title="Copy the visible logs + current metrics as JSON to your clipboard"
+            >
+              {copyState === 'copied' ? 'Copied!' : copyState === 'failed' ? 'Failed' : 'Copy'}
+            </button>
+            <button
+              type="button"
               onClick={handleClearLogs}
               className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-[11px] rounded px-2 py-1 border border-zinc-700 transition-colors"
               title="Clear the in-memory log buffer (JSONL files on disk are kept)"
@@ -171,18 +210,15 @@ export default function AILogsDrawer({
           <div className="px-5 py-3 border-b border-zinc-800 shrink-0 bg-zinc-900/40">
             <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Live Metrics</div>
             <div className="grid grid-cols-3 gap-2">
-              <MetricTile label="LLM calls" value={formatNumber(stats.llmCalls)} accent="zinc" />
-              <MetricTile label="Cache hits" value={formatNumber(stats.cacheHits)} accent="emerald" hint="L1 replay" />
-              <MetricTile label="Read cache" value={`${stats.readHitPct}%`} accent="emerald" hint={`${formatNumber(stats.readHits)} hits`} />
-              <MetricTile label="Verifier ✓" value={formatNumber(stats.verifierApprove)} accent="blue" />
-              <MetricTile label="Verifier ↻" value={formatNumber(stats.verifierModify)} accent="amber" hint="modified" />
-              <MetricTile label="Verifier ✗" value={formatNumber(stats.verifierDeny)} accent="red" hint="denied" />
-              <MetricTile label="Lint mods" value={formatNumber(stats.linterMod)} accent="amber" />
-              <MetricTile label="Rollbacks" value={formatNumber(stats.rollbacksFired)} accent="red" hint="auto-revert" />
-              <MetricTile label="Coord ↻" value={formatNumber(stats.coordResolved)} accent="emerald" hint="no LLM" />
-              <MetricTile label="SLA breach" value={formatNumber(stats.slaBreaches)} accent={stats.slaBreaches > 0 ? "red" : "zinc"} />
-              <MetricTile label="Deadman" value={formatNumber(stats.deadmanTrips)} accent={stats.deadmanTrips > 0 ? "red" : "zinc"} />
-              <MetricTile label="Lint block" value={formatNumber(stats.linterBlock)} accent={stats.linterBlock > 0 ? "red" : "zinc"} />
+              <MetricTile label="LLM calls" value={formatNumber(stats.llmCalls)} accent="zinc" hint="NLU extract" />
+              <MetricTile label="Reports" value={formatNumber(stats.reportsProcessed)} accent="zinc" hint="processed" />
+              <MetricTile label="NLU cache" value={`${stats.cacheHitPct}%`} accent="emerald" hint={`${formatNumber(stats.cacheHits)} hits`} />
+              <MetricTile label="Incidents" value={formatNumber(stats.incidentsDeclared)} accent="blue" hint="declared" />
+              <MetricTile label="Dispatches" value={formatNumber(stats.dispatchesExecuted)} accent="blue" />
+              <MetricTile label="Cordons" value={formatNumber(stats.cordonsCreated)} accent="blue" />
+              <MetricTile label="Alerts" value={formatNumber(stats.alertsPublished)} accent="blue" />
+              <MetricTile label="Timeouts" value={formatNumber(stats.extractTimeouts)} accent={stats.extractTimeouts > 0 ? "amber" : "zinc"} hint="LLM" />
+              <MetricTile label="Errors" value={formatNumber(stats.extractErrors)} accent={stats.extractErrors > 0 ? "red" : "zinc"} hint="extract" />
             </div>
           </div>
         )}
