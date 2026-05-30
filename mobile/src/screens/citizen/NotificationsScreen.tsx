@@ -153,20 +153,18 @@ export default function NotificationsScreen() {
       : `Citywide · severity ${rule.severityFloor}+`
     : 'Sign in to receive alerts';
 
-  const renderRightActions = (
-    _progress: Animated.AnimatedInterpolation<number>,
-    dragX: Animated.AnimatedInterpolation<number>,
-  ) => {
-    const translateX = dragX.interpolate({ inputRange: [-160, 0], outputRange: [0, 80], extrapolate: 'clamp' });
-    return (
-      <Animated.View style={[styles.removeAction, { backgroundColor: t.color.danger, borderRadius: t.radius.lg, transform: [{ translateX }] }]}>
-        <Icon name="trash" size={20} color={t.color.onDanger} />
-        <Text variant="label" color={t.color.onDanger} style={{ marginTop: 2 }}>
-          Remove
-        </Text>
-      </Animated.View>
-    );
-  };
+  const RemovePane = () => (
+    <Animated.View style={[styles.removeAction, { backgroundColor: t.color.danger, borderRadius: t.radius.lg }]}>
+      <Icon name="trash" size={20} color={t.color.onDanger} />
+      <Text variant="label" color={t.color.onDanger} style={{ marginTop: 2 }}>
+        Remove
+      </Text>
+    </Animated.View>
+  );
+  // Swipe left → action pane on the right; swipe right → pane on the left.
+  // Either direction removes the alert (see onSwipeableOpen).
+  const renderRightActions = () => <RemovePane />;
+  const renderLeftActions = () => <RemovePane />;
 
   return (
     <Screen title="Alerts" subtitle={radiusLabel} scroll={false} padded={false}>
@@ -216,9 +214,12 @@ export default function NotificationsScreen() {
                   else swipeRefs.current.delete(item.id);
                 }}
                 renderRightActions={renderRightActions}
+                renderLeftActions={renderLeftActions}
                 friction={1.5}
                 rightThreshold={60}
+                leftThreshold={60}
                 overshootRight={false}
+                overshootLeft={false}
                 onSwipeableWillOpen={() => {
                   if (openSwipeRef.current && openSwipeRef.current !== swipeRefs.current.get(item.id)) {
                     openSwipeRef.current.close();

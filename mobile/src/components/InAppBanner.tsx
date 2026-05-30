@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Animated, Pressable, StyleSheet, View } from 'react-native';
+import { Animated, Dimensions, PanResponder, Pressable, StyleSheet, View } from 'react-native';
 import { useTheme } from '@/theme';
 import { Text, IconBadge, Icon, warningKindIcon } from '@/components/ui';
 import type { GeofenceToast } from '@/lib/geofence';
@@ -10,6 +10,10 @@ type Props = {
 };
 
 const AUTO_DISMISS_MS = 6000;
+const SCREEN_W = Dimensions.get('window').width;
+// How far / how fast a horizontal swipe must be to dismiss rather than spring back.
+const SWIPE_DISTANCE = 90;
+const SWIPE_VELOCITY = 0.5;
 
 export function InAppBanner({ toasts, onDismiss }: Props) {
   useEffect(() => {
@@ -33,11 +37,43 @@ export function InAppBanner({ toasts, onDismiss }: Props) {
 function ToastCard({ toast, onDismiss }: { toast: GeofenceToast; onDismiss: () => void }) {
   const t = useTheme();
   const slide = useRef(new Animated.Value(t.reduceMotion ? 0 : -90)).current;
+  // Horizontal drag offset for swipe-to-dismiss.
+  const pan = useRef(new Animated.Value(0)).current;
+
+  // Keep the latest onDismiss reachable from the (stable) PanResponder closure.
+  const onDismissRef = useRef(onDismiss);
+  onDismissRef.current = onDismiss;
 
   useEffect(() => {
     if (t.reduceMotion) return;
     Animated.spring(slide, { toValue: 0, useNativeDriver: true, speed: 14, bounciness: 6 }).start();
   }, [slide, t.reduceMotion]);
+
+  const responder = useRef(
+    PanResponder.create({
+      // Don't hijack taps (so the × button still works) — only claim the gesture
+      // once the finger is clearly moving horizontally.
+      onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dx) > 8 && Math.abs(g.dx) > Math.abs(g.dy),
+      onPanResponderMove: (_e, g) => pan.setValue(g.dx),
+      onPanResponderRelease: (_e, g) => {
+        const fling = Math.abs(g.dx) > SWIPE_DISTANCE || Math.abs(g.vx) > SWIPE_VELOCITY;
+        if (fling) {
+          const to = (g.dx || g.vx) >= 0 ? SCREEN_W : -SCREEN_W;
+          Animated.timing(pan, { toValue: to, duration: 160, useNativeDriver: true }).start(() => onDismissRef.current());
+        } else {
+          Animated.spring(pan, { toValue: 0, useNativeDriver: true, speed: 20, bounciness: 6 }).start();
+        }
+      },
+      onPanResponderTerminationRequest: () => false,
+    }),
+  ).current;
+
+  // Fade out as the card is swiped toward either edge.
+  const opacity = pan.interpolate({
+    inputRange: [-SCREEN_W, 0, SCREEN_W],
+    outputRange: [0, 1, 0],
+    extrapolate: 'clamp',
+  });
 
   const accent =
     toast.kind === 'disaster' || toast.kind === 'alert'
@@ -51,6 +87,7 @@ function ToastCard({ toast, onDismiss }: { toast: GeofenceToast; onDismiss: () =
   return (
     <Animated.View
       accessibilityLiveRegion="polite"
+      {...responder.panHandlers}
       style={[
         styles.card,
         {
@@ -58,7 +95,8 @@ function ToastCard({ toast, onDismiss }: { toast: GeofenceToast; onDismiss: () =
           borderColor: t.color.border,
           borderRadius: t.radius.lg,
           borderLeftColor: accent,
-          transform: [{ translateY: slide }],
+          opacity,
+          transform: [{ translateY: slide }, { translateX: pan }],
           ...t.shadow(2),
         },
       ]}
@@ -72,7 +110,14 @@ function ToastCard({ toast, onDismiss }: { toast: GeofenceToast; onDismiss: () =
           {toast.body}
         </Text>
       </View>
-      <Pressable onPress={onDismiss} hitSlop={10} style={{ padding: 4 }} accessibilityRole="button" accessibilityLabel="Dismiss alert">
+      <Pressable
+        onPress={() => onDismissRef.current()}
+        hitSlop={10}
+        style={{ padding: 4 }}
+        accessibilityRole="button"
+        accessibilityLabel="Dismiss alert"
+        accessibilityHint="Or swipe the alert left or right to dismiss"
+      >
         <Icon name="close" size={18} color={t.color.textMuted} />
       </Pressable>
     </Animated.View>
