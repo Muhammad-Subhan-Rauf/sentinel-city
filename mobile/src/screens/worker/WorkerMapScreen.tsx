@@ -3,8 +3,10 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { DisasterMap } from '@/components/DisasterMap';
 import { DisasterDetailModal } from '@/components/DisasterDetailModal';
+import { DestinationSearch } from '@/components/DestinationSearch';
 import { api, fetchRoute, Cordon, Disaster, MobileWorker, Notification, Route, WorkerSubRole } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
@@ -65,6 +67,7 @@ function disastersToAvoidPolygons(disasters: Disaster[]): number[][][] {
 
 export default function WorkerMapScreen() {
   const t = useTheme();
+  const insets = useSafeAreaInsets();
   const { session } = useAuth();
   const [me, setMe] = useState<MobileWorker | null>(null);
   const [destination, setDestination] = useState<LatLng | null>(null);
@@ -138,6 +141,14 @@ export default function WorkerMapScreen() {
   const onMapPress = (lat: number, lng: number) => {
     if (!me) return;
     const dest = { lat, lng };
+    setDestination(dest);
+    computeRoute({ lat: me.lat, lng: me.lng }, dest);
+  };
+
+  // Picked from the destination search box — same effect as tapping the map.
+  const onSearchSelect = (p: { lat: number; lng: number }) => {
+    if (!me) return;
+    const dest = { lat: p.lat, lng: p.lng };
     setDestination(dest);
     computeRoute({ lat: me.lat, lng: me.lng }, dest);
   };
@@ -222,10 +233,17 @@ export default function WorkerMapScreen() {
         route={route}
         onMapPress={onMapPress}
         onPolygonPress={onPolygonPress}
+        legendTop={insets.top + (dispatchTarget ? 128 : 64)}
       />
 
+      {/* Destination search — type/choose a place to route to, just like citizens.
+          Higher z-index so the autocomplete dropdown overlays everything. */}
+      <View style={[styles.searchWrap, { top: insets.top + 8, zIndex: 30 }]}>
+        <DestinationSearch focus={myLoc} destination={destination} onSelect={onSearchSelect} onClear={clearRoute} />
+      </View>
+
       {dispatchTarget && (
-        <View style={[styles.dispatchBanner, { backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]} accessibilityRole="alert">
+        <View style={[styles.dispatchBanner, { top: insets.top + 72, backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]} accessibilityRole="alert">
           <Icon name="route" size={20} color={t.color.onDanger} />
           <View style={{ flex: 1, marginLeft: t.spacing.md }}>
             <Text variant="h3" color={t.color.onDanger}>
@@ -239,55 +257,72 @@ export default function WorkerMapScreen() {
       )}
 
       <Card style={styles.banner} elevation={2}>
-        <IconBadge
-          name={me?.role === 'firefighter' ? 'firefighter' : me?.role === 'police' ? 'police' : 'ambulance'}
-          color={accent}
-          size={44}
-        />
-        <View style={{ flex: 1, marginHorizontal: t.spacing.md }}>
-          <Text variant="bodyStrong" numberOfLines={1}>
-            {me?.name ?? 'Loading…'}
-          </Text>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4, flexWrap: 'wrap' }}>
-            <Text variant="caption" tone="secondary">
-              {subRoleLabel}
+        {/* Identity row */}
+        <View style={styles.bannerTop}>
+          <IconBadge
+            name={me?.role === 'firefighter' ? 'firefighter' : me?.role === 'police' ? 'police' : 'ambulance'}
+            color={accent}
+            size={44}
+          />
+          <View style={{ flex: 1, marginLeft: t.spacing.md, minWidth: 0 }}>
+            <Text variant="bodyStrong" numberOfLines={1}>
+              {me?.name ?? 'Loading…'}
             </Text>
-            {me && <Badge label={me.status.replace('_', ' ')} tone={STATUS_TONE[me.status]} />}
-          </View>
-          {destination && route && !routing && (
-            <Text variant="caption" tone="secondary" style={{ marginTop: 4 }}>
-              {route.distanceKm.toFixed(1)} km · ~{Math.round(route.durationMin)} min
-            </Text>
-          )}
-          {routing && (
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 }}>
-              <ActivityIndicator color={t.color.primary} size="small" />
-              <Text variant="caption" tone="secondary">
-                Computing route…
+              <Text variant="caption" tone="secondary" numberOfLines={1} style={{ flexShrink: 1 }}>
+                {subRoleLabel}
               </Text>
+              {me && <Badge label={me.status.replace('_', ' ')} tone={STATUS_TONE[me.status]} />}
             </View>
-          )}
-          {routeError && (
-            <Text variant="caption" tone="danger" style={{ marginTop: 4 }}>
-              {routeError}
+          </View>
+        </View>
+
+        {/* Route status line (only one shows at a time) */}
+        {destination && route && !routing && (
+          <Text variant="caption" tone="secondary" style={styles.bannerLine}>
+            {route.distanceKm.toFixed(1)} km · ~{Math.round(route.durationMin)} min · avoiding active hazards
+          </Text>
+        )}
+        {routing && (
+          <View style={[styles.bannerLine, { flexDirection: 'row', alignItems: 'center', gap: 6 }]}>
+            <ActivityIndicator color={t.color.primary} size="small" />
+            <Text variant="caption" tone="secondary">
+              Computing route…
             </Text>
+          </View>
+        )}
+        {routeError && (
+          <Text variant="caption" tone="danger" style={styles.bannerLine}>
+            {routeError}
+          </Text>
+        )}
+        {!destination && !routing && !routeError && me && (
+          <View style={[styles.bannerLine, { flexDirection: 'row', alignItems: 'center', gap: 6 }]}>
+            <Icon name="route" size={13} color={t.color.textMuted} />
+            <Text variant="caption" tone="secondary" numberOfLines={1} style={{ flex: 1 }}>
+              Tap the map to plot a route — it avoids active hazards
+            </Text>
+          </View>
+        )}
+
+        {/* Full-width action — never crammed beside the identity now */}
+        <View style={{ marginTop: t.spacing.md }}>
+          {destination ? (
+            <Button label="Clear route" variant="secondary" icon="close" onPress={clearRoute} />
+          ) : (
+            <Pressable
+              onPress={cycleStatus}
+              accessibilityRole="button"
+              accessibilityLabel={me ? STATUS_ACTION[me.status] : 'Update status'}
+              style={({ pressed }) => [styles.statusBtn, { backgroundColor: accent, borderRadius: t.radius.md, opacity: pressed ? 0.85 : 1 }]}
+            >
+              <Icon name="refresh" size={16} color={t.color.alwaysWhite} />
+              <Text variant="label" color={t.color.alwaysWhite} numberOfLines={1}>
+                {me ? STATUS_ACTION[me.status] : 'Status'}
+              </Text>
+            </Pressable>
           )}
         </View>
-        {destination ? (
-          <Button label="Clear" variant="secondary" size="sm" fullWidth={false} onPress={clearRoute} />
-        ) : (
-          <Pressable
-            onPress={cycleStatus}
-            accessibilityRole="button"
-            accessibilityLabel={me ? STATUS_ACTION[me.status] : 'Update status'}
-            style={({ pressed }) => [styles.statusBtn, { backgroundColor: accent, borderRadius: t.radius.md, opacity: pressed ? 0.85 : 1 }]}
-          >
-            <Icon name="refresh" size={15} color={t.color.alwaysWhite} />
-            <Text variant="label" color={t.color.alwaysWhite}>
-              {me ? STATUS_ACTION[me.status] : 'Status'}
-            </Text>
-          </Pressable>
-        )}
       </Card>
 
       <DisasterDetailModal
@@ -303,9 +338,9 @@ export default function WorkerMapScreen() {
 }
 
 const styles = StyleSheet.create({
+  searchWrap: { position: 'absolute', left: 16, right: 16 },
   dispatchBanner: {
     position: 'absolute',
-    top: 64,
     left: 16,
     right: 16,
     flexDirection: 'row',
@@ -313,6 +348,8 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 14,
   },
-  banner: { position: 'absolute', bottom: 24, left: 16, right: 16, flexDirection: 'row', alignItems: 'center' },
-  statusBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 11, minHeight: 44 },
+  banner: { position: 'absolute', bottom: 24, left: 16, right: 16 },
+  bannerTop: { flexDirection: 'row', alignItems: 'center' },
+  bannerLine: { marginTop: 8 },
+  statusBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 16, height: 48 },
 });

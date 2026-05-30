@@ -32,7 +32,7 @@ function buildHtml(bg: string, tiles: string): string {
 <script>
 (function () {
   var post = function (msg) { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(msg)); };
-  var map = L.map('map', { zoomControl: true, attributionControl: false });
+  var map = L.map('map', { zoomControl: false, attributionControl: false });
   L.tileLayer('${tiles}', { subdomains: 'abcd', maxZoom: 20, keepBuffer: 8 }).addTo(map);
   var marker = null;
   function makeIcon(color) {

@@ -30,6 +30,8 @@ type Props = {
   onPolygonPress?: (eventId: string | null, label: string) => void;
   pins?: DisasterMapPin[];
   onDisastersChange?: (disasters: Disaster[]) => void;
+  /** Top offset for the floating legend so it clears each screen's chrome. */
+  legendTop?: number;
 };
 
 type PolygonItem = {
@@ -68,7 +70,7 @@ function buildLeafletHtml(p: MapPalette): string {
 <script>
 (function () {
   var post = function (payload) { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(payload)); };
-  var map = L.map('map', { zoomControl: true, attributionControl: false }).setView([${MANHATTAN.lat}, ${MANHATTAN.lng}], 13);
+  var map = L.map('map', { zoomControl: false, attributionControl: false }).setView([${MANHATTAN.lat}, ${MANHATTAN.lng}], 13);
   L.tileLayer('${p.tiles}', { subdomains: 'abcd', maxZoom: 20, keepBuffer: 8 }).addTo(map);
   map.on('click', function (e) { post({ type: 'press', lat: e.latlng.lat, lng: e.latlng.lng }); });
 
@@ -153,6 +155,7 @@ export function DisasterMap({
   onPolygonPress,
   pins,
   onDisastersChange,
+  legendTop,
 }: Props) {
   const t = useTheme();
   const webviewRef = useRef<WebViewType | null>(null);
@@ -304,6 +307,7 @@ export function DisasterMap({
       <MapLegend
         myRole={myRole}
         mySubRole={mySubRole}
+        topOffset={legendTop}
         showOtherUsers={showOtherUsers}
         hasDestination={!!destination}
         hasRoute={!!(route && route.coordinates.length > 1)}

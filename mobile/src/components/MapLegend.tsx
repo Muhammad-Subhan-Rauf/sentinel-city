@@ -23,6 +23,9 @@ type Props = {
   stationCounts?: StationCounts;
   citizenCount?: number;
   stats: LegendStats;
+  /** Absolute top offset (px) — each screen sets this to clear its own header /
+   *  safe-area / top banners so the chip + expanded panel never collide. */
+  topOffset?: number;
 };
 
 function LegendRow({ swatch, label, detail }: { swatch: React.ReactNode; label: string; detail?: string }) {
@@ -48,7 +51,7 @@ function Glyph({ emoji }: { emoji: string }) {
 
 const countLabel = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
-export function MapLegend({ myRole, mySubRole, showOtherUsers, hasDestination, hasRoute, hasPins, stationCounts, citizenCount, stats }: Props) {
+export function MapLegend({ myRole, mySubRole, showOtherUsers, hasDestination, hasRoute, hasPins, stationCounts, citizenCount, stats, topOffset = 16 }: Props) {
   const t = useTheme();
   const [open, setOpen] = useState(false);
 
@@ -76,7 +79,7 @@ export function MapLegend({ myRole, mySubRole, showOtherUsers, hasDestination, h
         : 'Legend';
 
   return (
-    <View style={styles.wrap}>
+    <View style={[styles.wrap, { top: topOffset }]}>
       <Pressable
         onPress={() => setOpen((v) => !v)}
         hitSlop={6}
@@ -134,7 +137,9 @@ export function MapLegend({ myRole, mySubRole, showOtherUsers, hasDestination, h
 }
 
 const styles = StyleSheet.create({
-  wrap: { position: 'absolute', top: 16, left: 16, right: 16 },
+  // `top` is supplied per-screen via the topOffset prop so the legend clears
+  // each map's own header / safe-area / banners.
+  wrap: { position: 'absolute', left: 16, right: 16 },
   chip: { flexDirection: 'row', alignItems: 'center', alignSelf: 'flex-start', borderWidth: 1, paddingVertical: 8, paddingHorizontal: 12, gap: 8 },
   chipDot: { width: 10, height: 10, borderRadius: 5 },
   panel: { marginTop: 8, borderWidth: 1, paddingVertical: 8, paddingHorizontal: 12, maxWidth: 320 },

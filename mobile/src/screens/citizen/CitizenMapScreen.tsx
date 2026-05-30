@@ -1,17 +1,22 @@
 // Citizen map — Google Maps style. The user sees their own location, active
-// hazards (red/yellow polygons), a tappable destination + a route that avoids
-// active hazard polygons (recomputed via Valhalla avoid_polygons), and — when
-// standing inside an active zone — a Call 911 button that auto-fills a transcript.
+// hazards (red/yellow polygons), and a tappable destination + a route that
+// avoids active hazard polygons (recomputed via Valhalla avoid_polygons).
+//
+// When the citizen is standing inside an active zone we DO NOT add a second
+// 911 button on top of the map — we signal the tab bar so the existing
+// centre SOS button pulses red. One consistent affordance, no surprise UI.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AccessibilityInfo, ActivityIndicator, Alert, Pressable, StyleSheet, View } from 'react-native';
+import { AccessibilityInfo, ActivityIndicator, StyleSheet, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { DisasterMap } from '@/components/DisasterMap';
-import { api, fetchRoute, MobileCitizen, Notification, Cordon, Route, Disaster, EmergencyService } from '@/lib/api';
+import { DestinationSearch } from '@/components/DestinationSearch';
+import { api, fetchRoute, MobileCitizen, Notification, Cordon, Route, Disaster } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
-import { Text, Card, Button, Icon } from '@/components/ui';
+import { Text, Card, Icon } from '@/components/ui';
 import { disasterRing, pointInPolygon, ringForValhallaAvoid } from '@/lib/geo';
-import { EmergencyCallModal } from '@/components/EmergencyCallModal';
+import { setInDangerZone } from '@/lib/dangerSignal';
 
 type LatLng = { lat: number; lng: number };
 
@@ -37,48 +42,6 @@ function disastersToAvoidPolygons(disasters: Disaster[]): number[][][] {
   return out;
 }
 
-function severityWord(sev: number): string {
-  return sev >= 5 ? 'critical' : sev >= 4 ? 'severe' : sev >= 3 ? 'major' : sev >= 2 ? 'moderate' : 'minor';
-}
-
-function causePhrase(cause: Disaster['cause']): string | null {
-  if (cause === 'weather') return 'storm/weather-driven';
-  if (cause === 'infrastructure') return 'infrastructure-related';
-  return null;
-}
-
-function describeZone(d: Disaster): string {
-  const type = d.disaster_type.replace(/_/g, ' ').toLowerCase();
-  const cause = causePhrase(d.cause);
-  return `an active ${type} zone at severity ${d.severity} (${severityWord(d.severity)})${cause ? `, ${cause}` : ''}`;
-}
-
-function buildEmergencyTranscript(dangers: Disaster[], callerName: string, caller: LatLng): string {
-  const coords = `${caller.lat.toFixed(5)}, ${caller.lng.toFixed(5)}`;
-  const head = [
-    `This is an automated 911 report from Sentinel-City.`,
-    `Caller: ${callerName}.`,
-    `Location: ${coords}.`,
-  ];
-  if (dangers.length === 0) {
-    return [...head, `Caller is requesting emergency assistance at this location.`, `Please dispatch the nearest available unit.`].join(' ');
-  }
-  const sorted = [...dangers].sort((a, b) => b.severity - a.severity);
-  let situation: string;
-  if (sorted.length === 1) {
-    situation = `The caller is inside ${describeZone(sorted[0])}.`;
-  } else {
-    const primary = describeZone(sorted[0]);
-    const rest = sorted.slice(1).map(describeZone).join('; ');
-    situation = `The caller is inside ${primary}, overlapping with: ${rest}.`;
-  }
-  const overlapNote =
-    sorted.length > 1 ? `Multiple hazards on scene — ${sorted.length} overlapping zones — coordinate the response.` : null;
-  return [...head, situation, overlapNote, `Caller requires immediate assistance. Please dispatch the nearest available unit.`]
-    .filter(Boolean)
-    .join(' ');
-}
-
 function activeDangersContaining(loc: LatLng | null, disasters: Disaster[]): Disaster[] {
   if (!loc) return [];
   const hits: Disaster[] = [];
@@ -93,6 +56,7 @@ function activeDangersContaining(loc: LatLng | null, disasters: Disaster[]): Dis
 
 export default function CitizenMapScreen() {
   const t = useTheme();
+  const insets = useSafeAreaInsets();
   const { session } = useAuth();
   const [me, setMe] = useState<MobileCitizen | null>(null);
   const [destination, setDestination] = useState<LatLng | null>(null);
@@ -101,11 +65,6 @@ export default function CitizenMapScreen() {
   const [routeError, setRouteError] = useState<string | null>(null);
   const [disasters, setDisasters] = useState<Disaster[]>([]);
   const avoidSignature = useRef<string>('');
-  const [modalOpen, setModalOpen] = useState(false);
-  const [placingCall, setPlacingCall] = useState(false);
-  const [lastCallAt, setLastCallAt] = useState<number | null>(null);
-  const [callTranscript, setCallTranscript] = useState<string>('');
-  const [callDisasterId, setCallDisasterId] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -130,17 +89,23 @@ export default function CitizenMapScreen() {
   const insideDangers = useMemo(() => activeDangersContaining(myLatLng, disasters), [myLatLng, disasters]);
   const activeCount = disasters.filter((d) => d.status === 'active').length;
 
-  // Announce hazard entry for screen-reader users (once per entry).
+  // Announce hazard entry for screen-reader users (once per entry) and signal
+  // the tab bar so the centre SOS button pulses.
   const wasInDanger = useRef(false);
   useEffect(() => {
     const now = insideDangers.length > 0;
+    setInDangerZone(now);
     if (now && !wasInDanger.current) {
       AccessibilityInfo.announceForAccessibility(
-        `Warning. You are inside an active ${insideDangers[0].disaster_type.replace(/_/g, ' ')} zone. Call 911 is now available.`,
+        `Warning. You are inside an active ${insideDangers[0].disaster_type.replace(/_/g, ' ')} zone. The SOS button is highlighted — tap it to call for help.`,
       );
     }
     wasInDanger.current = now;
   }, [insideDangers]);
+
+  // Drop the signal if this screen unmounts (e.g. sign-out) so a stale "in
+  // zone" indicator can never linger on the tab bar.
+  useEffect(() => () => setInDangerZone(false), []);
 
   const lastDisasterSig = useRef<string>('');
   useEffect(() => {
@@ -152,7 +117,14 @@ export default function CitizenMapScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [disasters, destination]);
 
+  // Monotonic token guarding against stale async route results. Each compute
+  // captures the current token; clearRoute (and every new compute) bumps it, so
+  // a fetch that resolves AFTER the user cleared — or after a newer request
+  // started — is discarded instead of redrawing a path that should be gone.
+  const routeToken = useRef(0);
+
   const computeRoute = useCallback(async (from: LatLng, to: LatLng) => {
+    const myToken = ++routeToken.current;
     setRouting(true);
     setRouteError(null);
     try {
@@ -164,12 +136,14 @@ export default function CitizenMapScreen() {
       const avoid = [...notifsToAvoidPolygons([...notifs, ...cordons]), ...disastersToAvoidPolygons(disastersNow)];
       avoidSignature.current = JSON.stringify(avoid);
       const r = await fetchRoute(from, to, avoid);
+      if (routeToken.current !== myToken) return; // superseded by a newer request or cleared
       setRoute(r);
     } catch (err) {
+      if (routeToken.current !== myToken) return;
       setRoute(null);
       setRouteError(err instanceof Error ? err.message : 'Could not compute a safe route right now.');
     } finally {
-      setRouting(false);
+      if (routeToken.current === myToken) setRouting(false);
     }
   }, []);
 
@@ -212,51 +186,22 @@ export default function CitizenMapScreen() {
     computeRoute(myLatLng, dest);
   };
 
+  // Picked from the destination search box. Same effect as tapping the map.
+  const onSearchSelect = (p: { lat: number; lng: number }) => {
+    const dest = { lat: p.lat, lng: p.lng };
+    setDestination(dest);
+    if (myLatLng) computeRoute(myLatLng, dest);
+  };
+
   const clearRoute = () => {
+    // Invalidate any in-flight / scheduled route compute so a late-resolving
+    // fetchRoute can't repaint the path after the user cleared it.
+    routeToken.current++;
     setDestination(null);
     setRoute(null);
     setRouteError(null);
+    setRouting(false);
   };
-
-  const openEmergencyCall = () => {
-    if (!session || !myLatLng || insideDangers.length === 0) return;
-    const worst = [...insideDangers].sort((a, b) => b.severity - a.severity)[0];
-    const transcript = buildEmergencyTranscript(insideDangers, me?.name ?? session.name, myLatLng);
-    setCallTranscript(transcript);
-    setCallDisasterId(worst.id);
-    setModalOpen(true);
-  };
-
-  const submitEmergencyCall = async (services: EmergencyService[], photoDataUrl: string | null) => {
-    if (!session || !myLatLng || !callDisasterId || services.length === 0) return;
-    setPlacingCall(true);
-    try {
-      await api.placeEmergencyCall({
-        citizen_id: session.userId,
-        disaster_id: callDisasterId,
-        caller_lat: myLatLng.lat,
-        caller_lng: myLatLng.lng,
-        transcript: callTranscript,
-        requested_services: services,
-        photo_data_url: photoDataUrl,
-      });
-      setLastCallAt(Date.now());
-      setModalOpen(false);
-      Alert.alert(
-        '911 dispatched',
-        `Notified: ${services.join(', ')}.${photoDataUrl ? ' Your photo was sent as proof.' : ''} They've been given your location and the hazard details. Stay on the line — help is on the way.`,
-        [{ text: 'OK' }],
-      );
-    } catch (e) {
-      Alert.alert('Call failed', e instanceof Error ? e.message : 'Could not reach 911 right now. Try again.');
-    } finally {
-      setPlacingCall(false);
-    }
-  };
-
-  const cooldownLeftMs = lastCallAt ? Math.max(0, 30_000 - (Date.now() - lastCallAt)) : 0;
-  const cooldownActive = cooldownLeftMs > 0;
-  const callDisabled = placingCall || cooldownActive || modalOpen;
 
   if (!session) return null;
 
@@ -273,12 +218,19 @@ export default function CitizenMapScreen() {
         route={route}
         onMapPress={onMapPress}
         onDisastersChange={setDisasters}
+        legendTop={insets.top + 128}
       />
+
+      {/* Destination search — pinned to the top, above the hazard banners.
+          Higher z-index so the autocomplete dropdown overlays everything. */}
+      <View style={[styles.searchWrap, { top: insets.top + 8, zIndex: 30 }]}>
+        <DestinationSearch focus={myLatLng} destination={destination} onSelect={onSearchSelect} onClear={clearRoute} />
+      </View>
 
       {/* In-zone DANGER banner */}
       {insideDangers.length > 0 && (
         <View
-          style={[styles.topBanner, { backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]}
+          style={[styles.topBanner, { top: insets.top + 72, backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]}
           accessibilityRole="alert"
         >
           <Icon name="alert" size={22} color={t.color.onDanger} />
@@ -296,7 +248,7 @@ export default function CitizenMapScreen() {
 
       {/* Advisory banner — hazards nearby but not on you */}
       {insideDangers.length === 0 && activeCount > 0 && (
-        <View style={[styles.topBanner, { backgroundColor: t.color.warning, borderRadius: t.radius.lg, ...t.shadow(2) }]}>
+        <View style={[styles.topBanner, { top: insets.top + 72, backgroundColor: t.color.warning, borderRadius: t.radius.lg, ...t.shadow(2) }]}>
           <Icon name="alert" size={20} color={t.color.alwaysWhite} />
           <Text variant="bodyStrong" color={t.color.alwaysWhite} style={{ flex: 1, marginLeft: t.spacing.md }}>
             {activeCount} active danger zone{activeCount === 1 ? '' : 's'} nearby — stay clear of red areas
@@ -304,39 +256,8 @@ export default function CitizenMapScreen() {
         </View>
       )}
 
-      {/* Call 911 — only inside an active zone */}
-      {insideDangers.length > 0 && (
-        <Pressable
-          onPress={openEmergencyCall}
-          disabled={callDisabled}
-          accessibilityRole="button"
-          accessibilityLabel={cooldownActive ? `Call 911, available in ${Math.ceil(cooldownLeftMs / 1000)} seconds` : 'Call 911'}
-          accessibilityState={{ disabled: callDisabled }}
-          style={({ pressed }) => [
-            styles.call911,
-            {
-              backgroundColor: cooldownActive ? t.color.surfaceAlt : pressed ? t.color.dangerStrong : t.color.danger,
-              borderRadius: t.radius.lg,
-              borderWidth: cooldownActive ? 1 : 0,
-              borderColor: t.color.border,
-              ...t.shadow(3),
-            },
-          ]}
-        >
-          <Icon name="calls" size={24} color={cooldownActive ? t.color.textMuted : t.color.onDanger} />
-          <Text variant="h2" color={cooldownActive ? t.color.textMuted : t.color.onDanger} style={{ letterSpacing: 0.5 }}>
-            {cooldownActive ? `Just called · ${Math.ceil(cooldownLeftMs / 1000)}s` : 'Call 911'}
-          </Text>
-        </Pressable>
-      )}
-
-      <EmergencyCallModal
-        visible={modalOpen}
-        transcript={callTranscript}
-        submitting={placingCall}
-        onCancel={() => setModalOpen(false)}
-        onSubmit={submitEmergencyCall}
-      />
+      {/* When inside a zone, the centre SOS button in the tab bar pulses red
+          (see CitizenTabBar + dangerSignal) — no extra button is drawn here. */}
 
       {/* Destination / route panel */}
       <Card style={styles.routePanel} elevation={2}>
@@ -344,7 +265,7 @@ export default function CitizenMapScreen() {
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
             <Icon name={destination ? 'route' : 'location'} size={16} color={t.color.primary} />
             <Text variant="bodyStrong" style={{ flex: 1 }}>
-              {destination ? 'Safe route set' : 'Tap the map to choose a destination'}
+              {destination ? 'Safe route set' : 'Search above or tap the map to set a destination'}
             </Text>
           </View>
           {route && !routing && (
@@ -366,33 +287,25 @@ export default function CitizenMapScreen() {
             </Text>
           )}
         </View>
-        {destination && <Button label="Clear" variant="secondary" size="sm" fullWidth={false} onPress={clearRoute} />}
       </Card>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  searchWrap: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+  },
   topBanner: {
     position: 'absolute',
-    top: 64,
     left: 16,
     right: 16,
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 12,
     paddingHorizontal: 14,
-  },
-  call911: {
-    position: 'absolute',
-    bottom: 112,
-    left: 16,
-    right: 16,
-    height: 60,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 10,
   },
   routePanel: {
     position: 'absolute',
