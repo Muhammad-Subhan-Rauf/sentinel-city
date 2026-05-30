@@ -160,10 +160,17 @@ export type EmergencyCall = {
   citizen_name: string;
   caller_lat: number;
   caller_lng: number;
-  disaster_id: string;
+  // null for a direct SOS not tied to any declared disaster.
+  disaster_id: string | null;
+  // For a disaster-linked call this is the disaster type; for a direct SOS it is
+  // the chosen emergency category (e.g. "Medical", "Fire").
   disaster_type: string;
   severity: number;
   cause: 'weather' | 'infrastructure' | null;
+  // True when placed via the standalone "call for help" SOS flow.
+  is_direct?: boolean;
+  // The emergency category chosen for a direct SOS, if any.
+  category?: string | null;
   disaster_lat: number | null;
   disaster_lng: number | null;
   transcript: string;
@@ -177,7 +184,29 @@ export type EmergencyCall = {
     sub_role: 'paramedic' | 'police' | 'firefighter';
     acknowledged_at: string;
   }>;
+  // Whether the caller attached a proof photo. The image itself is fetched on
+  // demand via api.getCallPhoto(id) so the polled call feed stays lightweight.
+  has_photo?: boolean;
+  // AI authenticity verdict (see AiAssessment). Starts as { status: 'analyzing' }.
+  ai_assessment?: AiAssessment;
 };
+
+// AI authenticity verdict for a 911 call. Filled in by the backend's vision
+// model (pipeline.prank_check) a moment after the call is placed: it weighs the
+// transcript + disaster context + the attached proof photo to estimate whether
+// the call is genuine. Advisory only — responders always still see the call.
+export type AiAssessment =
+  | { status: 'analyzing' }
+  | {
+      status: 'done' | 'unavailable';
+      verdict: 'genuine' | 'uncertain' | 'likely_prank';
+      confidence: number; // 0..1
+      photo_supports_call?: boolean | null;
+      observed?: string;
+      reasoning: string;
+      had_photo?: boolean;
+      model?: string;
+    };
 
 // Maps a worker's sub_role to the matching 911 service identifier.
 export const SUBROLE_TO_SERVICE: Record<'paramedic' | 'police' | 'firefighter', EmergencyService> = {
@@ -208,6 +237,10 @@ export type FireStation = {
   truck_count: number;
   trucks_dispatched: number;
 };
+
+// Minimal shape shared by hospitals + police stations (and a superset-compatible
+// view of fire stations) — just what the map needs to drop a marker.
+export type StationPoint = { id: string; name?: string | null; lat: number; lng: number };
 
 export type LoginResponse = {
   user_id: string;
@@ -297,6 +330,21 @@ export const api = {
     request<{ disasters: Disaster[] }>('/api/disasters').then((r) => r.disasters),
   getDisaster: (id: string) => request<Disaster>(`/api/disasters/${id}`),
 
+  // Disasters a citizen has actually reported. A disaster surfaces on mobile —
+  // on the map, in routing, and for the danger banner / 911 gate — ONLY once at
+  // least one citizen report references it (report.event_id === disaster.id),
+  // regardless of whether it was placed by the operator or the AI. This is the
+  // single source of truth for "which disasters are live on mobile"; use it
+  // everywhere instead of listDisasters() + a source filter.
+  listReportedDisasters: async (): Promise<Disaster[]> => {
+    const [disasters, reports] = await Promise.all([
+      api.listDisasters(),
+      api.listCitizenReports(500),
+    ]);
+    const reported = new Set(reports.map((r) => r.event_id).filter((id): id is string => !!id));
+    return disasters.filter((d) => reported.has(d.id));
+  },
+
   // Citizen reports (admin Calls screen)
   listCitizenReports: (limit = 100) =>
     request<{ reports: CitizenReport[] }>(`/api/citizen-reports?limit=${limit}`).then(
@@ -306,16 +354,27 @@ export const api = {
   // 911 calls (citizen creates, workers consume — filtered by their service)
   placeEmergencyCall: (body: {
     citizen_id: string;
-    disaster_id: string;
+    // Omit / null for a direct SOS that isn't tied to a declared disaster.
+    disaster_id?: string | null;
+    // Emergency category for a direct SOS (e.g. "Medical", "Fire", "Crime").
+    category?: string | null;
     caller_lat: number;
     caller_lng: number;
     transcript: string;
     requested_services: EmergencyService[];
+    // Optional base64 data URL ("data:image/jpeg;base64,…") of a proof photo the
+    // caller captured. The backend runs an AI authenticity check against it.
+    photo_data_url?: string | null;
   }) =>
     request<EmergencyCall>('/api/911/call', {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+  // Fetch the proof photo for a call on demand (kept out of the list feed).
+  getCallPhoto: (id: string) =>
+    request<{ id: string; photo_data_url: string }>(`/api/911/calls/${id}/photo`).then(
+      (r) => r.photo_data_url,
+    ),
   listEmergencyCalls: (params?: {
     statusFilter?: 'new' | 'acknowledged' | 'closed' | 'all';
     service?: EmergencyService;
@@ -347,9 +406,14 @@ export const api = {
   statsInjured: () =>
     request<{ injured_estimate: number; contributing_events: number }>('/api/stats/injured'),
 
-  // Dispatch — reuses the same endpoint as the web app
+  // Dispatch — reuses the same endpoints as the web operator console so the
+  // mobile map shows the exact same infrastructure (fire / hospital / police).
   listFireStations: () =>
     request<{ stations: FireStation[] }>('/api/fire-stations').then((r) => r.stations),
+  listHospitals: () =>
+    request<{ hospitals: StationPoint[] }>('/api/hospitals').then((r) => r.hospitals),
+  listPoliceStations: () =>
+    request<{ stations: StationPoint[] }>('/api/police-stations').then((r) => r.stations),
 };
 
 // ─── External: Valhalla routing ──────────────────────────────────────

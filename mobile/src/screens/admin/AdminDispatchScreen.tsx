@@ -1,25 +1,27 @@
 // Admin: Dispatch Details — who's on duty, where, doing what.
 
 import React, { useEffect, useState } from 'react';
-import { RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { Screen } from '@/components/Screen';
 import { api, FireStation, MobileWorker } from '@/lib/api';
-import { colors } from '@/lib/colors';
+import { useTheme } from '@/theme';
+import { Text, Card, Badge, IconBadge, Icon, SectionHeader, IconName, BadgeTone } from '@/components/ui';
 
-const STATUS_COLOR: Record<MobileWorker['status'], string> = {
-  available: colors.success,
-  dispatched: colors.warning,
-  on_scene: colors.danger,
-  off_duty: colors.textMuted,
+const STATUS_TONE: Record<MobileWorker['status'], BadgeTone> = {
+  available: 'success',
+  dispatched: 'warning',
+  on_scene: 'danger',
+  off_duty: 'neutral',
 };
 
-const ROLE_ICON: Record<MobileWorker['role'], string> = {
-  firefighter: '🚒',
-  paramedic: '🚑',
-  police: '🚓',
+const ROLE_ICON: Record<MobileWorker['role'], IconName> = {
+  firefighter: 'firefighter',
+  paramedic: 'ambulance',
+  police: 'police',
 };
 
 export default function AdminDispatchScreen() {
+  const t = useTheme();
   const [workers, setWorkers] = useState<MobileWorker[]>([]);
   const [stations, setStations] = useState<FireStation[]>([]);
   const [refreshing, setRefreshing] = useState(false);
@@ -27,10 +29,7 @@ export default function AdminDispatchScreen() {
   const load = async () => {
     setRefreshing(true);
     try {
-      const [w, s] = await Promise.all([
-        api.listWorkers().catch(() => []),
-        api.listFireStations().catch(() => []),
-      ]);
+      const [w, s] = await Promise.all([api.listWorkers().catch(() => []), api.listFireStations().catch(() => [])]);
       setWorkers(w);
       setStations(s);
     } finally {
@@ -49,91 +48,81 @@ export default function AdminDispatchScreen() {
     return acc;
   }, {});
 
-  return (
-    <Screen title="Dispatch">
-      <Text style={styles.subtitle}>Live roster of emergency workers in the field.</Text>
+  const roleAccent = (role: MobileWorker['role']) =>
+    role === 'firefighter' ? t.color.firefighter : role === 'police' ? t.color.police : t.color.paramedic;
 
+  const stats: Array<{ label: string; value: number; color: string }> = [
+    { label: 'On duty', value: workers.length, color: t.color.primary },
+    { label: 'Dispatched', value: byStatus.dispatched ?? 0, color: t.color.warning },
+    { label: 'On scene', value: byStatus.on_scene ?? 0, color: t.color.danger },
+    { label: 'Stations', value: stations.length, color: t.color.info },
+  ];
+
+  return (
+    <Screen title="Dispatch" subtitle="Live roster of emergency workers in the field." scroll={false}>
       <ScrollView
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} tintColor={colors.info} />}
+        style={{ flex: 1 }}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: t.spacing.xxxl }}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} tintColor={t.color.primary} />}
       >
         <View style={styles.statRow}>
-          <View style={styles.statBox}>
-            <Text style={styles.statValue}>{workers.length}</Text>
-            <Text style={styles.statLabel}>On duty</Text>
-          </View>
-          <View style={styles.statBox}>
-            <Text style={[styles.statValue, { color: colors.warning }]}>{byStatus.dispatched ?? 0}</Text>
-            <Text style={styles.statLabel}>Dispatched</Text>
-          </View>
-          <View style={styles.statBox}>
-            <Text style={[styles.statValue, { color: colors.danger }]}>{byStatus.on_scene ?? 0}</Text>
-            <Text style={styles.statLabel}>On scene</Text>
-          </View>
-          <View style={styles.statBox}>
-            <Text style={[styles.statValue, { color: colors.info }]}>{stations.length}</Text>
-            <Text style={styles.statLabel}>Stations</Text>
-          </View>
+          {stats.map((s) => (
+            <Card key={s.label} padded={false} style={{ flex: 1, minWidth: 70, paddingVertical: t.spacing.md, alignItems: 'center' }}>
+              <Text variant="h1" color={s.color} style={{ fontVariant: ['tabular-nums'] }}>
+                {s.value}
+              </Text>
+              <Text variant="caption" tone="secondary" style={{ marginTop: 2 }}>
+                {s.label}
+              </Text>
+            </Card>
+          ))}
         </View>
 
-        <Text style={styles.sectionHeader}>Workers</Text>
+        <SectionHeader title="Workers" hint={`${workers.length} in the field`} style={{ marginTop: t.spacing.lg }} />
         {workers.map((w) => (
-          <View key={w.id} style={styles.card}>
-            <Text style={styles.cardIcon}>{ROLE_ICON[w.role]}</Text>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.cardName}>{w.name}</Text>
-              <Text style={styles.cardRole}>
+          <Card key={w.id} accent={roleAccent(w.role)} style={styles.row}>
+            <IconBadge name={ROLE_ICON[w.role]} color={roleAccent(w.role)} size={42} />
+            <View style={{ flex: 1, marginHorizontal: t.spacing.md }}>
+              <Text variant="bodyStrong">{w.name}</Text>
+              <Text variant="caption" tone="muted" style={{ marginTop: 2, fontFamily: t.fonts.mono }}>
                 {w.role} · {w.lat.toFixed(3)}, {w.lng.toFixed(3)}
               </Text>
             </View>
-            <View
-              style={[
-                styles.statusPill,
-                { backgroundColor: `${STATUS_COLOR[w.status]}22`, borderColor: STATUS_COLOR[w.status] },
-              ]}
-            >
-              <Text style={[styles.statusPillText, { color: STATUS_COLOR[w.status] }]}>
-                {w.status.replace('_', ' ')}
-              </Text>
-            </View>
-          </View>
+            <Badge label={w.status.replace('_', ' ')} tone={STATUS_TONE[w.status]} />
+          </Card>
         ))}
 
         {stations.length > 0 && (
           <>
-            <Text style={styles.sectionHeader}>Fire Stations</Text>
+            <SectionHeader title="Fire Stations" hint={`${stations.length} active`} style={{ marginTop: t.spacing.lg }} />
             {stations.map((s) => {
               const dispatched = s.trucks_dispatched ?? 0;
               const total = s.truck_count ?? 0;
               const ratio = total > 0 ? dispatched / total : 0;
-              const trucksColor =
-                total > 0 && dispatched >= total
-                  ? colors.danger
-                  : ratio >= 0.75
-                  ? colors.warning
-                  : colors.success;
+              const tone: BadgeTone = total > 0 && dispatched >= total ? 'danger' : ratio >= 0.75 ? 'warning' : 'success';
               return (
-                <View key={s.id} style={styles.card}>
-                  <Text style={styles.cardIcon}>🏛️</Text>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.cardName}>{s.name ?? 'Unnamed station'}</Text>
-                    <Text style={styles.cardRole}>
+                <Card key={s.id} style={styles.row}>
+                  <IconBadge name="infrastructure" color={t.color.info} size={42} />
+                  <View style={{ flex: 1, marginHorizontal: t.spacing.md }}>
+                    <Text variant="bodyStrong">{s.name ?? 'Unnamed station'}</Text>
+                    <Text variant="caption" tone="muted" style={{ marginTop: 2, fontFamily: t.fonts.mono }}>
                       {s.lat.toFixed(4)}, {s.lng.toFixed(4)}
                     </Text>
                   </View>
-                  <View
-                    style={[
-                      styles.statusPill,
-                      { backgroundColor: `${trucksColor}22`, borderColor: trucksColor },
-                    ]}
-                  >
-                    <Text style={[styles.statusPillText, { color: trucksColor }]}>
-                      🚒 {dispatched}/{total}
-                    </Text>
-                  </View>
-                </View>
+                  <Badge label={`${dispatched}/${total}`} icon="firefighter" tone={tone} />
+                </Card>
               );
             })}
           </>
+        )}
+        {workers.length === 0 && stations.length === 0 && !refreshing && (
+          <View style={{ paddingTop: t.spacing.xxl, alignItems: 'center' }}>
+            <Icon name="people" size={32} color={t.color.textMuted} />
+            <Text variant="body" tone="muted" style={{ marginTop: 8 }}>
+              No workers on duty yet.
+            </Text>
+          </View>
         )}
       </ScrollView>
     </Screen>
@@ -141,35 +130,6 @@ export default function AdminDispatchScreen() {
 }
 
 const styles = StyleSheet.create({
-  subtitle: { color: colors.textSecondary, marginBottom: 12 },
-  statRow: { flexDirection: 'row', gap: 8, marginBottom: 16, flexWrap: 'wrap' },
-  statBox: {
-    flex: 1,
-    minWidth: 70,
-    backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    padding: 12,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  statValue: { color: colors.textPrimary, fontSize: 22, fontWeight: '800' },
-  statLabel: { color: colors.textSecondary, fontSize: 11, marginTop: 2 },
-  sectionHeader: { color: colors.textPrimary, fontSize: 16, fontWeight: '700', marginTop: 8, marginBottom: 8 },
-  card: {
-    backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 10,
-    padding: 12,
-    marginBottom: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  cardIcon: { fontSize: 22 },
-  cardName: { color: colors.textPrimary, fontWeight: '600' },
-  cardRole: { color: colors.textSecondary, fontSize: 12, marginTop: 2, textTransform: 'capitalize' },
-  statusPill: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, borderWidth: 1 },
-  statusPillText: { fontSize: 11, fontWeight: '700', textTransform: 'capitalize' },
+  statRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
+  row: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
 });

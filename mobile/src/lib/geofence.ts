@@ -104,34 +104,36 @@ function toastFor(w: NearbyWarning, session: Session): { title: string; body: st
   const bearing = w.bearing && w.bearing !== '—' ? ` ${w.bearing}` : '';
   const audience = session.role === 'worker' ? session.sub_role : session.role;
 
+  // Titles are emoji-free: the in-app banner / Alerts feed render a vector icon
+  // keyed off `w.kind` (see warningKindIcon), so glyphs live in the UI layer.
   if (w.kind === 'disaster') {
     const t = prettyType(w.title);
     const sev = `sev ${w.severity}`;
     switch (audience) {
       case 'firefighter':
-        return { title: `🚒 Fire dispatch — ${t}`, body: `${sev} · ${distance}${bearing} away.` };
+        return { title: `Fire dispatch — ${t}`, body: `${sev} · ${distance}${bearing} away.` };
       case 'police':
-        return { title: `🚓 Police dispatch — ${t}`, body: `${sev} · ${distance}${bearing} away.` };
+        return { title: `Police dispatch — ${t}`, body: `${sev} · ${distance}${bearing} away.` };
       case 'paramedic':
-        return { title: `🚑 EMS dispatch — ${t}`, body: `${sev} · ${distance}${bearing} away.` };
+        return { title: `EMS dispatch — ${t}`, body: `${sev} · ${distance}${bearing} away.` };
       case 'admin':
-        return { title: `📡 Citywide alert — ${t}`, body: `Active at severity ${w.severity}.` };
+        return { title: `Citywide alert — ${t}`, body: `Active at severity ${w.severity}.` };
       case 'citizen':
       default:
-        return { title: `⚠ Danger nearby — ${t}`, body: `${sev} · ${distance}${bearing} away. Stay clear.` };
+        return { title: `Danger nearby — ${t}`, body: `${sev} · ${distance}${bearing} away. Stay clear.` };
     }
   }
   if (w.kind === 'cordon') {
-    return { title: `🚧 ${w.title}`, body: `${w.message} (${distance}${bearing})` };
+    return { title: w.title, body: `${w.message} (${distance}${bearing})` };
   }
   if (w.kind === 'dispatch') {
-    return { title: `🚨 ${w.title}`, body: w.message };
+    return { title: w.title, body: w.message };
   }
   if (w.kind === 'weather') {
-    return { title: `🌡 ${w.title}`, body: w.message };
+    return { title: w.title, body: w.message };
   }
   // alert
-  return { title: `⚠ ${w.title}`, body: `${w.message} (${distance}${bearing})` };
+  return { title: w.title, body: `${w.message} (${distance}${bearing})` };
 }
 
 // Describe a single warning for the Notifications screen. Same wording rules

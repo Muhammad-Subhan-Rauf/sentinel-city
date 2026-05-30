@@ -1,40 +1,76 @@
+// Standard screen scaffold: safe-area aware, themed background, an optional
+// large title + subtitle header, and a scroll/no-scroll body. List screens pass
+// `scroll={false}` and render their own FlatList so virtualization works.
+
 import React from 'react';
-import { StyleSheet, View, Text, ScrollView } from 'react-native';
+import { ScrollView, View, ViewStyle } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { colors } from '@/lib/colors';
+import { useTheme } from '@/theme/ThemeProvider';
+import { Text } from '@/components/ui';
 
 type Props = {
   title?: string;
+  subtitle?: string;
+  right?: React.ReactNode;
   children: React.ReactNode;
   scroll?: boolean;
+  /** Apply the standard 16pt gutter to the body. */
+  padded?: boolean;
+  contentContainerStyle?: ViewStyle;
 };
 
-export function Screen({ title, children, scroll = true }: Props) {
-  const body = scroll ? (
-    <ScrollView contentContainerStyle={styles.scrollPad}>{children}</ScrollView>
-  ) : (
-    // Non-scroll body must flex so a FlatList/list child can size itself.
-    // Without `flex: 1` here, virtualized children collapse to 0 height and
-    // render no rows (the bug that hid the Notifications feed).
-    <View style={[styles.scrollPad, { flex: 1 }]}>{children}</View>
-  );
+export function Screen({
+  title,
+  subtitle,
+  right,
+  children,
+  scroll = true,
+  padded = true,
+  contentContainerStyle,
+}: Props) {
+  const t = useTheme();
+  const pad: ViewStyle = padded
+    ? { paddingHorizontal: t.spacing.lg, paddingBottom: t.spacing.xxxl }
+    : {};
+
+  const header =
+    title || subtitle || right ? (
+      <View
+        style={{
+          flexDirection: 'row',
+          alignItems: 'flex-start',
+          justifyContent: 'space-between',
+          gap: t.spacing.md,
+          paddingHorizontal: t.spacing.lg,
+          paddingTop: t.spacing.sm,
+          paddingBottom: t.spacing.md,
+        }}
+      >
+        <View style={{ flex: 1 }}>
+          {title ? <Text variant="title">{title}</Text> : null}
+          {subtitle ? (
+            <Text variant="body" tone="secondary" style={{ marginTop: 2 }}>
+              {subtitle}
+            </Text>
+          ) : null}
+        </View>
+        {right ? <View style={{ paddingTop: 4 }}>{right}</View> : null}
+      </View>
+    ) : null;
+
   return (
-    <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
-      {title ? <Text style={styles.title}>{title}</Text> : null}
-      {body}
+    <SafeAreaView style={{ flex: 1, backgroundColor: t.color.bg }} edges={['top', 'left', 'right']}>
+      {header}
+      {scroll ? (
+        <ScrollView
+          contentContainerStyle={[{ paddingTop: t.spacing.xs }, pad, contentContainerStyle]}
+          showsVerticalScrollIndicator={false}
+        >
+          {children}
+        </ScrollView>
+      ) : (
+        <View style={[{ flex: 1 }, pad, contentContainerStyle]}>{children}</View>
+      )}
     </SafeAreaView>
   );
 }
-
-const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: colors.bg },
-  title: {
-    color: colors.textPrimary,
-    fontSize: 24,
-    fontWeight: '700',
-    paddingHorizontal: 20,
-    paddingTop: 12,
-    paddingBottom: 4,
-  },
-  scrollPad: { padding: 16, paddingBottom: 32 },
-});

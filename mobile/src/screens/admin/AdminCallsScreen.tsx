@@ -2,11 +2,12 @@
 // with a sticky list of the 10 most recent transcripts at the bottom.
 
 import React, { useEffect, useMemo, useState } from 'react';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ScrollView, StyleSheet, View } from 'react-native';
 import { DisasterMap, type DisasterMapPin } from '@/components/DisasterMap';
 import { useAuth } from '@/lib/auth';
 import { api, type CitizenReport } from '@/lib/api';
-import { colors } from '@/lib/colors';
+import { useTheme } from '@/theme';
+import { Text, Badge, Icon } from '@/components/ui';
 
 const POLL_MS = 5000;
 
@@ -23,6 +24,7 @@ function relativeTime(iso: string): string {
 }
 
 export default function AdminCallsScreen() {
+  const t = useTheme();
   const { session } = useAuth();
   const [reports, setReports] = useState<CitizenReport[]>([]);
 
@@ -54,50 +56,53 @@ export default function AdminCallsScreen() {
           lng: r.location.lng,
           label: r.transcript.length > 80 ? `${r.transcript.slice(0, 80)}…` : r.transcript,
         })),
-    [reports]
+    [reports],
   );
 
   return (
-    <View style={styles.root}>
-      <View style={styles.mapWrap}>
-        <DisasterMap
-          myLocation={null}
-          myRole="admin"
-          myUserId={session?.userId ?? ''}
-          showOtherUsers={false}
-          pins={pins}
-        />
+    <View style={{ flex: 1, backgroundColor: t.color.bg }}>
+      <View style={{ flex: 1 }}>
+        <DisasterMap myLocation={null} myRole="admin" myUserId={session?.userId ?? ''} showOtherUsers={false} pins={pins} />
       </View>
 
-      <View style={styles.summaryBar}>
-        <Text style={styles.summaryText}>
+      <View style={[styles.summaryBar, { backgroundColor: t.color.surfaceAlt, borderColor: t.color.border }]}>
+        <View style={[styles.liveDot, { backgroundColor: t.color.success }]} />
+        <Text variant="label" tone="secondary">
           {reports.length} report{reports.length === 1 ? '' : 's'} · live
         </Text>
       </View>
 
-      <View style={styles.listWrap}>
-        <ScrollView contentContainerStyle={{ paddingBottom: 16 }}>
-          <Text style={styles.listHeader}>Recent</Text>
+      <View style={[styles.listWrap, { backgroundColor: t.color.bg }]}>
+        <Text variant="overline" tone="muted" style={{ paddingHorizontal: t.spacing.lg, marginBottom: t.spacing.sm }}>
+          Recent reports
+        </Text>
+        <ScrollView contentContainerStyle={{ paddingBottom: 16, paddingHorizontal: t.spacing.lg }} showsVerticalScrollIndicator={false}>
           {reports.slice(0, 10).map((r) => (
-            <View key={r.id} style={styles.row}>
-              <View
-                style={[
-                  styles.kindDot,
-                  { backgroundColor: r.report_kind === 'affected' ? colors.danger : colors.info },
-                ]}
+            <View key={r.id} style={[styles.row, { borderBottomColor: t.color.divider }]}>
+              <Icon
+                name={r.report_kind === 'affected' ? 'alert' : 'info'}
+                size={18}
+                color={r.report_kind === 'affected' ? t.color.danger : t.color.info}
               />
               <View style={{ flex: 1 }}>
-                <Text style={styles.rowTitle} numberOfLines={2}>
+                <Text variant="body" numberOfLines={2}>
                   {r.transcript || '(no transcript)'}
                 </Text>
-                <Text style={styles.rowMeta}>
-                  {r.report_kind} · {relativeTime(r.reported_at)}
-                  {r.perceived_severity != null ? ` · sev ${r.perceived_severity}` : ''}
-                </Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 }}>
+                  <Badge label={r.report_kind} tone={r.report_kind === 'affected' ? 'danger' : 'info'} />
+                  <Text variant="caption" tone="muted">
+                    {relativeTime(r.reported_at)}
+                    {r.perceived_severity != null ? ` · sev ${r.perceived_severity}` : ''}
+                  </Text>
+                </View>
               </View>
             </View>
           ))}
-          {reports.length === 0 && <Text style={styles.empty}>No reports yet.</Text>}
+          {reports.length === 0 && (
+            <Text variant="body" tone="muted" center style={{ marginTop: 20 }}>
+              No reports yet.
+            </Text>
+          )}
         </ScrollView>
       </View>
     </View>
@@ -105,35 +110,8 @@ export default function AdminCallsScreen() {
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.bg },
-  mapWrap: { flex: 1 },
-  summaryBar: {
-    paddingVertical: 6,
-    paddingHorizontal: 16,
-    backgroundColor: colors.surfaceAlt,
-    borderTopWidth: 1,
-    borderBottomWidth: 1,
-    borderColor: colors.border,
-  },
-  summaryText: { color: colors.textSecondary, fontSize: 12, fontWeight: '600' },
-  listWrap: { height: 220, backgroundColor: colors.bg, paddingHorizontal: 12, paddingTop: 8 },
-  listHeader: {
-    color: colors.textMuted,
-    fontSize: 11,
-    textTransform: 'uppercase',
-    letterSpacing: 1.2,
-    marginBottom: 6,
-  },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    paddingVertical: 8,
-    borderBottomColor: colors.border,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  kindDot: { width: 10, height: 10, borderRadius: 5 },
-  rowTitle: { color: colors.textPrimary, fontSize: 13 },
-  rowMeta: { color: colors.textMuted, fontSize: 11, marginTop: 2, textTransform: 'capitalize' },
-  empty: { color: colors.textMuted, textAlign: 'center', marginTop: 20, fontSize: 13 },
+  summaryBar: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8, paddingHorizontal: 16, borderTopWidth: 1, borderBottomWidth: 1 },
+  liveDot: { width: 8, height: 8, borderRadius: 4 },
+  listWrap: { height: 240, paddingTop: 10 },
+  row: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10, borderBottomWidth: StyleSheet.hairlineWidth },
 });

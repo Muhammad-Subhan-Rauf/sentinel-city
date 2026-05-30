@@ -1,14 +1,17 @@
-// Admin: AI Agent Details — the registry of mock AI agents driving the city.
+// Admin: AI Agent Details — the registry of AI agents driving the city.
 
 import React, { useEffect, useState } from 'react';
-import { RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { RefreshControl, ScrollView, StyleSheet, View } from 'react-native';
 import { Screen } from '@/components/Screen';
 import { api, Agent } from '@/lib/api';
-import { colors } from '@/lib/colors';
+import { useTheme } from '@/theme';
+import { Text, Card, Badge, IconBadge, Divider, SkeletonCard, EmptyState } from '@/components/ui';
 
 export default function AdminAgentsScreen() {
+  const t = useTheme();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [firstLoad, setFirstLoad] = useState(true);
 
   const load = async () => {
     setRefreshing(true);
@@ -16,6 +19,7 @@ export default function AdminAgentsScreen() {
       setAgents(await api.listAgents().catch(() => []));
     } finally {
       setRefreshing(false);
+      setFirstLoad(false);
     }
   };
 
@@ -24,83 +28,73 @@ export default function AdminAgentsScreen() {
   }, []);
 
   return (
-    <Screen title="AI Agents">
-      <Text style={styles.subtitle}>
-        Mock registry — these slots will be filled by live AI models. Each card shows what the agent does
-        and a snapshot of its latest behaviour.
-      </Text>
-
+    <Screen title="AI Agents" subtitle="The autonomous agents coordinating the city's response, with a snapshot of each one's latest behaviour." scroll={false}>
       <ScrollView
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} tintColor={colors.info} />}
+        style={{ flex: 1 }}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: t.spacing.xxxl }}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} tintColor={t.color.primary} />}
       >
-        {agents.map((a) => (
-          <View key={a.id} style={styles.card}>
-            <View style={styles.cardHead}>
-              <Text style={styles.cardName}>{a.name}</Text>
-              <View style={styles.statusPill}>
-                <View style={styles.statusDot} />
-                <Text style={styles.statusText}>{a.status}</Text>
-              </View>
-            </View>
-            <Text style={styles.role}>{a.role}</Text>
-            <Text style={styles.model}>Powered by · {a.model}</Text>
-            <View style={styles.divider} />
-            <Text style={styles.actionLabel}>Most recent action</Text>
-            <Text style={styles.action}>{a.last_action}</Text>
-
-            <View style={styles.metricsRow}>
-              {Object.entries(a.metrics).map(([k, v]) => (
-                <View key={k} style={styles.metricBox}>
-                  <Text style={styles.metricValue}>{v.toLocaleString()}</Text>
-                  <Text style={styles.metricLabel}>{k.replace(/_/g, ' ')}</Text>
+        {firstLoad ? (
+          <>
+            <SkeletonCard />
+            <SkeletonCard />
+            <SkeletonCard />
+          </>
+        ) : agents.length === 0 ? (
+          <EmptyState icon="agents" tone={t.color.admin} title="No agents registered" body="Active AI agents will appear here as they come online." />
+        ) : (
+          agents.map((a) => (
+            <Card key={a.id} style={{ marginBottom: t.spacing.md }}>
+              <View style={styles.head}>
+                <IconBadge name="agents" color={t.color.admin} size={44} />
+                <View style={{ flex: 1, marginHorizontal: t.spacing.md }}>
+                  <Text variant="h3">{a.name}</Text>
+                  <Text variant="caption" tone="secondary">
+                    {a.role}
+                  </Text>
                 </View>
-              ))}
-            </View>
-          </View>
-        ))}
+                <Badge label={a.status} tone="success" icon="radio" />
+              </View>
+
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: t.spacing.sm }}>
+                <Text variant="caption" tone="muted">
+                  Powered by
+                </Text>
+                <Badge label={a.model} tone="accent" icon="sparkles" />
+              </View>
+
+              <Divider style={{ marginVertical: t.spacing.md }} />
+
+              <Text variant="overline" tone="muted">
+                Most recent action
+              </Text>
+              <Text variant="body" style={{ marginTop: 4 }}>
+                {a.last_action}
+              </Text>
+
+              <View style={styles.metricsRow}>
+                {Object.entries(a.metrics).map(([k, v]) => (
+                  <View key={k} style={[styles.metricBox, { backgroundColor: t.color.surfaceAlt, borderRadius: t.radius.md }]}>
+                    <Text variant="h2" tone="info" style={{ fontVariant: ['tabular-nums'] }}>
+                      {v.toLocaleString()}
+                    </Text>
+                    <Text variant="caption" tone="secondary" style={{ marginTop: 2, textTransform: 'capitalize' }}>
+                      {k.replace(/_/g, ' ')}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            </Card>
+          ))
+        )}
       </ScrollView>
     </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  subtitle: { color: colors.textSecondary, marginBottom: 12 },
-  card: {
-    backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 12,
-  },
-  cardHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  cardName: { color: colors.textPrimary, fontSize: 16, fontWeight: '700', flex: 1 },
-  statusPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: `${colors.success}22`,
-    borderColor: colors.success,
-    borderWidth: 1,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 12,
-  },
-  statusDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.success },
-  statusText: { color: colors.success, fontSize: 11, fontWeight: '700', textTransform: 'uppercase' },
-  role: { color: colors.textSecondary, fontSize: 13, marginTop: 4 },
-  model: { color: colors.textMuted, fontSize: 11, marginTop: 2 },
-  divider: { height: 1, backgroundColor: colors.border, marginVertical: 10 },
-  actionLabel: { color: colors.textMuted, fontSize: 11, textTransform: 'uppercase', marginBottom: 2 },
-  action: { color: colors.textPrimary, fontSize: 13, lineHeight: 18 },
-  metricsRow: { flexDirection: 'row', gap: 8, marginTop: 10, flexWrap: 'wrap' },
-  metricBox: {
-    flex: 1,
-    minWidth: 100,
-    backgroundColor: colors.surfaceAlt,
-    padding: 10,
-    borderRadius: 8,
-  },
-  metricValue: { color: colors.info, fontSize: 18, fontWeight: '700' },
-  metricLabel: { color: colors.textSecondary, fontSize: 11, marginTop: 2, textTransform: 'capitalize' },
+  head: { flexDirection: 'row', alignItems: 'center' },
+  metricsRow: { flexDirection: 'row', gap: 8, marginTop: 12, flexWrap: 'wrap' },
+  metricBox: { flex: 1, minWidth: 100, padding: 12 },
 });

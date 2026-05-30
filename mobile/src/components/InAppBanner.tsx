@@ -1,6 +1,7 @@
-import React, { useEffect } from 'react';
-import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
-import { colors } from '@/lib/colors';
+import React, { useEffect, useRef } from 'react';
+import { Animated, Pressable, StyleSheet, View } from 'react-native';
+import { useTheme } from '@/theme';
+import { Text, IconBadge, Icon, warningKindIcon } from '@/components/ui';
 import type { GeofenceToast } from '@/lib/geofence';
 
 type Props = {
@@ -11,97 +12,82 @@ type Props = {
 const AUTO_DISMISS_MS = 6000;
 
 export function InAppBanner({ toasts, onDismiss }: Props) {
-  // Auto-dismiss the oldest toast after AUTO_DISMISS_MS.
   useEffect(() => {
     if (toasts.length === 0) return;
     const oldest = toasts[0];
-    const t = setTimeout(() => onDismiss(oldest.id), AUTO_DISMISS_MS);
-    return () => clearTimeout(t);
+    const timer = setTimeout(() => onDismiss(oldest.id), AUTO_DISMISS_MS);
+    return () => clearTimeout(timer);
   }, [toasts, onDismiss]);
 
   if (toasts.length === 0) return null;
 
   return (
     <View pointerEvents="box-none" style={styles.wrap}>
-      {toasts.slice(-2).map((t) => (
-        <ToastCard key={t.id} toast={t} onDismiss={() => onDismiss(t.id)} />
+      {toasts.slice(-2).map((toast) => (
+        <ToastCard key={toast.id} toast={toast} onDismiss={() => onDismiss(toast.id)} />
       ))}
     </View>
   );
 }
 
 function ToastCard({ toast, onDismiss }: { toast: GeofenceToast; onDismiss: () => void }) {
-  const slide = React.useRef(new Animated.Value(-80)).current;
+  const t = useTheme();
+  const slide = useRef(new Animated.Value(t.reduceMotion ? 0 : -90)).current;
 
   useEffect(() => {
-    Animated.timing(slide, {
-      toValue: 0,
-      duration: 240,
-      useNativeDriver: true,
-    }).start();
-  }, [slide]);
+    if (t.reduceMotion) return;
+    Animated.spring(slide, { toValue: 0, useNativeDriver: true, speed: 14, bounciness: 6 }).start();
+  }, [slide, t.reduceMotion]);
 
   const accent =
     toast.kind === 'disaster' || toast.kind === 'alert'
-      ? colors.danger
+      ? t.color.danger
       : toast.kind === 'cordon'
-        ? colors.hazardCordon
+        ? t.color.hazardCordon
         : toast.kind === 'weather'
-          ? colors.hazardNotification
-          : toast.kind === 'dispatch'
-            ? colors.info
-            : colors.hazardNotification;
+          ? t.color.warning
+          : t.color.primary;
 
   return (
     <Animated.View
+      accessibilityLiveRegion="polite"
       style={[
         styles.card,
-        { borderLeftColor: accent, transform: [{ translateY: slide }] },
+        {
+          backgroundColor: t.color.surface,
+          borderColor: t.color.border,
+          borderRadius: t.radius.lg,
+          borderLeftColor: accent,
+          transform: [{ translateY: slide }],
+          ...t.shadow(2),
+        },
       ]}
     >
-      <View style={{ flex: 1 }}>
-        <Text style={styles.title}>{toast.title}</Text>
-        <Text style={styles.body} numberOfLines={2}>
+      <IconBadge name={warningKindIcon(toast.kind)} color={accent} size={38} />
+      <View style={{ flex: 1, marginLeft: 12 }}>
+        <Text variant="bodyStrong" numberOfLines={1}>
+          {toast.title}
+        </Text>
+        <Text variant="caption" tone="secondary" numberOfLines={2} style={{ marginTop: 1 }}>
           {toast.body}
         </Text>
       </View>
-      <Pressable onPress={onDismiss} hitSlop={10} style={styles.dismiss}>
-        <Text style={styles.dismissText}>×</Text>
+      <Pressable onPress={onDismiss} hitSlop={10} style={{ padding: 4 }} accessibilityRole="button" accessibilityLabel="Dismiss alert">
+        <Icon name="close" size={18} color={t.color.textMuted} />
       </Pressable>
     </Animated.View>
   );
 }
 
 const styles = StyleSheet.create({
-  wrap: {
-    position: 'absolute',
-    top: 56,
-    left: 12,
-    right: 12,
-    gap: 8,
-    zIndex: 1000,
-  },
+  wrap: { position: 'absolute', top: 52, left: 12, right: 12, gap: 8, zIndex: 1000 },
   card: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: colors.surface,
-    borderLeftWidth: 4,
-    borderRadius: 10,
-    padding: 12,
+    paddingVertical: 10,
+    paddingLeft: 12,
     paddingRight: 8,
-    borderColor: colors.border,
     borderWidth: 1,
-    shadowColor: '#000',
-    shadowOpacity: 0.35,
-    shadowOffset: { width: 0, height: 4 },
-    shadowRadius: 8,
-    elevation: 4,
+    borderLeftWidth: 4,
   },
-  title: { color: colors.textPrimary, fontWeight: '700', fontSize: 14 },
-  body: { color: colors.textSecondary, fontSize: 13, marginTop: 2 },
-  dismiss: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  dismissText: { color: colors.textMuted, fontSize: 22, lineHeight: 22 },
 });

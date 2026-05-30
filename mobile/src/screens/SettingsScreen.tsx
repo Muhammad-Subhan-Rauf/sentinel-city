@@ -1,26 +1,25 @@
 // Shared Settings screen for all roles.
 //   - Citizens & workers: pin-drop map (drag to relocate) + sign-out
-//   - Admins: identity caption + sign-out only (no map; admins don't have a position)
+//   - Admins: identity card + sign-out only (no map; admins have no position)
 
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LeafletPicker } from '@/components/LeafletPicker';
 import { useAuth } from '@/lib/auth';
 import { api } from '@/lib/api';
-import { colors, roleAccent } from '@/lib/colors';
+import { useTheme } from '@/theme';
+import { Text, Card, Button, IconBadge, Badge, Icon, SectionHeader, IconName } from '@/components/ui';
 
 const MANHATTAN = { lat: 40.758, lng: -73.9855 };
 
-// Helper: did this thrown error come from a 404 on a /citizens/ or /workers/
-// "me" lookup? The api client formats errors as `API 404 /api/citizens/<id>: …`
-// so a substring check is the simplest way without bloating the api layer.
 function isStaleSession(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e ?? '');
   return /\bAPI 404\b/.test(msg) && /\/api\/(citizens|workers)\//.test(msg);
 }
 
 export default function SettingsScreen() {
+  const t = useTheme();
   const { session, signOut } = useAuth();
   const [pin, setPin] = useState<{ lat: number; lng: number } | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
@@ -28,31 +27,44 @@ export default function SettingsScreen() {
 
   const role = session?.role;
   const isField = role === 'citizen' || role === 'worker';
-  const accent = roleAccent(role ?? 'citizen');
 
-  // Pull current position from backend for citizens/workers.
+  const accent =
+    role === 'citizen'
+      ? t.color.citizen
+      : role === 'admin'
+        ? t.color.admin
+        : session?.sub_role === 'firefighter'
+          ? t.color.firefighter
+          : session?.sub_role === 'police'
+            ? t.color.police
+            : t.color.paramedic;
+
+  const roleIcon: IconName =
+    role === 'admin'
+      ? 'shield'
+      : role === 'worker'
+        ? session?.sub_role === 'firefighter'
+          ? 'firefighter'
+          : session?.sub_role === 'police'
+            ? 'police'
+            : 'ambulance'
+        : 'person';
+
   useEffect(() => {
     if (!session || !isField) return;
     let cancelled = false;
     (async () => {
       try {
         const me =
-          session.role === 'citizen'
-            ? await api.getCitizen(session.userId)
-            : await api.getWorker(session.userId);
+          session.role === 'citizen' ? await api.getCitizen(session.userId) : await api.getWorker(session.userId);
         if (cancelled) return;
         setPin({ lat: me.lat, lng: me.lng });
       } catch (e) {
         if (cancelled) return;
-        // Backend was restarted, wiping its in-memory roster. The phone's
-        // stored session is now stale — kick the user back to PIN entry so
-        // their next login re-upserts them on the server.
         if (isStaleSession(e)) {
           signOut().catch(() => {});
           return;
         }
-        // Otherwise: first time or transient error, fall back to Manhattan
-        // so the map can still render.
         setPin(MANHATTAN);
       }
     })();
@@ -70,13 +82,12 @@ export default function SettingsScreen() {
       } else {
         await api.updateWorker(session.userId, { lat: loc.lat, lng: loc.lng });
       }
-      setSavedAt(new Date().toLocaleTimeString());
+      setSavedAt(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
     } catch (e) {
       if (isStaleSession(e)) {
         signOut().catch(() => {});
         return;
       }
-      /* swallow other errors; banner could surface them later */
     } finally {
       setSaving(false);
     }
@@ -85,84 +96,87 @@ export default function SettingsScreen() {
   if (!session) return null;
 
   return (
-    <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
-      <Text style={styles.title}>Settings</Text>
-      <Text style={styles.subtitle}>
-        Signed in as {session.name} · {session.sub_role ?? session.role}
+    <SafeAreaView style={[styles.safe, { backgroundColor: t.color.bg }]} edges={['top', 'left', 'right']}>
+      <Text variant="title" style={{ paddingHorizontal: t.spacing.lg, paddingTop: t.spacing.sm, paddingBottom: t.spacing.md }}>
+        Settings
       </Text>
 
-      {isField && (
-        <>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>Change address / location</Text>
-            <Text style={styles.sectionHint}>Drag the pin or tap the map to update.</Text>
-          </View>
-          <View style={styles.mapBox}>
-            {pin ? (
-              <LeafletPicker
-                pin={pin}
-                accent={accent}
-                onPinChange={(loc) => {
-                  setPin(loc);
-                  pushLocation(loc);
-                }}
+      <View style={{ flex: 1, paddingHorizontal: t.spacing.lg }}>
+        <Card style={{ marginBottom: t.spacing.lg }}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: t.spacing.md }}>
+            <IconBadge name={roleIcon} color={accent} size={52} iconSize={26} />
+            <View style={{ flex: 1 }}>
+              <Text variant="h2">{session.name}</Text>
+              <Badge
+                label={(session.sub_role ?? session.role).replace(/^\w/, (c) => c.toUpperCase())}
+                color={accent}
+                icon="shield"
+                style={{ marginTop: 6 }}
               />
-            ) : (
-              <ActivityIndicator color={colors.info} style={{ marginTop: 24 }} />
-            )}
+            </View>
           </View>
+        </Card>
 
-          <View style={styles.coordsRow}>
-            {pin && (
-              <Text style={styles.coords}>
-                {pin.lat.toFixed(5)}, {pin.lng.toFixed(5)}
-              </Text>
-            )}
-            {saving ? (
-              <ActivityIndicator color={colors.info} />
-            ) : savedAt ? (
-              <Text style={styles.savedAt}>Synced {savedAt}</Text>
-            ) : null}
-          </View>
-        </>
-      )}
+        {isField && (
+          <>
+            <SectionHeader title="Your location" hint="Drag the pin or tap the map to update where alerts reach you." />
+            <Card padded={false} style={{ overflow: 'hidden', flex: 1, marginBottom: t.spacing.md }}>
+              {pin ? (
+                <LeafletPicker
+                  pin={pin}
+                  accent={accent}
+                  onPinChange={(loc) => {
+                    setPin(loc);
+                    pushLocation(loc);
+                  }}
+                />
+              ) : (
+                <View style={{ flex: 1, minHeight: 220, alignItems: 'center', justifyContent: 'center' }}>
+                  <ActivityIndicator color={t.color.primary} />
+                </View>
+              )}
+            </Card>
 
-      <Pressable onPress={signOut} style={styles.signOutBtn}>
-        <Text style={styles.signOutText}>Sign out</Text>
-      </Pressable>
+            <View style={styles.coordsRow}>
+              {pin && (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <Icon name="pin" size={14} color={t.color.textMuted} />
+                  <Text variant="mono" tone="secondary">
+                    {pin.lat.toFixed(5)}, {pin.lng.toFixed(5)}
+                  </Text>
+                </View>
+              )}
+              {saving ? (
+                <ActivityIndicator color={t.color.primary} />
+              ) : savedAt ? (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                  <Icon name="check-circle" size={14} color={t.color.success} />
+                  <Text variant="caption" tone="success">
+                    Synced {savedAt}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          </>
+        )}
+
+        {!isField && <View style={{ flex: 1 }} />}
+
+        <View style={styles.appearanceRow}>
+          <Icon name={t.scheme === 'light' ? 'eye' : 'eye-off'} size={14} color={t.color.textMuted} />
+          <Text variant="caption" tone="muted" style={{ marginLeft: 6 }}>
+            Appearance follows your device ({t.scheme} mode)
+          </Text>
+        </View>
+
+        <Button label="Sign out" variant="danger" icon="signout" onPress={signOut} style={{ marginBottom: t.spacing.lg }} />
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: colors.bg, padding: 16 },
-  title: { color: colors.textPrimary, fontSize: 24, fontWeight: '700' },
-  subtitle: { color: colors.textSecondary, marginTop: 4, marginBottom: 12 },
-  sectionHeader: { marginTop: 4 },
-  sectionTitle: { color: colors.textPrimary, fontSize: 16, fontWeight: '700' },
-  sectionHint: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
-  mapBox: {
-    flex: 1,
-    backgroundColor: colors.surface,
-    borderRadius: 12,
-    overflow: 'hidden',
-    marginVertical: 12,
-    minHeight: 240,
-  },
-  coordsRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginBottom: 12,
-  },
-  coords: { color: colors.textPrimary, fontSize: 13, fontVariant: ['tabular-nums'] },
-  savedAt: { color: colors.success, fontSize: 12 },
-  signOutBtn: {
-    backgroundColor: colors.danger,
-    paddingVertical: 14,
-    borderRadius: 10,
-    alignItems: 'center',
-    marginTop: 12,
-  },
-  signOutText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  safe: { flex: 1 },
+  coordsRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
+  appearanceRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
 });

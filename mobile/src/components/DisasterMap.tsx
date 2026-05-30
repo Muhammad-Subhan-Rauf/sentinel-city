@@ -1,33 +1,26 @@
 // Shared map view used by Citizen, Worker, and Admin Calls screens.
 //
 // Rendered via Leaflet inside a WebView so the mobile basemap matches the web
-// operator console exactly (CartoDB dark, same hazard polygon palette). Tile
-// traffic goes out over the phone's normal network; only API traffic goes
-// through adb reverse.
+// operator console. The basemap (and every injected marker/route color) follows
+// the active theme: CartoDB dark tiles in dark mode, Positron light tiles in
+// light mode. The WebView is keyed by scheme so it rebuilds cleanly on switch.
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 import type { WebView as WebViewType } from 'react-native-webview';
-import { api, MobileCitizen, MobileWorker, Notification, Cordon, Route, Disaster, WorkerSubRole } from '@/lib/api';
-import { colors, roleAccent, workerAccent } from '@/lib/colors';
+import { api, MobileCitizen, StationPoint, Notification, Cordon, Route, Disaster, WorkerSubRole } from '@/lib/api';
+import { useTheme } from '@/theme';
 import { disasterRing } from '@/lib/geo';
 import { MapLegend } from './MapLegend';
 
 const MANHATTAN = { lat: 40.758, lng: -73.9855 };
 
-export type DisasterMapPin = {
-  id: string;
-  lat: number;
-  lng: number;
-  label: string;
-};
+export type DisasterMapPin = { id: string; lat: number; lng: number; label: string };
 
 type Props = {
   myLocation: { lat: number; lng: number } | null;
   myRole: 'citizen' | 'worker' | 'admin';
-  // Only meaningful when myRole === 'worker'; selects the per-subrole accent
-  // for the "me" marker and the matching legend row.
   mySubRole?: WorkerSubRole;
   myUserId: string;
   showOtherUsers: boolean;
@@ -36,14 +29,11 @@ type Props = {
   onMapPress?: (lat: number, lng: number) => void;
   onPolygonPress?: (eventId: string | null, label: string) => void;
   pins?: DisasterMapPin[];
-  // Called whenever the active-disaster list changes, so the parent screen
-  // can surface a DANGER banner or other in-zone alerts.
   onDisastersChange?: (disasters: Disaster[]) => void;
 };
 
 type PolygonItem = {
   id: string;
-  // GeoJSON-style [lng, lat] ring — passed straight to Leaflet.GeoJSON
   ring: Array<[number, number]>;
   color: string;
   fillOpacity: number;
@@ -57,26 +47,19 @@ function polygonToRing(geometry: any): Array<[number, number]> {
   return geometry.coordinates[0] ?? [];
 }
 
-// One-shot HTML payload. Map is created on DOMContentLoaded; subsequent state
-// arrives via window.__applyState (called by RN through injectJavaScript).
-// All overlay state lives in window-scoped vars so the map doesn't rebuild on
-// every prop change.
-const LEAFLET_HTML = `<!doctype html>
+type MapPalette = { bg: string; tiles: string; pinBorder: string; routeColor: string; destColor: string; pinColor: string };
+
+function buildLeafletHtml(p: MapPalette): string {
+  return `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
-  html, body, #map { height: 100%; margin: 0; padding: 0; background: ${colors.bg}; }
-  .me-dot {
-    width: 18px; height: 18px; border-radius: 50%;
-    border: 3px solid #fff; box-shadow: 0 0 0 4px rgba(255,255,255,0.25);
-  }
-  .pin {
-    width: 14px; height: 14px; border-radius: 50%;
-    border: 2px solid #0b1220; box-shadow: 0 0 6px rgba(0,0,0,0.6);
-  }
+  html, body, #map { height: 100%; margin: 0; padding: 0; background: ${p.bg}; }
+  .me-dot { width: 18px; height: 18px; border-radius: 50%; border: 3px solid #fff; box-shadow: 0 0 0 4px rgba(255,255,255,0.25); }
+  .pin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid ${p.pinBorder}; box-shadow: 0 0 6px rgba(0,0,0,0.5); }
 </style>
 </head>
 <body>
@@ -84,132 +67,70 @@ const LEAFLET_HTML = `<!doctype html>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 (function () {
-  var post = function (payload) {
-    if (window.ReactNativeWebView) {
-      window.ReactNativeWebView.postMessage(JSON.stringify(payload));
-    }
-  };
+  var post = function (payload) { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(payload)); };
+  var map = L.map('map', { zoomControl: true, attributionControl: false }).setView([${MANHATTAN.lat}, ${MANHATTAN.lng}], 13);
+  L.tileLayer('${p.tiles}', { subdomains: 'abcd', maxZoom: 20, keepBuffer: 8 }).addTo(map);
+  map.on('click', function (e) { post({ type: 'press', lat: e.latlng.lat, lng: e.latlng.lng }); });
 
-  var map = L.map('map', {
-    zoomControl: true,
-    attributionControl: false,
-  }).setView([${MANHATTAN.lat}, ${MANHATTAN.lng}], 13);
-
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    subdomains: 'abcd',
-    maxZoom: 20,
-    keepBuffer: 8,
-  }).addTo(map);
-
-  map.on('click', function (e) {
-    post({ type: 'press', lat: e.latlng.lat, lng: e.latlng.lng });
-  });
-
-  // Layer groups — wiped & rebuilt on each setState call. Cheap: counts are
-  // small (handful of polygons, dozens of markers at most).
   var polygonLayer = L.layerGroup().addTo(map);
+  var stationLayer = L.layerGroup().addTo(map);
   var pinLayer = L.layerGroup().addTo(map);
   var otherUserLayer = L.layerGroup().addTo(map);
   var destinationLayer = L.layerGroup().addTo(map);
   var routeLayer = L.layerGroup().addTo(map);
   var meLayer = L.layerGroup().addTo(map);
-
   var centeredOnMe = false;
 
-  function makePinIcon(color) {
-    return L.divIcon({
-      className: '',
-      html: '<div class="pin" style="background:' + color + '"></div>',
-      iconSize: [14, 14],
-      iconAnchor: [7, 7],
-    });
+  // Station markers mirror the web operator console exactly: an emoji DivIcon
+  // (🚒 fire · 🏥 hospital · 🚓 police) with the station name as a tooltip.
+  var STATION_EMOJI = { fire: '🚒', hospital: '🏥', police: '🚓' };
+  function makeStationIcon(kind) {
+    return L.divIcon({ className: '', html: '<div style="font-size:20px;line-height:20px;text-shadow:0 1px 2px #000;">' + (STATION_EMOJI[kind] || '📍') + '</div>', iconSize: [24, 24], iconAnchor: [12, 12] });
   }
-
+  function makePinIcon(color) {
+    return L.divIcon({ className: '', html: '<div class="pin" style="background:' + color + '"></div>', iconSize: [14, 14], iconAnchor: [7, 7] });
+  }
   function makeMeIcon(color) {
-    return L.divIcon({
-      className: '',
-      html: '<div class="me-dot" style="background:' + color + '"></div>',
-      iconSize: [18, 18],
-      iconAnchor: [9, 9],
-    });
+    return L.divIcon({ className: '', html: '<div class="me-dot" style="background:' + color + '"></div>', iconSize: [18, 18], iconAnchor: [9, 9] });
   }
 
   window.__applyState = function (state) {
     try {
-      // Polygons (notifications + cordons)
       polygonLayer.clearLayers();
-      (state.polygons || []).forEach(function (p) {
-        var latlngs = (p.ring || []).map(function (c) { return [c[1], c[0]]; });
+      (state.polygons || []).forEach(function (pg) {
+        var latlngs = (pg.ring || []).map(function (c) { return [c[1], c[0]]; });
         if (latlngs.length < 3) return;
-        var poly = L.polygon(latlngs, {
-          color: p.color,
-          weight: 2,
-          fillColor: p.color,
-          fillOpacity: p.fillOpacity,
-          dashArray: p.dashArray || undefined,
-        });
-        poly.on('click', function (ev) {
-          L.DomEvent.stopPropagation(ev);
-          post({ type: 'polygonPress', eventId: p.eventId, label: p.label });
-        });
+        var poly = L.polygon(latlngs, { color: pg.color, weight: 2, fillColor: pg.color, fillOpacity: pg.fillOpacity, dashArray: pg.dashArray || undefined });
+        poly.on('click', function (ev) { L.DomEvent.stopPropagation(ev); post({ type: 'polygonPress', eventId: pg.eventId, label: pg.label }); });
         poly.addTo(polygonLayer);
       });
 
-      // Citizen-report pins
+      stationLayer.clearLayers();
+      (state.stations || []).forEach(function (s) {
+        var m = L.marker([s.lat, s.lng], { icon: makeStationIcon(s.kind), keyboard: false });
+        if (s.label) m.bindTooltip(s.label, { direction: 'top', offset: [0, -8] });
+        m.addTo(stationLayer);
+      });
+
       pinLayer.clearLayers();
-      (state.pins || []).forEach(function (pin) {
-        L.marker([pin.lat, pin.lng], { icon: makePinIcon('${colors.info}') })
-          .bindPopup(pin.label)
-          .addTo(pinLayer);
-      });
+      (state.pins || []).forEach(function (pin) { L.marker([pin.lat, pin.lng], { icon: makePinIcon('${p.pinColor}') }).bindPopup(pin.label).addTo(pinLayer); });
 
-      // Other users
       otherUserLayer.clearLayers();
-      (state.otherUsers || []).forEach(function (u) {
-        L.marker([u.lat, u.lng], { icon: makePinIcon(u.color) })
-          .bindPopup(u.title + (u.subtitle ? '<br/>' + u.subtitle : ''))
-          .addTo(otherUserLayer);
-      });
+      (state.otherUsers || []).forEach(function (u) { L.marker([u.lat, u.lng], { icon: makePinIcon(u.color) }).bindPopup(u.title + (u.subtitle ? '<br/>' + u.subtitle : '')).addTo(otherUserLayer); });
 
-      // Destination
       destinationLayer.clearLayers();
-      if (state.destination) {
-        L.marker([state.destination.lat, state.destination.lng], {
-          icon: makePinIcon('${colors.success}'),
-        }).bindPopup('Destination').addTo(destinationLayer);
-      }
+      if (state.destination) { L.marker([state.destination.lat, state.destination.lng], { icon: makePinIcon('${p.destColor}') }).bindPopup('Destination').addTo(destinationLayer); }
 
-      // Route polyline
       routeLayer.clearLayers();
-      if (state.route && state.route.length > 1) {
-        L.polyline(state.route, {
-          color: '${colors.info}',
-          weight: 5,
-          opacity: 0.9,
-        }).addTo(routeLayer);
-      }
+      if (state.route && state.route.length > 1) { L.polyline(state.route, { color: '${p.routeColor}', weight: 5, opacity: 0.9 }).addTo(routeLayer); }
 
-      // "Me" — ring + dot
       meLayer.clearLayers();
       if (state.me) {
-        L.circle([state.me.lat, state.me.lng], {
-          radius: 80,
-          color: state.me.color,
-          fillColor: state.me.color,
-          fillOpacity: 0.15,
-          weight: 3,
-        }).addTo(meLayer);
-        L.marker([state.me.lat, state.me.lng], { icon: makeMeIcon(state.me.color) })
-          .bindPopup(state.me.title)
-          .addTo(meLayer);
-        if (!centeredOnMe) {
-          map.setView([state.me.lat, state.me.lng], 14);
-          centeredOnMe = true;
-        }
+        L.circle([state.me.lat, state.me.lng], { radius: 80, color: state.me.color, fillColor: state.me.color, fillOpacity: 0.15, weight: 3 }).addTo(meLayer);
+        L.marker([state.me.lat, state.me.lng], { icon: makeMeIcon(state.me.color) }).bindPopup(state.me.title).addTo(meLayer);
+        if (!centeredOnMe) { map.setView([state.me.lat, state.me.lng], 14); centeredOnMe = true; }
       }
-    } catch (err) {
-      post({ type: 'error', message: String(err && err.message || err) });
-    }
+    } catch (err) { post({ type: 'error', message: String(err && err.message || err) }); }
   };
 
   post({ type: 'ready' });
@@ -218,6 +139,7 @@ true;
 </script>
 </body>
 </html>`;
+}
 
 export function DisasterMap({
   myLocation,
@@ -232,37 +154,67 @@ export function DisasterMap({
   pins,
   onDisastersChange,
 }: Props) {
+  const t = useTheme();
   const webviewRef = useRef<WebViewType | null>(null);
   const [ready, setReady] = useState(false);
   const [notifs, setNotifs] = useState<Notification[]>([]);
   const [cordons, setCordons] = useState<Cordon[]>([]);
   const [disasters, setDisasters] = useState<Disaster[]>([]);
   const [citizens, setCitizens] = useState<MobileCitizen[]>([]);
-  const [workers, setWorkers] = useState<MobileWorker[]>([]);
+  const [fireStations, setFireStations] = useState<StationPoint[]>([]);
+  const [hospitals, setHospitals] = useState<StationPoint[]>([]);
+  const [policeStations, setPoliceStations] = useState<StationPoint[]>([]);
+
+  // Colours the user's own "me" dot by their sub-role; individual workers are no
+  // longer plotted (their stations are shown instead).
+  const workerAccent = (sub?: string | null) =>
+    sub === 'firefighter' ? t.color.firefighter : sub === 'police' ? t.color.police : sub === 'paramedic' ? t.color.paramedic : t.color.worker;
+
+  const html = useMemo(
+    () =>
+      buildLeafletHtml({
+        bg: t.color.bg,
+        tiles:
+          t.scheme === 'light'
+            ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
+            : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+        pinBorder: t.color.bg,
+        routeColor: t.color.primary,
+        destColor: t.color.success,
+        pinColor: t.color.primary,
+      }),
+    [t.scheme, t.color.bg, t.color.primary, t.color.success],
+  );
 
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
       try {
-        // Mobile map renders only AI-originated warnings — operator-drawn
-        // dashboard rows are hidden. The list endpoints still return
-        // everything; we filter client-side on the `source` field.
-        const [notifs, cordons, disasters, citizens, workers] = await Promise.all([
+        const [notifs, cordons, disasters, citizens, fireStations, hospitals, policeStations] = await Promise.all([
           api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => []),
           api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => []),
-          api.listDisasters().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => []),
+          // Disasters are gated on citizen reports (see api.listReportedDisasters):
+          // a placed disaster only appears once users report it, any source.
+          api.listReportedDisasters().catch(() => []),
+          // Other citizens stay private to citizens — only fetched when allowed.
           showOtherUsers ? api.listCitizens().catch(() => []) : Promise.resolve([]),
-          showOtherUsers ? api.listWorkers().catch(() => []) : Promise.resolve([]),
+          // Public infrastructure — fire / hospital / police stations — is shown
+          // on EVERY user's map (synced with the web operator console).
+          api.listFireStations().catch(() => []),
+          api.listHospitals().catch(() => []),
+          api.listPoliceStations().catch(() => []),
         ]);
         if (cancelled) return;
         setNotifs(notifs);
         setCordons(cordons);
         setDisasters(disasters);
         setCitizens(citizens);
-        setWorkers(workers);
+        setFireStations(fireStations);
+        setHospitals(hospitals);
+        setPoliceStations(policeStations);
         onDisastersChange?.(disasters);
       } catch {
-        // Best-effort; skip frame on error.
+        /* skip frame on error */
       }
     };
     tick();
@@ -275,137 +227,77 @@ export function DisasterMap({
 
   const polygons = useMemo<PolygonItem[]>(() => {
     const merged: PolygonItem[] = [];
-    // Disaster footprints first so they paint underneath operator overlays.
-    // Point-type disasters become a severity-scaled circle so they're visible
-    // on the map and not just a 0-area dot.
     for (const d of disasters) {
       if (d.status !== 'active') continue;
       const ring = disasterRing(d.area_geometry, d.severity);
       if (ring.length < 3) continue;
-      merged.push({
-        id: `d-${d.id}`,
-        ring,
-        color: colors.danger,
-        fillOpacity: 0.22,
-        label: `${d.disaster_type.replace('_', ' ')} · severity ${d.severity}`,
-        eventId: d.id,
-      });
+      merged.push({ id: `d-${d.id}`, ring, color: t.color.danger, fillOpacity: 0.22, label: `${d.disaster_type.replace('_', ' ')} · severity ${d.severity}`, eventId: d.id });
     }
     for (const n of notifs) {
       const ring = polygonToRing(n.geometry);
-      if (ring.length)
-        merged.push({
-          id: `n-${n.id}`,
-          ring,
-          color: colors.hazardNotification,
-          fillOpacity: 0.15,
-          label: n.reason,
-          eventId: n.event_id ?? null,
-        });
+      if (ring.length) merged.push({ id: `n-${n.id}`, ring, color: t.color.hazardNotification, fillOpacity: 0.15, label: n.reason, eventId: n.event_id ?? null });
     }
     for (const c of cordons) {
       const ring = polygonToRing(c.geometry);
-      if (ring.length)
-        merged.push({
-          id: `c-${c.id}`,
-          ring,
-          color: colors.hazardCordon,
-          fillOpacity: 0.12,
-          dashArray: '4 6',
-          label: c.reason ?? 'Cordon',
-          eventId: c.event_id ?? null,
-        });
+      if (ring.length) merged.push({ id: `c-${c.id}`, ring, color: t.color.hazardCordon, fillOpacity: 0.12, dashArray: '4 6', label: c.reason ?? 'Cordon', eventId: c.event_id ?? null });
     }
     return merged;
-  }, [notifs, cordons, disasters]);
+  }, [notifs, cordons, disasters, t.color.danger, t.color.hazardNotification, t.color.hazardCordon]);
 
-  // Push state into the WebView whenever anything visible changes. Stringify
-  // once; the WebView parses it inside __applyState.
   useEffect(() => {
     if (!ready) return;
-    // Color the "me" dot by sub-role when worker (red/rose/blue), else by role.
-    const meColor = myRole === 'worker' ? workerAccent(mySubRole) : roleAccent(myRole);
+    const meColor = myRole === 'worker' ? workerAccent(mySubRole) : myRole === 'citizen' ? t.color.citizen : t.color.admin;
     const subRoleLabel =
-      mySubRole === 'firefighter'
-        ? 'Firefighter'
-        : mySubRole === 'paramedic'
-          ? 'Paramedic'
-          : mySubRole === 'police'
-            ? 'Police'
-            : 'Emergency Worker';
-    const meTitle =
-      myRole === 'citizen'
-        ? 'You · Citizen'
-        : myRole === 'worker'
-          ? `You · ${subRoleLabel}`
-          : 'You · Operator';
+      mySubRole === 'firefighter' ? 'Firefighter' : mySubRole === 'paramedic' ? 'Paramedic' : mySubRole === 'police' ? 'Police' : 'Emergency Worker';
+    const meTitle = myRole === 'citizen' ? 'You · Citizen' : myRole === 'worker' ? `You · ${subRoleLabel}` : 'You · Operator';
+    // Only other citizens are ever plotted as people (and only where allowed).
+    // Individual public servants are NOT shown — their stations are, below.
     const otherUsers = showOtherUsers
-      ? [
-          ...citizens
-            .filter((c) => c.id !== myUserId)
-            .map((c) => ({
-              lat: c.lat,
-              lng: c.lng,
-              color: colors.citizen,
-              title: c.name,
-              subtitle: `Citizen · ${c.status}`,
-            })),
-          ...workers
-            .filter((w) => w.id !== myUserId)
-            .map((w) => ({
-              lat: w.lat,
-              lng: w.lng,
-              // Each worker dot is painted in its dispatch color so an admin
-              // can read who's who without tapping.
-              color: workerAccent(w.role),
-              title: w.name,
-              subtitle: `${w.role} · ${w.status}`,
-            })),
-        ]
+      ? citizens.filter((c) => c.id !== myUserId).map((c) => ({ lat: c.lat, lng: c.lng, color: t.color.citizen, title: c.name, subtitle: `Citizen · ${c.status}` }))
       : [];
+
+    const stations = [
+      ...fireStations.map((s) => ({ lat: s.lat, lng: s.lng, kind: 'fire', label: s.name ?? 'Fire station' })),
+      ...hospitals.map((s) => ({ lat: s.lat, lng: s.lng, kind: 'hospital', label: s.name ?? 'Hospital' })),
+      ...policeStations.map((s) => ({ lat: s.lat, lng: s.lng, kind: 'police', label: s.name ?? 'Police station' })),
+    ];
 
     const state = {
       polygons,
+      stations,
       pins: pins ?? [],
       otherUsers,
       destination: destination ?? null,
       route: route?.coordinates.map((c) => [c.latitude, c.longitude]) ?? null,
       me: myLocation ? { lat: myLocation.lat, lng: myLocation.lng, color: meColor, title: meTitle } : null,
     };
-    const js = `window.__applyState && window.__applyState(${JSON.stringify(state)}); true;`;
-    webviewRef.current?.injectJavaScript(js);
-  }, [ready, polygons, pins, showOtherUsers, citizens, workers, myLocation, myRole, mySubRole, myUserId, destination, route]);
+    webviewRef.current?.injectJavaScript(`window.__applyState && window.__applyState(${JSON.stringify(state)}); true;`);
+  }, [ready, polygons, pins, showOtherUsers, citizens, fireStations, hospitals, policeStations, myLocation, myRole, mySubRole, myUserId, destination, route, t.color]);
 
   const handleMessage = (event: { nativeEvent: { data: string } }) => {
     try {
       const msg = JSON.parse(event.nativeEvent.data);
-      if (msg.type === 'ready') {
-        setReady(true);
-      } else if (msg.type === 'press') {
-        onMapPress?.(msg.lat, msg.lng);
-      } else if (msg.type === 'polygonPress') {
-        onPolygonPress?.(msg.eventId ?? null, msg.label ?? '');
-      }
+      if (msg.type === 'ready') setReady(true);
+      else if (msg.type === 'press') onMapPress?.(msg.lat, msg.lng);
+      else if (msg.type === 'polygonPress') onPolygonPress?.(msg.eventId ?? null, msg.label ?? '');
     } catch {
-      // Malformed messages are ignored — the JS bridge will retry next event.
+      /* ignore malformed bridge messages */
     }
   };
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: t.color.bg }]}>
       <WebView
+        key={t.scheme}
         ref={webviewRef}
-        source={{ html: LEAFLET_HTML }}
+        source={{ html }}
         originWhitelist={['*']}
         javaScriptEnabled
         domStorageEnabled
-        // Avoid the white flash on first load against the dark app chrome.
-        style={styles.webview}
+        style={[styles.webview, { backgroundColor: t.color.bg }]}
         onMessage={handleMessage}
-        // Android: hardware-accelerated layer keeps tile panning smooth.
+        onLoadStart={() => setReady(false)}
         androidLayerType="hardware"
-        // Some Android builds block the CDN over plain http; Leaflet uses
-        // https everywhere we configure, so this stays false.
         mixedContentMode="never"
       />
 
@@ -416,23 +308,15 @@ export function DisasterMap({
         hasDestination={!!destination}
         hasRoute={!!(route && route.coordinates.length > 1)}
         hasPins={!!(pins && pins.length > 0)}
-        workerCounts={{
-          firefighter: workers.filter((w) => w.id !== myUserId && w.role === 'firefighter').length,
-          paramedic: workers.filter((w) => w.id !== myUserId && w.role === 'paramedic').length,
-          police: workers.filter((w) => w.id !== myUserId && w.role === 'police').length,
-        }}
+        stationCounts={{ fire: fireStations.length, hospital: hospitals.length, police: policeStations.length }}
         citizenCount={citizens.filter((c) => c.id !== myUserId).length}
-        stats={{
-          dangerZones: disasters.filter((d) => d.status === 'active').length,
-          advisories: notifs.length,
-          cordons: cordons.length,
-        }}
+        stats={{ dangerZones: disasters.filter((d) => d.status === 'active').length, advisories: notifs.length, cordons: cordons.length }}
       />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.bg },
-  webview: { flex: 1, backgroundColor: colors.bg },
+  container: { flex: 1 },
+  webview: { flex: 1 },
 });

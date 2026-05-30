@@ -1,28 +1,21 @@
-// Citizen map — Google Maps style. The user sees:
-//   - their own location (blue pulse marker, distinct from any other dot)
-//   - active hazards (red/yellow polygons)
-//   - NO other citizens (privacy-by-default)
-//   - a tappable destination + route line that avoids active hazard polygons
-//
-// Rerouting: whenever the active hazard set changes, we recompute the route
-// using Valhalla's avoid_polygons feature so the citizen is steered around
-// the disaster automatically.
+// Citizen map — Google Maps style. The user sees their own location, active
+// hazards (red/yellow polygons), a tappable destination + a route that avoids
+// active hazard polygons (recomputed via Valhalla avoid_polygons), and — when
+// standing inside an active zone — a Call 911 button that auto-fills a transcript.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View, ActivityIndicator } from 'react-native';
+import { AccessibilityInfo, ActivityIndicator, Alert, Pressable, StyleSheet, View } from 'react-native';
 import { DisasterMap } from '@/components/DisasterMap';
 import { api, fetchRoute, MobileCitizen, Notification, Cordon, Route, Disaster, EmergencyService } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import { colors } from '@/lib/colors';
+import { useTheme } from '@/theme';
+import { Text, Card, Button, Icon } from '@/components/ui';
 import { disasterRing, pointInPolygon, ringForValhallaAvoid } from '@/lib/geo';
 import { EmergencyCallModal } from '@/components/EmergencyCallModal';
 
 type LatLng = { lat: number; lng: number };
 
 function notifsToAvoidPolygons(notifs: Array<Notification | Cordon>): number[][][] {
-  // Valhalla wants [[[lng, lat], ...]] per polygon, and rejects anything
-  // whose perimeter exceeds 10 km — so we run every ring through
-  // ringForValhallaAvoid before forwarding.
   const out: number[][][] = [];
   for (const n of notifs) {
     if (n.geometry?.type !== 'Polygon') continue;
@@ -33,9 +26,6 @@ function notifsToAvoidPolygons(notifs: Array<Notification | Cordon>): number[][]
   return out;
 }
 
-// Active disaster footprints (Wildfire / Flood / Building_Fire / etc.). Point
-// disasters become a severity-scaled circle; oversized polygons get
-// down-sampled to a Valhalla-safe circumference.
 function disastersToAvoidPolygons(disasters: Disaster[]): number[][][] {
   const out: number[][][] = [];
   for (const d of disasters) {
@@ -47,22 +37,8 @@ function disastersToAvoidPolygons(disasters: Disaster[]): number[][][] {
   return out;
 }
 
-// Pre-built call script the citizen "speaks" when they tap Call 911.
-// The transcript adapts to *every* active zone the caller is currently inside
-// — dispatch needs the full picture, not just the worst one, because a wildfire
-// overlapping a flood is a very different ask from a flood alone. Pure function
-// of the disaster set + caller so what the citizen sees is exactly what gets
-// spoken and POSTed.
 function severityWord(sev: number): string {
-  return sev >= 5
-    ? 'critical'
-    : sev >= 4
-      ? 'severe'
-      : sev >= 3
-        ? 'major'
-        : sev >= 2
-          ? 'moderate'
-          : 'minor';
+  return sev >= 5 ? 'critical' : sev >= 4 ? 'severe' : sev >= 3 ? 'major' : sev >= 2 ? 'moderate' : 'minor';
 }
 
 function causePhrase(cause: Disaster['cause']): string | null {
@@ -77,68 +53,33 @@ function describeZone(d: Disaster): string {
   return `an active ${type} zone at severity ${d.severity} (${severityWord(d.severity)})${cause ? `, ${cause}` : ''}`;
 }
 
-function buildEmergencyTranscript(
-  dangers: Disaster[],
-  callerName: string,
-  caller: LatLng,
-): string {
+function buildEmergencyTranscript(dangers: Disaster[], callerName: string, caller: LatLng): string {
   const coords = `${caller.lat.toFixed(5)}, ${caller.lng.toFixed(5)}`;
   const head = [
     `This is an automated 911 report from Sentinel-City.`,
     `Caller: ${callerName}.`,
     `Location: ${coords}.`,
   ];
-
-  // Defensive fallback — the modal shouldn't open when dangers is empty, but
-  // if a caller manages it (e.g. they just exited the zone) say something
-  // coherent rather than emitting "is inside zero zones".
   if (dangers.length === 0) {
-    return [
-      ...head,
-      `Caller is requesting emergency assistance at this location.`,
-      `Please dispatch the nearest available unit.`,
-    ].join(' ');
+    return [...head, `Caller is requesting emergency assistance at this location.`, `Please dispatch the nearest available unit.`].join(' ');
   }
-
-  // Sort worst-first so dispatch hears the most urgent zone before the others.
   const sorted = [...dangers].sort((a, b) => b.severity - a.severity);
-
   let situation: string;
   if (sorted.length === 1) {
     situation = `The caller is inside ${describeZone(sorted[0])}.`;
   } else {
-    // Worst zone gets full English; the remainder are listed compactly so the
-    // sentence still scans even with four overlapping zones. Reads like:
-    // "Caller is inside a severe wildfire zone (severity 4, storm-driven),
-    //  overlapping with: a moderate flood zone (severity 2); a minor accident
-    //  zone (severity 1)."
     const primary = describeZone(sorted[0]);
     const rest = sorted.slice(1).map(describeZone).join('; ');
     situation = `The caller is inside ${primary}, overlapping with: ${rest}.`;
   }
-
   const overlapNote =
-    sorted.length > 1
-      ? `Multiple hazards on scene — ${sorted.length} overlapping zones — coordinate the response.`
-      : null;
-
-  return [
-    ...head,
-    situation,
-    overlapNote,
-    `Caller requires immediate assistance. Please dispatch the nearest available unit.`,
-  ]
+    sorted.length > 1 ? `Multiple hazards on scene — ${sorted.length} overlapping zones — coordinate the response.` : null;
+  return [...head, situation, overlapNote, `Caller requires immediate assistance. Please dispatch the nearest available unit.`]
     .filter(Boolean)
     .join(' ');
 }
 
-// Which active disasters does this point sit inside? Empty = the user is in
-// the clear. The disaster's geometry can be Polygon or Point; either way
-// disasterRing() gives us a closed ring suitable for point-in-polygon.
-function activeDangersContaining(
-  loc: LatLng | null,
-  disasters: Disaster[],
-): Disaster[] {
+function activeDangersContaining(loc: LatLng | null, disasters: Disaster[]): Disaster[] {
   if (!loc) return [];
   const hits: Disaster[] = [];
   for (const d of disasters) {
@@ -151,6 +92,7 @@ function activeDangersContaining(
 }
 
 export default function CitizenMapScreen() {
+  const t = useTheme();
   const { session } = useAuth();
   const [me, setMe] = useState<MobileCitizen | null>(null);
   const [destination, setDestination] = useState<LatLng | null>(null);
@@ -159,21 +101,12 @@ export default function CitizenMapScreen() {
   const [routeError, setRouteError] = useState<string | null>(null);
   const [disasters, setDisasters] = useState<Disaster[]>([]);
   const avoidSignature = useRef<string>('');
-  // 911 call placement state.
-  //   - modalOpen drives the multi-step EmergencyCallModal (voice + selection).
-  //   - placingCall: true while POST is in flight.
-  //   - lastCallAt: timestamp of the last successful submission, used to
-  //     debounce repeated taps for 30 s.
   const [modalOpen, setModalOpen] = useState(false);
   const [placingCall, setPlacingCall] = useState(false);
   const [lastCallAt, setLastCallAt] = useState<number | null>(null);
-  // The transcript shown / spoken inside the modal. Computed once at open time
-  // so it doesn't change mid-flow if disasters update between voice and submit.
   const [callTranscript, setCallTranscript] = useState<string>('');
   const [callDisasterId, setCallDisasterId] = useState<string | null>(null);
 
-  // Pull "me" from the backend so the map reflects mock-location updates from
-  // the Location screen too.
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
@@ -194,15 +127,21 @@ export default function CitizenMapScreen() {
   }, [session]);
 
   const myLatLng: LatLng | null = me ? { lat: me.lat, lng: me.lng } : null;
-  const insideDangers = useMemo(
-    () => activeDangersContaining(myLatLng, disasters),
-    [myLatLng, disasters],
-  );
+  const insideDangers = useMemo(() => activeDangersContaining(myLatLng, disasters), [myLatLng, disasters]);
   const activeCount = disasters.filter((d) => d.status === 'active').length;
 
-  // The DisasterMap already polls disasters every 3 s and surfaces them via
-  // onDisastersChange. Reroute immediately when that local set changes — saves
-  // up to 2 s vs. waiting for our own poll to catch the same data.
+  // Announce hazard entry for screen-reader users (once per entry).
+  const wasInDanger = useRef(false);
+  useEffect(() => {
+    const now = insideDangers.length > 0;
+    if (now && !wasInDanger.current) {
+      AccessibilityInfo.announceForAccessibility(
+        `Warning. You are inside an active ${insideDangers[0].disaster_type.replace(/_/g, ' ')} zone. Call 911 is now available.`,
+      );
+    }
+    wasInDanger.current = now;
+  }, [insideDangers]);
+
   const lastDisasterSig = useRef<string>('');
   useEffect(() => {
     if (!destination || !myLatLng) return;
@@ -210,55 +149,35 @@ export default function CitizenMapScreen() {
     if (sig === lastDisasterSig.current) return;
     lastDisasterSig.current = sig;
     computeRoute(myLatLng, destination);
-    // myLatLng intentionally omitted from deps — we only want this to fire on
-    // disaster-set changes, not on every GPS poll tick.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [disasters, destination]);
 
-  const computeRoute = useCallback(
-    async (from: LatLng, to: LatLng) => {
-      setRouting(true);
-      setRouteError(null);
-      try {
-        // Mobile-side hazard data is AI-only — operator-drawn dashboard rows
-        // must not influence routing or the in-app map. Both the source
-        // field and any future server-side filter let us narrow client-side
-        // for now; once every device is on the new schema we can move this
-        // to a query parameter.
-        const [notifs, cordons, disastersNow] = await Promise.all([
-          api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Notification[]),
-          api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Cordon[]),
-          api.listDisasters().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Disaster[]),
-        ]);
-        const avoid = [
-          ...notifsToAvoidPolygons([...notifs, ...cordons]),
-          ...disastersToAvoidPolygons(disastersNow),
-        ];
-        avoidSignature.current = JSON.stringify(avoid);
-        const r = await fetchRoute(from, to, avoid);
-        setRoute(r);
-      } catch (err) {
-        setRoute(null);
-        setRouteError(
-          err instanceof Error ? err.message : 'Could not compute a safe route right now.'
-        );
-      } finally {
-        setRouting(false);
-      }
-    },
-    []
-  );
+  const computeRoute = useCallback(async (from: LatLng, to: LatLng) => {
+    setRouting(true);
+    setRouteError(null);
+    try {
+      const [notifs, cordons, disastersNow] = await Promise.all([
+        api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Notification[]),
+        api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Cordon[]),
+        api.listReportedDisasters().catch(() => [] as Disaster[]),
+      ]);
+      const avoid = [...notifsToAvoidPolygons([...notifs, ...cordons]), ...disastersToAvoidPolygons(disastersNow)];
+      avoidSignature.current = JSON.stringify(avoid);
+      const r = await fetchRoute(from, to, avoid);
+      setRoute(r);
+    } catch (err) {
+      setRoute(null);
+      setRouteError(err instanceof Error ? err.message : 'Could not compute a safe route right now.');
+    } finally {
+      setRouting(false);
+    }
+  }, []);
 
-  // Keep latest "me" in a ref so the rerouter doesn't re-establish its timer
-  // every poll cycle (myLatLng is a new object each render).
   const meRef = useRef<MobileCitizen | null>(null);
   useEffect(() => {
     meRef.current = me;
   }, [me]);
 
-  // Re-route automatically whenever the active hazard set OR active disaster
-  // set changes. Polling every 2 s so a freshly-added disaster on the path
-  // triggers a reroute within a couple of seconds.
   useEffect(() => {
     if (!destination) return;
     let cancelled = false;
@@ -266,20 +185,12 @@ export default function CitizenMapScreen() {
       const latest = meRef.current;
       if (!latest) return;
       try {
-        // Mobile-side hazard data is AI-only — operator-drawn dashboard rows
-        // must not influence routing or the in-app map. Both the source
-        // field and any future server-side filter let us narrow client-side
-        // for now; once every device is on the new schema we can move this
-        // to a query parameter.
         const [notifs, cordons, disastersNow] = await Promise.all([
           api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Notification[]),
           api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Cordon[]),
-          api.listDisasters().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => [] as Disaster[]),
+          api.listReportedDisasters().catch(() => [] as Disaster[]),
         ]);
-        const sig = JSON.stringify([
-          ...notifsToAvoidPolygons([...notifs, ...cordons]),
-          ...disastersToAvoidPolygons(disastersNow),
-        ]);
+        const sig = JSON.stringify([...notifsToAvoidPolygons([...notifs, ...cordons]), ...disastersToAvoidPolygons(disastersNow)]);
         if (sig !== avoidSignature.current && !cancelled) {
           computeRoute({ lat: latest.lat, lng: latest.lng }, destination);
         }
@@ -307,15 +218,8 @@ export default function CitizenMapScreen() {
     setRouteError(null);
   };
 
-  // Open the 911 modal. Locks in the worst active disaster + the transcript
-  // at open time so the values shown / spoken inside the modal stay stable
-  // even if the disaster set updates while the citizen is choosing services.
   const openEmergencyCall = () => {
     if (!session || !myLatLng || insideDangers.length === 0) return;
-    // Pass the full set of overlapping zones so the transcript can describe
-    // every active hazard at the caller's position — not just the worst one.
-    // The backend's placeEmergencyCall still wants a single disaster_id, so
-    // we anchor it to the worst-severity zone (highest first).
     const worst = [...insideDangers].sort((a, b) => b.severity - a.severity)[0];
     const transcript = buildEmergencyTranscript(insideDangers, me?.name ?? session.name, myLatLng);
     setCallTranscript(transcript);
@@ -323,9 +227,7 @@ export default function CitizenMapScreen() {
     setModalOpen(true);
   };
 
-  // Fired by the modal once the citizen has picked the service(s). We POST
-  // here — the modal is purely UI for voice + selection.
-  const submitEmergencyCall = async (services: EmergencyService[]) => {
+  const submitEmergencyCall = async (services: EmergencyService[], photoDataUrl: string | null) => {
     if (!session || !myLatLng || !callDisasterId || services.length === 0) return;
     setPlacingCall(true);
     try {
@@ -336,33 +238,32 @@ export default function CitizenMapScreen() {
         caller_lng: myLatLng.lng,
         transcript: callTranscript,
         requested_services: services,
+        photo_data_url: photoDataUrl,
       });
       setLastCallAt(Date.now());
       setModalOpen(false);
       Alert.alert(
-        '🚨 911 dispatched',
-        `Notified: ${services.join(', ')}. They've been given your location and the hazard details. Stay on the line — help is on the way.`,
+        '911 dispatched',
+        `Notified: ${services.join(', ')}.${photoDataUrl ? ' Your photo was sent as proof.' : ''} They've been given your location and the hazard details. Stay on the line — help is on the way.`,
         [{ text: 'OK' }],
       );
     } catch (e) {
-      Alert.alert(
-        'Call failed',
-        e instanceof Error ? e.message : 'Could not reach 911 right now. Try again.',
-      );
+      Alert.alert('Call failed', e instanceof Error ? e.message : 'Could not reach 911 right now. Try again.');
     } finally {
       setPlacingCall(false);
     }
   };
 
-  // 30 s cooldown after a successful call so a panicked citizen doesn't spam
-  // dispatch by repeated taps.
   const cooldownLeftMs = lastCallAt ? Math.max(0, 30_000 - (Date.now() - lastCallAt)) : 0;
   const cooldownActive = cooldownLeftMs > 0;
+  const callDisabled = placingCall || cooldownActive || modalOpen;
 
   if (!session) return null;
 
+  const worstSeverity = insideDangers.length ? Math.max(...insideDangers.map((d) => d.severity)) : 0;
+
   return (
-    <View style={styles.container}>
+    <View style={{ flex: 1, backgroundColor: t.color.bg }}>
       <DisasterMap
         myLocation={myLatLng}
         myRole="citizen"
@@ -374,36 +275,57 @@ export default function CitizenMapScreen() {
         onDisastersChange={setDisasters}
       />
 
+      {/* In-zone DANGER banner */}
       {insideDangers.length > 0 && (
-        <View style={styles.dangerBanner}>
-          <Text style={styles.dangerTitle}>
-            ⚠ DANGER — you are inside an active {insideDangers[0].disaster_type.replace('_', ' ').toLowerCase()} zone
-          </Text>
-          <Text style={styles.dangerSub}>
-            Severity {insideDangers[0].severity}
-            {insideDangers.length > 1 ? ` · ${insideDangers.length - 1} more overlapping` : ''}
-            {' '}· Tap the map to set a safe destination
+        <View
+          style={[styles.topBanner, { backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]}
+          accessibilityRole="alert"
+        >
+          <Icon name="alert" size={22} color={t.color.onDanger} />
+          <View style={{ flex: 1, marginLeft: t.spacing.md }}>
+            <Text variant="h3" color={t.color.onDanger}>
+              DANGER · inside an active {insideDangers[0].disaster_type.replace(/_/g, ' ').toLowerCase()} zone
+            </Text>
+            <Text variant="caption" color={t.color.onDanger} style={{ opacity: 0.92, marginTop: 2 }}>
+              Severity {worstSeverity}
+              {insideDangers.length > 1 ? ` · ${insideDangers.length - 1} more overlapping` : ''} · tap the map to set a safe route
+            </Text>
+          </View>
+        </View>
+      )}
+
+      {/* Advisory banner — hazards nearby but not on you */}
+      {insideDangers.length === 0 && activeCount > 0 && (
+        <View style={[styles.topBanner, { backgroundColor: t.color.warning, borderRadius: t.radius.lg, ...t.shadow(2) }]}>
+          <Icon name="alert" size={20} color={t.color.alwaysWhite} />
+          <Text variant="bodyStrong" color={t.color.alwaysWhite} style={{ flex: 1, marginLeft: t.spacing.md }}>
+            {activeCount} active danger zone{activeCount === 1 ? '' : 's'} nearby — stay clear of red areas
           </Text>
         </View>
       )}
 
-      {/* Call 911 — gated on being inside an active zone. The button is the
-          only way for citizens to escalate to police, and it auto-fills the
-          transcript so the caller doesn't have to compose anything. */}
+      {/* Call 911 — only inside an active zone */}
       {insideDangers.length > 0 && (
         <Pressable
           onPress={openEmergencyCall}
-          disabled={placingCall || cooldownActive || modalOpen}
+          disabled={callDisabled}
+          accessibilityRole="button"
+          accessibilityLabel={cooldownActive ? `Call 911, available in ${Math.ceil(cooldownLeftMs / 1000)} seconds` : 'Call 911'}
+          accessibilityState={{ disabled: callDisabled }}
           style={({ pressed }) => [
-            styles.call911Btn,
-            (placingCall || cooldownActive || modalOpen) && styles.call911BtnDisabled,
-            pressed && !placingCall && !cooldownActive && !modalOpen && styles.call911BtnPressed,
+            styles.call911,
+            {
+              backgroundColor: cooldownActive ? t.color.surfaceAlt : pressed ? t.color.dangerStrong : t.color.danger,
+              borderRadius: t.radius.lg,
+              borderWidth: cooldownActive ? 1 : 0,
+              borderColor: t.color.border,
+              ...t.shadow(3),
+            },
           ]}
         >
-          <Text style={styles.call911BtnText}>
-            {cooldownActive
-              ? `Just called (${Math.ceil(cooldownLeftMs / 1000)}s)`
-              : '🚨 Call 911'}
+          <Icon name="calls" size={24} color={cooldownActive ? t.color.textMuted : t.color.onDanger} />
+          <Text variant="h2" color={cooldownActive ? t.color.textMuted : t.color.onDanger} style={{ letterSpacing: 0.5 }}>
+            {cooldownActive ? `Just called · ${Math.ceil(cooldownLeftMs / 1000)}s` : 'Call 911'}
           </Text>
         </Pressable>
       )}
@@ -415,109 +337,70 @@ export default function CitizenMapScreen() {
         onCancel={() => setModalOpen(false)}
         onSubmit={submitEmergencyCall}
       />
-      {insideDangers.length === 0 && activeCount > 0 && (
-        <View style={styles.advisoryBanner}>
-          <Text style={styles.advisoryText}>
-            ⚠ {activeCount} active danger zone{activeCount === 1 ? '' : 's'} nearby — stay clear of red areas
-          </Text>
-        </View>
-      )}
 
-      <View style={styles.banner}>
+      {/* Destination / route panel */}
+      <Card style={styles.routePanel} elevation={2}>
         <View style={{ flex: 1 }}>
-          <Text style={styles.bannerTitle}>
-            {destination ? 'Route set' : 'Tap the map to choose a destination'}
-          </Text>
-          {route && (
-            <Text style={styles.bannerSub}>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <Icon name={destination ? 'route' : 'location'} size={16} color={t.color.primary} />
+            <Text variant="bodyStrong" style={{ flex: 1 }}>
+              {destination ? 'Safe route set' : 'Tap the map to choose a destination'}
+            </Text>
+          </View>
+          {route && !routing && (
+            <Text variant="caption" tone="secondary" style={{ marginTop: 4 }}>
               {route.distanceKm.toFixed(1)} km · ~{Math.round(route.durationMin)} min · avoiding active hazards
             </Text>
           )}
           {routing && (
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
-              <ActivityIndicator color={colors.info} />
-              <Text style={styles.bannerSub}>Calculating safer path…</Text>
+              <ActivityIndicator color={t.color.primary} size="small" />
+              <Text variant="caption" tone="secondary">
+                Calculating safer path…
+              </Text>
             </View>
           )}
-          {routeError && <Text style={[styles.bannerSub, { color: colors.danger }]}>{routeError}</Text>}
+          {routeError && (
+            <Text variant="caption" tone="danger" style={{ marginTop: 4 }}>
+              {routeError}
+            </Text>
+          )}
         </View>
-        {destination && (
-          <Pressable onPress={clearRoute} style={styles.clearBtn}>
-            <Text style={styles.clearBtnText}>Clear</Text>
-          </Pressable>
-        )}
-      </View>
+        {destination && <Button label="Clear" variant="secondary" size="sm" fullWidth={false} onPress={clearRoute} />}
+      </Card>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: colors.bg },
-  banner: {
+  topBanner: {
+    position: 'absolute',
+    top: 64,
+    left: 16,
+    right: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+  },
+  call911: {
+    position: 'absolute',
+    bottom: 112,
+    left: 16,
+    right: 16,
+    height: 60,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  routePanel: {
     position: 'absolute',
     bottom: 24,
     left: 16,
     right: 16,
-    backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    padding: 14,
-    borderRadius: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
   },
-  bannerTitle: { color: colors.textPrimary, fontWeight: '700' },
-  bannerSub: { color: colors.textSecondary, fontSize: 12, marginTop: 2 },
-  clearBtn: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    backgroundColor: colors.surfaceAlt,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 8,
-  },
-  clearBtnText: { color: colors.textPrimary, fontWeight: '600' },
-  dangerBanner: {
-    position: 'absolute',
-    top: 80,
-    left: 16,
-    right: 16,
-    backgroundColor: colors.danger,
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-  },
-  dangerTitle: { color: '#fff', fontWeight: '800', fontSize: 14 },
-  dangerSub: { color: '#fff', opacity: 0.9, fontSize: 12, marginTop: 4 },
-  advisoryBanner: {
-    position: 'absolute',
-    top: 80,
-    left: 16,
-    right: 16,
-    backgroundColor: colors.warning ?? '#d97706',
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-  },
-  advisoryText: { color: '#fff', fontWeight: '700', fontSize: 13 },
-  call911Btn: {
-    position: 'absolute',
-    bottom: 110, // sits above the destination/route banner at bottom: 24
-    left: 16,
-    right: 16,
-    backgroundColor: '#dc2626',
-    paddingVertical: 16,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.45,
-    shadowOffset: { width: 0, height: 6 },
-    shadowRadius: 10,
-    elevation: 8,
-  },
-  call911BtnPressed: { backgroundColor: '#b91c1c' },
-  call911BtnDisabled: { backgroundColor: '#6b7280' },
-  call911BtnText: { color: '#fff', fontWeight: '900', fontSize: 18, letterSpacing: 1 },
 });

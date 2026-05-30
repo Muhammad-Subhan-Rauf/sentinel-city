@@ -2,28 +2,14 @@
 // Tapping a tile fetches an AI-generated insight from the backend.
 
 import React, { useEffect, useState } from 'react';
-import {
-  ActivityIndicator,
-  Modal,
-  Pressable,
-  RefreshControl,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { Modal, RefreshControl, ScrollView, StyleSheet, View, Pressable } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { Screen } from '@/components/Screen';
-import { StatCard } from '@/components/StatCard';
 import { api, SavingsInsight, SavingsSummary } from '@/lib/api';
-import { colors } from '@/lib/colors';
+import { useTheme } from '@/theme';
+import { Text, Card, StatTile, IconBadge, Icon, SkeletonCard, IconName } from '@/components/ui';
 
 type Metric = 'lives' | 'infrastructure' | 'money';
-
-const METRIC_ACCENT: Record<Metric, string> = {
-  lives: colors.success,
-  infrastructure: colors.info,
-  money: colors.warning,
-};
 
 function formatUsd(n: number): string {
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
@@ -32,6 +18,7 @@ function formatUsd(n: number): string {
 }
 
 export default function AdminSavingsScreen() {
+  const t = useTheme();
   const [summary, setSummary] = useState<SavingsSummary | null>(null);
   const [injured, setInjured] = useState<{ injured_estimate: number; contributing_events: number } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -39,13 +26,16 @@ export default function AdminSavingsScreen() {
   const [insight, setInsight] = useState<SavingsInsight | null>(null);
   const [loadingInsight, setLoadingInsight] = useState(false);
 
+  const METRIC_ACCENT: Record<Metric, string> = {
+    lives: t.color.success,
+    infrastructure: t.color.info,
+    money: t.color.warning,
+  };
+
   const load = async () => {
     setRefreshing(true);
     try {
-      const [s, i] = await Promise.all([
-        api.savingsSummary().catch(() => null),
-        api.statsInjured().catch(() => null),
-      ]);
+      const [s, i] = await Promise.all([api.savingsSummary().catch(() => null), api.statsInjured().catch(() => null)]);
       if (s) setSummary(s);
       if (i) setInjured(i);
     } finally {
@@ -66,141 +56,103 @@ export default function AdminSavingsScreen() {
     try {
       setInsight(await api.savingsInsight(metric));
     } catch {
-      setInsight({
-        title: 'Insight unavailable',
-        summary: 'Could not reach the AI insight service.',
-        highlights: [],
-      });
+      setInsight({ title: 'Insight unavailable', summary: 'Could not reach the AI insight service.', highlights: [] });
     } finally {
       setLoadingInsight(false);
     }
   };
 
   return (
-    <Screen title="Impact">
-      <Text style={styles.subtitle}>
-        What the Sentinel-City AI agents have preserved. Tap a tile for the AI's full reasoning.
-      </Text>
-
+    <Screen title="Impact" subtitle="What the Sentinel-City AI agents have preserved. Tap a tile for the AI's full reasoning." scroll={false}>
       <ScrollView
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} tintColor={colors.info} />}
+        style={{ flex: 1 }}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: t.spacing.xxxl }}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} tintColor={t.color.primary} />}
       >
         {summary ? (
           <>
-            <StatCard
-              label="Lives saved"
-              value={summary.lives_saved.toLocaleString()}
-              accent={METRIC_ACCENT.lives}
-              onPress={() => openInsight('lives')}
-            />
-            <StatCard
+            <StatTile label="Lives saved" value={summary.lives_saved.toLocaleString()} accent={METRIC_ACCENT.lives} icon="shield" onPress={() => openInsight('lives')} />
+            <StatTile
               label="Injured (active events)"
               value={
                 injured
-                  ? `${injured.injured_estimate.toLocaleString()}${
-                      injured.contributing_events > 0 ? ` · ${injured.contributing_events} event${injured.contributing_events === 1 ? '' : 's'}` : ''
-                    }`
+                  ? `${injured.injured_estimate.toLocaleString()}${injured.contributing_events > 0 ? ` · ${injured.contributing_events} event${injured.contributing_events === 1 ? '' : 's'}` : ''}`
                   : '—'
               }
-              accent={colors.danger}
+              accent={t.color.danger}
+              icon="alert"
               onPress={() => openInsight('lives')}
             />
-            <StatCard
-              label="Infrastructure value preserved"
-              value={formatUsd(summary.infrastructure_value_usd)}
-              accent={METRIC_ACCENT.infrastructure}
-              onPress={() => openInsight('infrastructure')}
-            />
-            <StatCard
-              label="Operational money saved"
-              value={formatUsd(summary.money_saved_usd)}
-              accent={METRIC_ACCENT.money}
-              onPress={() => openInsight('money')}
-            />
-            <Text style={styles.footnote}>
-              As of {new Date(summary.as_of).toLocaleTimeString()} · numbers updated by the prediction agent.
-            </Text>
+            <StatTile label="Infrastructure value preserved" value={formatUsd(summary.infrastructure_value_usd)} accent={METRIC_ACCENT.infrastructure} icon="infrastructure" onPress={() => openInsight('infrastructure')} />
+            <StatTile label="Operational money saved" value={formatUsd(summary.money_saved_usd)} accent={METRIC_ACCENT.money} icon="impact" onPress={() => openInsight('money')} />
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, marginTop: t.spacing.sm }}>
+              <Icon name="time" size={12} color={t.color.textMuted} />
+              <Text variant="caption" tone="muted">
+                As of {new Date(summary.as_of).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · updated by the prediction agent
+              </Text>
+            </View>
           </>
         ) : (
-          <ActivityIndicator color={colors.info} style={{ marginTop: 40 }} />
+          <>
+            <SkeletonCard />
+            <SkeletonCard />
+            <SkeletonCard />
+          </>
         )}
       </ScrollView>
 
-      <Modal
-        visible={activeMetric !== null}
-        animationType="slide"
-        presentationStyle="pageSheet"
-        onRequestClose={() => setActiveMetric(null)}
-      >
-        <View style={styles.modalRoot}>
-          <View style={styles.modalHeader}>
-            <Text style={styles.modalKicker}>AI INSIGHT</Text>
-            <Pressable onPress={() => setActiveMetric(null)} hitSlop={10}>
-              <Text style={styles.modalClose}>Close</Text>
+      <Modal visible={activeMetric !== null} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setActiveMetric(null)}>
+        <SafeAreaView style={{ flex: 1, backgroundColor: t.color.bg }} edges={['top', 'left', 'right', 'bottom']}>
+          <View style={[styles.modalHeader, { borderBottomColor: t.color.border }]}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <Icon name="sparkles" size={16} color={t.color.primary} />
+              <Text variant="overline" tone="accent">
+                AI Insight
+              </Text>
+            </View>
+            <Pressable onPress={() => setActiveMetric(null)} hitSlop={12} accessibilityRole="button" accessibilityLabel="Close insight">
+              <Icon name="close" size={24} color={t.color.textSecondary} />
             </Pressable>
           </View>
 
-          <ScrollView contentContainerStyle={{ padding: 20 }}>
-            {loadingInsight && <ActivityIndicator color={colors.info} />}
-            {insight && (
+          <ScrollView contentContainerStyle={{ padding: t.spacing.xl }}>
+            {loadingInsight && (
+              <View style={{ gap: 12 }}>
+                <SkeletonCard />
+                <SkeletonCard />
+              </View>
+            )}
+            {insight && !loadingInsight && (
               <>
-                <Text style={styles.modalTitle}>{insight.title}</Text>
-                <Text style={styles.modalSummary}>{insight.summary}</Text>
-                {insight.highlights.length > 0 && (
-                  <View style={styles.highlightsBox}>
-                    <Text style={styles.highlightsLabel}>Key drivers</Text>
-                    {insight.highlights.map((h, i) => (
-                      <Text key={i} style={styles.highlightItem}>
-                        • {h}
-                      </Text>
-                    ))}
-                  </View>
-                )}
-                <Text style={styles.modalFootnote}>
-                  This narrative is mock-generated for the demo. The real insight will be produced
-                  by the prediction agent using event history + dispatch outcomes.
+                <Text variant="title">{insight.title}</Text>
+                <Text variant="body" tone="secondary" style={{ marginTop: t.spacing.md }}>
+                  {insight.summary}
                 </Text>
+                {insight.highlights.length > 0 && (
+                  <Card style={{ marginTop: t.spacing.xl }}>
+                    <Text variant="overline" tone="muted" style={{ marginBottom: t.spacing.sm }}>
+                      Key drivers
+                    </Text>
+                    {insight.highlights.map((h, i) => (
+                      <View key={i} style={{ flexDirection: 'row', gap: 8, marginTop: i === 0 ? 0 : 8 }}>
+                        <IconBadge name="check-circle" color={t.color.success} size={24} iconSize={14} />
+                        <Text variant="body" style={{ flex: 1 }}>
+                          {h}
+                        </Text>
+                      </View>
+                    ))}
+                  </Card>
+                )}
               </>
             )}
           </ScrollView>
-        </View>
+        </SafeAreaView>
       </Modal>
     </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  subtitle: { color: colors.textSecondary, marginBottom: 12 },
-  footnote: { color: colors.textMuted, fontSize: 11, textAlign: 'center', marginTop: 12 },
-
-  modalRoot: { flex: 1, backgroundColor: colors.bg },
-  modalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: 16,
-    borderBottomColor: colors.border,
-    borderBottomWidth: 1,
-  },
-  modalKicker: { color: colors.info, fontSize: 11, letterSpacing: 1, fontWeight: '700' },
-  modalClose: { color: colors.textSecondary, fontWeight: '600' },
-  modalTitle: { color: colors.textPrimary, fontSize: 22, fontWeight: '800', marginBottom: 12 },
-  modalSummary: { color: colors.textPrimary, fontSize: 15, lineHeight: 22 },
-  highlightsBox: {
-    marginTop: 18,
-    padding: 14,
-    backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 12,
-  },
-  highlightsLabel: {
-    color: colors.textMuted,
-    fontSize: 11,
-    textTransform: 'uppercase',
-    letterSpacing: 1,
-    marginBottom: 8,
-  },
-  highlightItem: { color: colors.textPrimary, fontSize: 13, lineHeight: 20 },
-  modalFootnote: { color: colors.textMuted, fontSize: 11, marginTop: 24, lineHeight: 16 },
+  modalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 14, borderBottomWidth: 1 },
 });

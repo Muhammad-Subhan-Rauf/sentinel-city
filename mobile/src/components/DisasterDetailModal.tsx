@@ -1,6 +1,7 @@
 import React from 'react';
-import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { colors } from '@/lib/colors';
+import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { useTheme } from '@/theme';
+import { Text, Badge, IconBadge, Button, disasterIcon } from '@/components/ui';
 import type { Disaster } from '@/lib/api';
 
 type Props = {
@@ -12,73 +13,72 @@ type Props = {
   onClose: () => void;
 };
 
-function severityColor(sev: number): string {
-  if (sev >= 8) return colors.danger;
-  if (sev >= 5) return colors.warning;
-  return colors.info;
-}
-
 export function DisasterDetailModal({ visible, loading, disaster, fallbackLabel, error, onClose }: Props) {
+  const t = useTheme();
+  const accent = disaster ? t.severityColor(disaster.severity) : t.color.textMuted;
+
   return (
     <Modal animationType="slide" transparent visible={visible} onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose}>
-        <Pressable style={styles.card} onPress={() => undefined}>
+      <Pressable style={[styles.backdrop, { backgroundColor: t.color.overlay }]} onPress={onClose}>
+        <Pressable
+          style={[styles.sheet, { backgroundColor: t.color.surface, ...t.shadow(3) }]}
+          onPress={() => undefined}
+        >
+          <View style={[styles.grabber, { backgroundColor: t.color.borderStrong }]} />
           {loading ? (
             <View style={styles.center}>
-              <ActivityIndicator color={colors.info} />
-              <Text style={styles.muted}>Loading event details…</Text>
+              <ActivityIndicator color={t.color.primary} />
+              <Text variant="body" tone="secondary">
+                Loading event details…
+              </Text>
             </View>
           ) : disaster ? (
-            <ScrollView contentContainerStyle={{ paddingBottom: 8 }}>
+            <ScrollView contentContainerStyle={{ paddingBottom: 8 }} showsVerticalScrollIndicator={false}>
               <View style={styles.headerRow}>
-                <Text style={styles.eyebrow}>Active incident</Text>
-                <View
-                  style={[
-                    styles.severityChip,
-                    { borderColor: severityColor(disaster.severity), backgroundColor: `${severityColor(disaster.severity)}22` },
-                  ]}
-                >
-                  <Text style={[styles.severityText, { color: severityColor(disaster.severity) }]}>
-                    Severity {disaster.severity}
+                <IconBadge name={disasterIcon(disaster.disaster_type)} color={accent} size={48} />
+                <View style={{ flex: 1, marginLeft: t.spacing.md }}>
+                  <Text variant="overline" tone="muted">
+                    Active incident
+                  </Text>
+                  <Text variant="h1" style={{ textTransform: 'capitalize' }}>
+                    {disaster.disaster_type.replace(/_/g, ' ')}
                   </Text>
                 </View>
+                <Badge label={`Sev ${disaster.severity}`} color={accent} icon="alert" />
               </View>
-              <Text style={styles.title}>{disaster.disaster_type.replace(/_/g, ' ')}</Text>
+
               <View style={styles.metaRow}>
                 <MetaCell label="Status" value={disaster.status} />
                 {disaster.cause && <MetaCell label="Cause" value={disaster.cause} />}
-                {disaster.spread_speed != null && (
-                  <MetaCell label="Spread" value={`${disaster.spread_speed.toFixed(1)}×`} />
-                )}
+                {disaster.spread_speed != null && <MetaCell label="Spread" value={`${disaster.spread_speed.toFixed(1)}×`} />}
               </View>
               {disaster.people_inside != null && (
                 <View style={styles.metaRow}>
                   <MetaCell label="People inside" value={String(disaster.people_inside)} />
-                  {disaster.safe_exit_pct != null && (
-                    <MetaCell label="Safe exit" value={`${Math.round(disaster.safe_exit_pct)}%`} />
-                  )}
+                  {disaster.safe_exit_pct != null && <MetaCell label="Safe exit" value={`${Math.round(disaster.safe_exit_pct)}%`} />}
                 </View>
               )}
               {disaster.notes && (
-                <View style={styles.notesBox}>
-                  <Text style={styles.notesLabel}>Notes</Text>
-                  <Text style={styles.notesBody}>{disaster.notes}</Text>
+                <View style={[styles.notesBox, { backgroundColor: t.color.surfaceAlt, borderColor: t.color.border, borderRadius: t.radius.md }]}>
+                  <Text variant="overline" tone="muted" style={{ marginBottom: 6 }}>
+                    Notes
+                  </Text>
+                  <Text variant="body">{disaster.notes}</Text>
                 </View>
               )}
             </ScrollView>
           ) : (
             <View style={styles.center}>
-              <Text style={styles.title}>{fallbackLabel ?? 'Hazard zone'}</Text>
-              <Text style={styles.muted}>
-                {error
-                  ? error
-                  : 'Event details unavailable for this polygon (likely a legacy zone with no linked disaster).'}
+              <IconBadge name="alert" color={t.color.warning} size={56} iconSize={28} />
+              <Text variant="h2" center style={{ textTransform: 'capitalize' }}>
+                {fallbackLabel ?? 'Hazard zone'}
+              </Text>
+              <Text variant="body" tone="secondary" center>
+                {error ? error : 'Event details unavailable for this polygon (likely a legacy zone with no linked disaster).'}
               </Text>
             </View>
           )}
-          <Pressable style={styles.closeBtn} onPress={onClose}>
-            <Text style={styles.closeBtnText}>Close</Text>
-          </Pressable>
+          <Button label="Close" variant="secondary" onPress={onClose} style={{ marginTop: 16 }} />
         </Pressable>
       </Pressable>
     </Modal>
@@ -88,62 +88,23 @@ export function DisasterDetailModal({ visible, loading, disaster, fallbackLabel,
 function MetaCell({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.metaCell}>
-      <Text style={styles.metaLabel}>{label}</Text>
-      <Text style={styles.metaValue}>{value}</Text>
+      <Text variant="overline" tone="muted">
+        {label}
+      </Text>
+      <Text variant="bodyStrong" style={{ marginTop: 4, textTransform: 'capitalize' }}>
+        {value}
+      </Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    justifyContent: 'flex-end',
-  },
-  card: {
-    backgroundColor: colors.surface,
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    paddingHorizontal: 20,
-    paddingTop: 18,
-    paddingBottom: 24,
-    maxHeight: '80%',
-  },
+  backdrop: { flex: 1, justifyContent: 'flex-end' },
+  sheet: { borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 28, maxHeight: '82%' },
+  grabber: { width: 40, height: 4, borderRadius: 2, alignSelf: 'center', marginBottom: 16 },
   center: { alignItems: 'center', justifyContent: 'center', paddingVertical: 16, gap: 12 },
-  headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  eyebrow: { color: colors.textSecondary, fontSize: 12, textTransform: 'uppercase', letterSpacing: 1.2 },
-  severityChip: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 999, borderWidth: 1 },
-  severityText: { fontWeight: '700', fontSize: 12 },
-  title: {
-    color: colors.textPrimary,
-    fontSize: 22,
-    fontWeight: '800',
-    marginTop: 8,
-    textTransform: 'capitalize',
-  },
-  metaRow: { flexDirection: 'row', gap: 16, marginTop: 12, flexWrap: 'wrap' },
+  headerRow: { flexDirection: 'row', alignItems: 'center' },
+  metaRow: { flexDirection: 'row', gap: 16, marginTop: 16, flexWrap: 'wrap' },
   metaCell: { minWidth: 100 },
-  metaLabel: { color: colors.textMuted, fontSize: 11, textTransform: 'uppercase', letterSpacing: 1 },
-  metaValue: { color: colors.textPrimary, fontSize: 15, fontWeight: '600', marginTop: 4, textTransform: 'capitalize' },
-  notesBox: {
-    marginTop: 16,
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: 10,
-    padding: 12,
-    borderColor: colors.border,
-    borderWidth: 1,
-  },
-  notesLabel: { color: colors.textSecondary, fontSize: 11, textTransform: 'uppercase', letterSpacing: 1 },
-  notesBody: { color: colors.textPrimary, fontSize: 14, marginTop: 6, lineHeight: 20 },
-  muted: { color: colors.textSecondary, textAlign: 'center', fontSize: 13, lineHeight: 18 },
-  closeBtn: {
-    marginTop: 16,
-    backgroundColor: colors.surfaceAlt,
-    borderColor: colors.border,
-    borderWidth: 1,
-    paddingVertical: 12,
-    alignItems: 'center',
-    borderRadius: 10,
-  },
-  closeBtnText: { color: colors.textPrimary, fontWeight: '700' },
+  notesBox: { marginTop: 16, padding: 12, borderWidth: 1 },
 });

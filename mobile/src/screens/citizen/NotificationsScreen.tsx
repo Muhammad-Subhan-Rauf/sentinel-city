@@ -1,27 +1,18 @@
-// Persistent notification feed for every role. Mirrors what the in-app
-// toast queue surfaced (citizen alerts, cordons, disasters, dispatches and
-// weather alerts — all AI-only) so the user has a scrollable history of
-// what they've been alerted about. Refreshes every 5 s.
+// Persistent notification feed for every role. Mirrors what the in-app toast
+// queue surfaced (citizen alerts, cordons, disasters, dispatches and weather
+// alerts — all AI-only) so the user has a scrollable history. Refreshes every 5s.
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, FlatList, RefreshControl, StyleSheet, Text, View, Pressable } from 'react-native';
+import { Animated, FlatList, RefreshControl, StyleSheet, View, Pressable } from 'react-native';
 import { Swipeable } from 'react-native-gesture-handler';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Screen } from '@/components/Screen';
-import {
-  api,
-  MobileCitizen,
-  MobileWorker,
-  NearbyWarning,
-} from '@/lib/api';
+import { api, MobileCitizen, MobileWorker, NearbyWarning } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import { colors } from '@/lib/colors';
+import { useTheme } from '@/theme';
+import { Text, Card, IconBadge, Badge, Icon, EmptyState, SkeletonCard, warningKindIcon } from '@/components/ui';
 import { describeWarningForRole, ruleFor } from '@/lib/geofence';
 
-// Storage key for dismissed alert IDs. Scoped by (device_id + role + sub_role)
-// — the same phone signed in as citizen vs firefighter has *different* user
-// state, and they must not share dismissed entries. Bumping to v2 to
-// invalidate any v1 keys left over from the device-id-only era.
 const DISMISSED_KEY_PREFIX = 'sentinel.alerts.dismissed.v2:';
 
 type AlertItem = {
@@ -34,10 +25,10 @@ type AlertItem = {
   createdAt: string;
 };
 
-async function fetchMe(
-  role: 'citizen' | 'worker',
-  id: string,
-): Promise<MobileCitizen | MobileWorker | null> {
+const SEVERITY_WORD = ['Minor', 'Moderate', 'Major', 'Severe', 'Critical'];
+const severityWord = (s: number) => SEVERITY_WORD[Math.max(1, Math.min(5, Math.round(s))) - 1];
+
+async function fetchMe(role: 'citizen' | 'worker', id: string): Promise<MobileCitizen | MobileWorker | null> {
   try {
     return role === 'citizen' ? await api.getCitizen(id) : await api.getWorker(id);
   } catch {
@@ -46,29 +37,22 @@ async function fetchMe(
 }
 
 export default function NotificationsScreen() {
+  const t = useTheme();
   const { session } = useAuth();
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [refreshing, setRefreshing] = useState(false);
-  const [tooFarCount, setTooFarCount] = useState(0);
-  // Dismissed IDs survive app restarts via AsyncStorage so the same alert
-  // doesn't come back on the next poll. Cleared from disk when the user taps
-  // the "Show dismissed" footer button.
+  const [firstLoad, setFirstLoad] = useState(true);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
-  // Open Swipeable refs — kept so we can close the previous one when a new
-  // swipe starts (only one open at a time).
   const swipeRefs = useRef<Map<string, Swipeable>>(new Map());
   const openSwipeRef = useRef<Swipeable | null>(null);
 
   const rule = useMemo(() => ruleFor(session), [session]);
-  // Per-(device+role) storage key. Sign-out → sign-in with a different PIN
-  // switches role and therefore the key, so each role keeps its own list.
   const storageKey = useMemo(() => {
     if (!session) return null;
     const r = session.role === 'worker' ? session.sub_role ?? 'worker' : session.role;
     return `${DISMISSED_KEY_PREFIX}${session.userId}:${r}`;
   }, [session]);
 
-  // Load persisted dismissals on mount / when the signed-in user changes.
   useEffect(() => {
     if (!storageKey) {
       setDismissed(new Set());
@@ -104,8 +88,6 @@ export default function NotificationsScreen() {
         persistDismissed(next);
         return next;
       });
-      // Drop the row immediately so the UI doesn't have to wait for the next
-      // poll to filter it out.
       setAlerts((prev) => prev.filter((a) => a.id !== id));
       swipeRefs.current.delete(id);
     },
@@ -121,8 +103,6 @@ export default function NotificationsScreen() {
     if (!session || !rule) return;
     setRefreshing(true);
     try {
-      // Citizens/workers fetch their own "me" so we can ask the AI feed for
-      // warnings near them. Admins request the citywide (no position) feed.
       let warnings: NearbyWarning[] = [];
       if (Number.isFinite(rule.radiusKm)) {
         const me =
@@ -131,12 +111,9 @@ export default function NotificationsScreen() {
             : null;
         if (!me) {
           setAlerts([]);
-          setTooFarCount(0);
           return;
         }
-        warnings = await api
-          .listNearbyWarnings(me.lat, me.lng, rule.radiusKm * 1000)
-          .catch(() => []);
+        warnings = await api.listNearbyWarnings(me.lat, me.lng, rule.radiusKm * 1000).catch(() => []);
       } else {
         warnings = await api.listNearbyWarnings(null, null, 50000).catch(() => []);
       }
@@ -155,17 +132,11 @@ export default function NotificationsScreen() {
           createdAt: w.created_at,
         });
       }
-
-      // Server already returns most-severe-first, then closest. Re-sort by
-      // distance so the screen matches the "near me" reading order — but
-      // citywide entries (distance_m=0) still bubble to the top.
       combined.sort((a, b) => a.distanceM - b.distanceM);
       setAlerts(combined.filter((a) => !dismissed.has(a.id)));
-      // "tooFarCount" was based on a client-side radius filter that no longer
-      // applies — the server has already trimmed the list to the role radius.
-      setTooFarCount(0);
     } finally {
       setRefreshing(false);
+      setFirstLoad(false);
     }
   };
 
@@ -173,75 +144,68 @@ export default function NotificationsScreen() {
     load();
     const handle = setInterval(load, 5000);
     return () => clearInterval(handle);
-    // `dismissed` intentionally captured by load() so a swipe immediately
-    // applies on the next tick.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.userId, rule, dismissed]);
 
   const radiusLabel = rule
     ? Number.isFinite(rule.radiusKm)
-      ? `Alerts within ${rule.radiusKm} km of your location.`
-      : 'Citywide alerts at severity ' + rule.severityFloor + '+.'
-    : 'Sign in to receive alerts.';
+      ? `Within ${rule.radiusKm} km of your location`
+      : `Citywide · severity ${rule.severityFloor}+`
+    : 'Sign in to receive alerts';
 
   const renderRightActions = (
     _progress: Animated.AnimatedInterpolation<number>,
     dragX: Animated.AnimatedInterpolation<number>,
   ) => {
-    // Slide the "Remove" pane in from the right as the row is dragged left.
-    const translateX = dragX.interpolate({
-      inputRange: [-160, 0],
-      outputRange: [0, 80],
-      extrapolate: 'clamp',
-    });
+    const translateX = dragX.interpolate({ inputRange: [-160, 0], outputRange: [0, 80], extrapolate: 'clamp' });
     return (
-      <Animated.View style={[styles.removeAction, { transform: [{ translateX }] }]}>
-        <Text style={styles.removeActionText}>Remove</Text>
+      <Animated.View style={[styles.removeAction, { backgroundColor: t.color.danger, borderRadius: t.radius.lg, transform: [{ translateX }] }]}>
+        <Icon name="trash" size={20} color={t.color.onDanger} />
+        <Text variant="label" color={t.color.onDanger} style={{ marginTop: 2 }}>
+          Remove
+        </Text>
       </Animated.View>
     );
   };
 
   return (
-    <Screen title="Notifications" scroll={false}>
-      <Text style={styles.subtitle}>{radiusLabel}</Text>
-      <FlatList
-        style={{ flex: 1 }}
-        data={alerts}
-        keyExtractor={(item) => item.id}
-          refreshControl={
-            <RefreshControl refreshing={refreshing} onRefresh={load} tintColor={colors.info} />
-          }
+    <Screen title="Alerts" subtitle={radiusLabel} scroll={false} padded={false}>
+      {firstLoad && alerts.length === 0 ? (
+        <View style={{ paddingHorizontal: t.spacing.lg, paddingTop: t.spacing.sm }}>
+          <SkeletonCard />
+          <SkeletonCard />
+          <SkeletonCard />
+        </View>
+      ) : (
+        <FlatList
+          style={{ flex: 1 }}
+          data={alerts}
+          keyExtractor={(item) => item.id}
+          contentContainerStyle={{ padding: t.spacing.lg, paddingTop: t.spacing.sm, flexGrow: 1 }}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={load} tintColor={t.color.primary} />}
           ListEmptyComponent={
-            <View style={styles.empty}>
-              <Text style={styles.emptyText}>No alerts nearby. You're in the clear.</Text>
-              {tooFarCount > 0 && (
-                <Text style={styles.emptyMuted}>
-                  {tooFarCount} active alert{tooFarCount === 1 ? '' : 's'} elsewhere in the city.
-                </Text>
-              )}
-            </View>
+            <EmptyState
+              icon="shield"
+              tone={t.color.success}
+              title="You're in the clear"
+              body="No active alerts in your area right now. We'll notify you the moment something changes nearby."
+            />
           }
           ListFooterComponent={
             dismissed.size > 0 ? (
-              <Pressable onPress={restoreAll} style={styles.restoreFooter}>
-                <Text style={styles.restoreFooterText}>
+              <Pressable onPress={restoreAll} style={styles.restoreFooter} accessibilityRole="button">
+                <Icon name="refresh" size={15} color={t.color.primary} />
+                <Text variant="label" tone="accent">
                   Show {dismissed.size} dismissed alert{dismissed.size === 1 ? '' : 's'}
                 </Text>
               </Pressable>
             ) : null
           }
           renderItem={({ item }) => {
-            const accent =
-              item.kind === 'cordon' || item.kind === 'disaster'
-                ? colors.danger
-                : item.kind === 'weather'
-                  ? colors.warning
-                  : item.kind === 'dispatch'
-                    ? colors.info
-                    : colors.danger;
+            const accent = t.severityColor(item.severity);
             const distanceText =
               item.distanceM === 0
-                ? 'citywide'
+                ? 'Citywide'
                 : item.distanceM < 1000
                   ? `${Math.round(item.distanceM)} m`
                   : `${(item.distanceM / 1000).toFixed(1)} km`;
@@ -263,64 +227,48 @@ export default function NotificationsScreen() {
                 }}
                 onSwipeableOpen={() => dismissAlert(item.id)}
               >
-                <View style={[styles.card, { borderLeftColor: accent }]}>
-                  <View style={styles.cardHeader}>
-                    <Text style={styles.cardKind}>{item.title}</Text>
-                    <Text style={styles.cardDistance}>{distanceText}</Text>
+                <Card accent={accent} style={{ marginBottom: t.spacing.md }}>
+                  <View style={styles.cardTop}>
+                    <IconBadge name={warningKindIcon(item.kind)} color={accent} size={40} />
+                    <View style={{ flex: 1, marginLeft: t.spacing.md }}>
+                      <Text variant="h3" numberOfLines={2}>
+                        {item.title}
+                      </Text>
+                    </View>
+                    <View style={styles.distancePill}>
+                      <Icon name="location" size={12} color={t.color.textMuted} />
+                      <Text variant="caption" tone="secondary" style={{ fontFamily: t.fonts.bold }}>
+                        {distanceText}
+                      </Text>
+                    </View>
                   </View>
-                  <Text style={styles.cardReason}>{item.body}</Text>
-                  <Text style={styles.cardTime}>
-                    {item.createdAt ? new Date(item.createdAt).toLocaleTimeString() : ''}
+                  <Text variant="body" tone="secondary" style={{ marginTop: t.spacing.sm }}>
+                    {item.body}
                   </Text>
-                </View>
+                  <View style={styles.cardFooter}>
+                    <Badge label={`Sev ${item.severity} · ${severityWord(item.severity)}`} color={accent} icon="alert" />
+                    <View style={styles.timeRow}>
+                      <Icon name="time" size={12} color={t.color.textMuted} />
+                      <Text variant="caption" tone="muted">
+                        {item.createdAt ? new Date(item.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                      </Text>
+                    </View>
+                  </View>
+                </Card>
               </Swipeable>
             );
           }}
-      />
+        />
+      )}
     </Screen>
   );
 }
 
 const styles = StyleSheet.create({
-  subtitle: { color: colors.textSecondary, marginBottom: 12 },
-  card: {
-    backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderLeftWidth: 4,
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 10,
-  },
-  cardHeader: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
-  cardKind: { color: colors.textPrimary, fontWeight: '700', flex: 1, marginRight: 8 },
-  cardDistance: { color: colors.info, fontWeight: '600' },
-  cardReason: { color: colors.textPrimary, fontSize: 14, marginBottom: 6 },
-  cardTime: { color: colors.textMuted, fontSize: 11 },
-  empty: { alignItems: 'center', paddingTop: 60 },
-  emptyText: { color: colors.textSecondary, fontSize: 15 },
-  emptyMuted: { color: colors.textMuted, fontSize: 12, marginTop: 8 },
-  removeAction: {
-    backgroundColor: colors.danger,
-    justifyContent: 'center',
-    alignItems: 'flex-end',
-    paddingHorizontal: 24,
-    marginBottom: 10,
-    borderRadius: 12,
-    width: 160,
-  },
-  removeActionText: {
-    color: '#fff',
-    fontWeight: '700',
-    fontSize: 14,
-  },
-  restoreFooter: {
-    paddingVertical: 14,
-    alignItems: 'center',
-  },
-  restoreFooterText: {
-    color: colors.info,
-    fontSize: 13,
-    fontWeight: '600',
-  },
+  cardTop: { flexDirection: 'row', alignItems: 'center' },
+  distancePill: { flexDirection: 'row', alignItems: 'center', gap: 3, marginLeft: 8 },
+  cardFooter: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 12 },
+  timeRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  removeAction: { justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20, marginBottom: 12, width: 96 },
+  restoreFooter: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 16 },
 });
