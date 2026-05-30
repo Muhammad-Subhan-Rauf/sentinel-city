@@ -17,7 +17,8 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.sentinelcity.mobile",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Sentinel-City uses your location to warn you about nearby disasters and route you to safety."
+        "NSLocationWhenInUseUsageDescription": "Sentinel-City uses your location to warn you about nearby disasters and route you to safety.",
+        "NSCameraUsageDescription": "Sentinel-City uses your camera so you can attach a photo as proof when you place a 911 call, helping responders verify and prioritise your emergency."
       }
     },
     "android": {
@@ -31,10 +32,7 @@
         "ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
-        "ACCESS_COARSE_LOCATION",
-        "ACCESS_FINE_LOCATION",
-        "android.permission.ACCESS_COARSE_LOCATION",
-        "android.permission.ACCESS_FINE_LOCATION"
+        "android.permission.CAMERA"
       ]
     },
     "web": {
@@ -48,7 +46,14 @@
           "locationAlwaysAndWhenInUsePermission": "Sentinel-City uses your location to warn you about nearby disasters."
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-font",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Sentinel-City uses your camera so you can attach a photo as proof when you place a 911 call, helping responders verify and prioritise your emergency."
+        }
+      ]
     ],
     "extra": {
       "backendUrl": "https://sentinel-backend-228162497559.me-central1.run.app",
@@ -63,7 +68,9 @@
       "policy": "appVersion"
     },
     "updates": {
-      "url": "https://u.expo.dev/847c3e00-adcd-4c6e-8085-de993c81baf2"
+      "url": "https://u.expo.dev/847c3e00-adcd-4c6e-8085-de993c81baf2",
+      "fallbackToCacheTimeout": 0,
+      "checkAutomatically": "ON_ERROR_RECOVERY"
     }
   }
 }
