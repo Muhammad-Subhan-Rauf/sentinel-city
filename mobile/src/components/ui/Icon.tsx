@@ -72,6 +72,8 @@ const REGISTRY = {
   signout: { lib: 'ion', glyph: 'log-out-outline' },
   refresh: { lib: 'ion', glyph: 'refresh' },
   time: { lib: 'ion', glyph: 'time-outline' },
+  history: { lib: 'ion', glyph: 'time' },
+  'history-outline': { lib: 'ion', glyph: 'time-outline' },
   walk: { lib: 'ion', glyph: 'walk' },
   person: { lib: 'ion', glyph: 'person' },
   people: { lib: 'ion', glyph: 'people' },

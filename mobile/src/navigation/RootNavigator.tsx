@@ -17,6 +17,7 @@ import { CitizenTabBar } from '@/navigation/CitizenTabBar';
 import LoginScreen from '@/screens/LoginScreen';
 import CitizenMapScreen from '@/screens/citizen/CitizenMapScreen';
 import CitizenSosScreen from '@/screens/citizen/CitizenSosScreen';
+import CitizenHistoryScreen from '@/screens/citizen/CitizenHistoryScreen';
 import NotificationsScreen from '@/screens/citizen/NotificationsScreen';
 import SettingsScreen from '@/screens/SettingsScreen';
 import WorkerMapScreen from '@/screens/worker/WorkerMapScreen';
@@ -67,9 +68,10 @@ function CitizenTabs() {
       screenOptions={useTabScreenOptions(t.color.citizen)}
       tabBar={(props) => <CitizenTabBar {...props} />}
     >
-      <Tab.Screen name="Map" component={CitizenMapScreen} options={{ tabBarIcon: tabIcon('map') }} />
+      <Tab.Screen name="Map" component={CitizenMapScreen} options={{ tabBarIcon: tabIcon('map'), headerShown: false }} />
       <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts') }} />
       <Tab.Screen name="SOS" component={CitizenSosScreen} options={{ title: 'Get help', headerShown: false }} />
+      <Tab.Screen name="History" component={CitizenHistoryScreen} options={{ tabBarIcon: tabIcon('history') }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: tabIcon('settings') }} />
     </Tab.Navigator>
   );
@@ -79,7 +81,7 @@ function WorkerTabs() {
   const t = useTheme();
   return (
     <Tab.Navigator screenOptions={useTabScreenOptions(t.color.worker)}>
-      <Tab.Screen name="Map" component={WorkerMapScreen} options={{ tabBarIcon: tabIcon('map') }} />
+      <Tab.Screen name="Map" component={WorkerMapScreen} options={{ tabBarIcon: tabIcon('map'), headerShown: false }} />
       <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts') }} />
       <Tab.Screen name="Calls" component={WorkerCallLogsScreen} options={{ tabBarIcon: tabIcon('calls') }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: tabIcon('settings') }} />
