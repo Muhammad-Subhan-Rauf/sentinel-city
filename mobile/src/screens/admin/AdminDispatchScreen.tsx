@@ -6,6 +6,7 @@ import { Screen } from '@/components/Screen';
 import { api, FireStation, MobileWorker } from '@/lib/api';
 import { useTheme } from '@/theme';
 import { Text, Card, Badge, IconBadge, Icon, SectionHeader, IconName, BadgeTone } from '@/components/ui';
+import { PlaceLabel } from '@/lib/geocode';
 
 const STATUS_TONE: Record<MobileWorker['status'], BadgeTone> = {
   available: 'success',
@@ -85,9 +86,17 @@ export default function AdminDispatchScreen() {
             <IconBadge name={ROLE_ICON[w.role]} color={roleAccent(w.role)} size={42} />
             <View style={{ flex: 1, marginHorizontal: t.spacing.md }}>
               <Text variant="bodyStrong">{w.name}</Text>
-              <Text variant="caption" tone="muted" style={{ marginTop: 2, fontFamily: t.fonts.mono }}>
-                {w.role} · {w.lat.toFixed(3)}, {w.lng.toFixed(3)}
-              </Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
+                <Text variant="caption" tone="muted">{w.role} · </Text>
+                <PlaceLabel
+                  lat={w.lat}
+                  lng={w.lng}
+                  fallback={`${w.lat.toFixed(3)}, ${w.lng.toFixed(3)}`}
+                  variant="caption"
+                  tone="muted"
+                  style={{ flex: 1 }}
+                />
+              </View>
             </View>
             <Badge label={w.status.replace('_', ' ')} tone={STATUS_TONE[w.status]} />
           </Card>
@@ -106,9 +115,14 @@ export default function AdminDispatchScreen() {
                   <IconBadge name="infrastructure" color={t.color.info} size={42} />
                   <View style={{ flex: 1, marginHorizontal: t.spacing.md }}>
                     <Text variant="bodyStrong">{s.name ?? 'Unnamed station'}</Text>
-                    <Text variant="caption" tone="muted" style={{ marginTop: 2, fontFamily: t.fonts.mono }}>
-                      {s.lat.toFixed(4)}, {s.lng.toFixed(4)}
-                    </Text>
+                    <PlaceLabel
+                      lat={s.lat}
+                      lng={s.lng}
+                      fallback={`${s.lat.toFixed(4)}, ${s.lng.toFixed(4)}`}
+                      variant="caption"
+                      tone="muted"
+                      style={{ marginTop: 2 }}
+                    />
                   </View>
                   <Badge label={`${dispatched}/${total}`} icon="firefighter" tone={tone} />
                 </Card>

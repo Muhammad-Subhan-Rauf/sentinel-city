@@ -14,6 +14,7 @@ import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
 import { Text, Card, Button, Badge, Icon, IconBadge, EmptyState, serviceIcon, BadgeTone } from '@/components/ui';
 import { CallEvidence } from '@/components/CallEvidence';
+import { PlaceLabel } from '@/lib/geocode';
 import { setDispatchTarget, scopeKeyFor } from '@/lib/dispatchTarget';
 
 const POLL_MS = 4000;
@@ -333,11 +334,16 @@ export default function WorkerCallLogsScreen() {
                   </View>
 
                   <View style={styles.metaRow}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, flex: 1, marginRight: 8 }}>
                       <Icon name="location" size={12} color={t.color.textMuted} />
-                      <Text variant="caption" tone="muted" style={{ fontFamily: t.fonts.mono }}>
-                        {item.caller_lat.toFixed(4)}, {item.caller_lng.toFixed(4)}
-                      </Text>
+                      <PlaceLabel
+                        lat={item.caller_lat}
+                        lng={item.caller_lng}
+                        fallback={`${item.caller_lat.toFixed(4)}, ${item.caller_lng.toFixed(4)}`}
+                        variant="caption"
+                        tone="muted"
+                        style={{ flex: 1 }}
+                      />
                     </View>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
                       <Icon name="time" size={12} color={t.color.textMuted} />

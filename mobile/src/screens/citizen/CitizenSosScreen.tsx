@@ -13,6 +13,7 @@ import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
 import { Text, Card, Button, Icon, IconBadge, IconName } from '@/components/ui';
 import { EmergencyCallModal } from '@/components/EmergencyCallModal';
+import { PlaceLabel } from '@/lib/geocode';
 
 type LatLng = { lat: number; lng: number };
 
@@ -209,13 +210,25 @@ export default function CitizenSosScreen() {
       {/* Location status */}
       <View style={[styles.locRow, { marginTop: t.spacing.lg }]}>
         <Icon name={loc ? 'location' : 'offline'} size={14} color={loc ? t.color.success : t.color.textMuted} />
-        <Text variant="caption" tone={loc ? 'secondary' : 'muted'} style={{ flex: 1 }}>
-          {loc
-            ? `Your location will be shared: ${loc.lat.toFixed(4)}, ${loc.lng.toFixed(4)}`
-            : locating
-              ? 'Getting your location…'
-              : 'Location unavailable — set it on the Settings tab.'}
-        </Text>
+        {loc ? (
+          <View style={{ flex: 1 }}>
+            <Text variant="caption" tone="muted">
+              Your location will be shared
+            </Text>
+            <PlaceLabel
+              lat={loc.lat}
+              lng={loc.lng}
+              fallback={`${loc.lat.toFixed(4)}, ${loc.lng.toFixed(4)}`}
+              variant="bodyStrong"
+              tone="secondary"
+              numberOfLines={2}
+            />
+          </View>
+        ) : (
+          <Text variant="caption" tone="muted" style={{ flex: 1 }}>
+            {locating ? 'Getting your location…' : 'Location unavailable — set it on the Settings tab.'}
+          </Text>
+        )}
       </View>
 
       {/* Call action */}

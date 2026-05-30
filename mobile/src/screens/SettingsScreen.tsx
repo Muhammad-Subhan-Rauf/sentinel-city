@@ -10,6 +10,7 @@ import { useAuth } from '@/lib/auth';
 import { api } from '@/lib/api';
 import { useTheme } from '@/theme';
 import { Text, Card, Button, IconBadge, Badge, Icon, SectionHeader, IconName } from '@/components/ui';
+import { PlaceLabel } from '@/lib/geocode';
 
 const MANHATTAN = { lat: 40.758, lng: -73.9855 };
 
@@ -139,11 +140,16 @@ export default function SettingsScreen() {
 
             <View style={styles.coordsRow}>
               {pin && (
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
                   <Icon name="pin" size={14} color={t.color.textMuted} />
-                  <Text variant="mono" tone="secondary">
-                    {pin.lat.toFixed(5)}, {pin.lng.toFixed(5)}
-                  </Text>
+                  <PlaceLabel
+                    lat={pin.lat}
+                    lng={pin.lng}
+                    fallback={`${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}`}
+                    variant="caption"
+                    tone="secondary"
+                    style={{ flex: 1 }}
+                  />
                 </View>
               )}
               {saving ? (

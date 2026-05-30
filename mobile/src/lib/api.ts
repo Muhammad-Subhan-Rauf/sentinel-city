@@ -8,6 +8,7 @@
 //   4. http://localhost:8000 (simulator / web)
 
 import Constants from 'expo-constants';
+import { haversineMeters } from '@/lib/geo';
 
 // Expo exposes the dev-machine host (e.g. "192.168.1.42:8081") via a few
 // different fields depending on SDK version + whether the bundle is dev or
@@ -499,6 +500,20 @@ export async function fetchRoute(
     (ring) => !isInsideRing(start, ring) && !isInsideRing(end, ring),
   );
 
+  // Valhalla rejects any route whose path exceeds 250 km (error 154). The
+  // straight-line distance is a lower bound on the road distance, so if it's
+  // already over the limit we fail fast with a clear message instead of a
+  // cryptic "Valhalla 400 — 154 …". (Road distance can still exceed the limit
+  // when the straight line is just under it — that case is caught on the
+  // response below.)
+  const MAX_ROUTE_M = 250_000;
+  const straightLineM = haversineMeters(start, end);
+  if (straightLineM > MAX_ROUTE_M) {
+    throw new Error(
+      `That destination is too far to route to — about ${Math.round(straightLineM / 1000)} km away. Choose a destination within 250 km.`,
+    );
+  }
+
   const body = {
     locations: [
       { lat: start.lat, lon: start.lng },
@@ -524,13 +539,24 @@ export async function fetchRoute(
     // Surface Valhalla's actual error string (e.g. "No path could be found",
     // "costing_options invalid") — otherwise debugging is a guessing game.
     let detail = res.statusText;
+    let errorCode: number | undefined;
     try {
       const errBody = await res.json();
+      errorCode = errBody?.error_code;
       detail = errBody?.error_code
         ? `${errBody.error_code}: ${errBody.error ?? errBody.error_message ?? 'unknown'}`
         : errBody?.error ?? errBody?.error_message ?? detail;
     } catch {
       try { detail = (await res.text()) || detail } catch { /* ignore */ }
+    }
+    // 154 = "path distance exceeds the max distance limit". Give the user an
+    // actionable message rather than the raw Valhalla code.
+    if (errorCode === 154 || /exceeds the max distance/i.test(detail)) {
+      throw new Error('That destination is too far to route to. Choose a closer destination.');
+    }
+    // 442 = "No path could be found" — usually unreachable / across water.
+    if (errorCode === 442 || /no path could be found/i.test(detail)) {
+      throw new Error('No safe route to that destination could be found. Try a nearby point.');
     }
     throw new Error(`Valhalla ${res.status} — ${detail}`);
   }
@@ -548,4 +574,104 @@ export async function fetchRoute(
   };
 }
 
-export const config = { BACKEND_URL, VALHALLA_URL };
+// ─── External: Stadia (Pelias) geocoding ─────────────────────────────
+//
+// Same provider + key as routing. Reverse geocoding turns a lat/lng into a
+// human area name; autocomplete powers the destination search box. Both degrade
+// gracefully (return null / []) when the key is missing or the network is down,
+// so callers can fall back to raw coordinates and never break a screen.
+
+const GEOCODE_URL: string =
+  (process.env.EXPO_PUBLIC_GEOCODE_URL as string | undefined) ?? VALHALLA_URL;
+
+export type PlaceSuggestion = {
+  id: string;
+  label: string; // primary line, e.g. "Times Square"
+  secondary?: string; // context line, e.g. "Manhattan, New York"
+  lat: number;
+  lng: number;
+};
+
+function peliasPrimary(props: any): string {
+  return (
+    props?.name ||
+    [props?.housenumber, props?.street].filter(Boolean).join(' ') ||
+    props?.neighbourhood ||
+    props?.locality ||
+    props?.label ||
+    ''
+  );
+}
+
+function peliasSecondary(props: any, primary: string): string {
+  const parts = [props?.neighbourhood, props?.locality, props?.region].filter(
+    (p: string | undefined): p is string => !!p && p !== primary,
+  );
+  // De-dupe while preserving order.
+  return [...new Set(parts)].slice(0, 2).join(', ');
+}
+
+// Reverse-geocode a coordinate to a concise area label, or null on any failure.
+export async function reverseGeocode(lat: number, lng: number): Promise<string | null> {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const url =
+    `${GEOCODE_URL}/geocoding/v1/reverse?point.lat=${lat}&point.lon=${lng}` +
+    `&size=1&layers=address,venue,street,neighbourhood,locality${STADIA_API_KEY ? `&api_key=${STADIA_API_KEY}` : ''}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const f = data?.features?.[0];
+    if (!f) return null;
+    const primary = peliasPrimary(f.properties);
+    if (!primary) return f.properties?.label ?? null;
+    const secondary = peliasSecondary(f.properties, primary);
+    return secondary ? `${primary}, ${secondary}` : primary;
+  } catch {
+    return null;
+  }
+}
+
+// Autocomplete place search for the destination box. `focus` biases results
+// toward the user's current area. Returns [] on any failure.
+export async function autocompletePlaces(
+  text: string,
+  focus?: { lat: number; lng: number } | null,
+): Promise<PlaceSuggestion[]> {
+  const q = text.trim();
+  if (q.length < 3) return [];
+  let url =
+    `${GEOCODE_URL}/geocoding/v1/autocomplete?text=${encodeURIComponent(q)}&size=6` +
+    (STADIA_API_KEY ? `&api_key=${STADIA_API_KEY}` : '');
+  if (focus && Number.isFinite(focus.lat) && Number.isFinite(focus.lng)) {
+    // Bias toward the user AND constrain to a routable radius so suggestions
+    // can't be thousands of km away (which would fail routing with error 154).
+    url +=
+      `&focus.point.lat=${focus.lat}&focus.point.lon=${focus.lng}` +
+      `&boundary.circle.lat=${focus.lat}&boundary.circle.lon=${focus.lng}&boundary.circle.radius=120`;
+  }
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json();
+    const feats: any[] = Array.isArray(data?.features) ? data.features : [];
+    return feats
+      .map((f, i): PlaceSuggestion | null => {
+        const coords = f?.geometry?.coordinates;
+        if (!Array.isArray(coords) || coords.length < 2) return null;
+        const primary = peliasPrimary(f.properties) || f.properties?.label || 'Unknown place';
+        return {
+          id: f?.properties?.gid ?? `${i}-${coords[0]},${coords[1]}`,
+          label: primary,
+          secondary: peliasSecondary(f.properties, primary),
+          lat: coords[1],
+          lng: coords[0],
+        };
+      })
+      .filter((s): s is PlaceSuggestion => s !== null);
+  } catch {
+    return [];
+  }
+}
+
+export const config = { BACKEND_URL, VALHALLA_URL, GEOCODE_URL };
