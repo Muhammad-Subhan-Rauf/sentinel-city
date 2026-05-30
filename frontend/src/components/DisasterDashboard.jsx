@@ -109,6 +109,16 @@ export default function DisasterDashboard() {
   const [showIntersections, setShowIntersections] = useState(false)
   const [mapStyle, setMapStyle] = useState('colored')
   const [city, setCity] = useState(DEFAULT_CITY) // { id, name, shortName, polygon, bounds } | null
+  // Advanced sidebar toggle — when off, hides Directives, dispatch panels,
+  // notify/cordon, and routing. Persisted across reloads.
+  const [advancedSidebar, setAdvancedSidebar] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage?.getItem('advancedSidebar') === '1'
+  })
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage?.setItem('advancedSidebar', advancedSidebar ? '1' : '0')
+  }, [advancedSidebar])
 
   // Routing state
   const [waypoints, setWaypoints] = useState({ start: null, end: null })
@@ -166,6 +176,8 @@ export default function DisasterDashboard() {
   const [crimeMenu, setCrimeMenu] = useState(null) // { citizenIdx, x, y } | null
   const [notifications, setNotifications] = useState([])
   const [cordons, setCordons] = useState([])
+  // Mock CCTV cameras the backend spawns around each active zone.
+  const [mockCameras, setMockCameras] = useState([])
   const [notifReason, setNotifReason] = useState('')
   const [polygonDrawKind, setPolygonDrawKind] = useState(null)  // 'notification' | 'cordon' | null
   const [simSpeed, setSimSpeed] = useState(1)
@@ -256,6 +268,24 @@ export default function DisasterDashboard() {
   }, [zones])
   useEffect(() => { notificationsRef.current = notifications }, [notifications])
   useEffect(() => { cordonsRef.current = cordons }, [cordons])
+
+  // Refresh the mock-CCTV camera list. Called after trigger / resolve / clear
+  // so the cyan dots on the map track the backend registry.
+  const refetchMockCameras = useCallback(async () => {
+    try {
+      const r = await fetch(`${BACKEND_URL}/api/cctv/cameras`)
+      if (!r.ok) return
+      const j = await r.json()
+      setMockCameras(j.cameras || [])
+    } catch { /* offline; cameras stay as-is until next refetch */ }
+  }, [])
+
+  // Re-pull cameras whenever the zone count changes — covers trigger, resolve,
+  // operator-initiated remove, and clear-all in one place. The backend
+  // registry is the source of truth.
+  useEffect(() => {
+    refetchMockCameras()
+  }, [zones.length, refetchMockCameras])
 
   // Boot the road graph + citizen engine once on mount (Manhattan bounds).
   useEffect(() => {
@@ -1411,6 +1441,27 @@ export default function DisasterDashboard() {
           </span>
         </header>
 
+        <div className="px-5 py-2.5 border-b border-zinc-800 flex items-center justify-between">
+          <span className="text-[11px] text-zinc-400">Advance sidebar</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={advancedSidebar}
+            onClick={() => setAdvancedSidebar((v) => !v)}
+            className={[
+              'relative inline-flex items-center h-5 w-9 rounded-full transition-colors',
+              advancedSidebar ? 'bg-emerald-600' : 'bg-zinc-700',
+            ].join(' ')}
+          >
+            <span
+              className={[
+                'inline-block h-4 w-4 rounded-full bg-white transition-transform',
+                advancedSidebar ? 'translate-x-4' : 'translate-x-0.5',
+              ].join(' ')}
+            />
+          </button>
+        </div>
+
         <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
           {/* Operating area */}
           <section>
@@ -1628,18 +1679,20 @@ export default function DisasterDashboard() {
           )}
 
           {/* Notes */}
-          <section>
-            <SectionLabel>
-              Directives <span className="text-zinc-600 font-normal">(optional)</span>
-            </SectionLabel>
-            <textarea
-              rows={3}
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              placeholder="Evacuation routes, hazmat details, road units…"
-              className="w-full bg-zinc-900 border border-zinc-800 rounded-md px-3 py-2 text-[13px] text-zinc-100 placeholder:text-zinc-600 resize-none focus:outline-none focus:border-zinc-600 transition-colors"
-            />
-          </section>
+          {advancedSidebar && (
+            <section>
+              <SectionLabel>
+                Directives <span className="text-zinc-600 font-normal">(optional)</span>
+              </SectionLabel>
+              <textarea
+                rows={3}
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="Evacuation routes, hazmat details, road units…"
+                className="w-full bg-zinc-900 border border-zinc-800 rounded-md px-3 py-2 text-[13px] text-zinc-100 placeholder:text-zinc-600 resize-none focus:outline-none focus:border-zinc-600 transition-colors"
+              />
+            </section>
+          )}
 
           {/* Zones */}
           <section>
@@ -1684,6 +1737,8 @@ export default function DisasterDashboard() {
           {/* Emergency tools — dispatch firefighters, send notifications,
               place cordons. Each is conceptually an operator (or future AI
               agent) tool. */}
+          {advancedSidebar && (
+          <>
           <section className="space-y-2">
             <SectionLabel>Dispatch firefighters</SectionLabel>
             <div className="flex items-center gap-2">
@@ -1994,6 +2049,8 @@ export default function DisasterDashboard() {
               </div>
             )}
           </section>
+          </>
+          )}
 
           {/* Trigger — flips all draft zones to active */}
           {(() => {
@@ -2036,22 +2093,24 @@ export default function DisasterDashboard() {
           </button>
 
           {/* Routing */}
-          <section>
-            <div className="flex items-center justify-between mb-2.5">
-              <SectionLabel className="mb-0">Routing</SectionLabel>
-              <span className="text-[10px] text-zinc-600">avoids active zones</span>
-            </div>
-            <RoutePanel
-              waypoints={waypoints}
-              waypointMode={waypointMode}
-              onPickMode={setWaypointMode}
-              onClearWaypoint={handleClearWaypoint}
-              onClearAll={handleClearAllWaypoints}
-              route={route}
-              loading={routeLoading}
-              error={routeError}
-            />
-          </section>
+          {advancedSidebar && (
+            <section>
+              <div className="flex items-center justify-between mb-2.5">
+                <SectionLabel className="mb-0">Routing</SectionLabel>
+                <span className="text-[10px] text-zinc-600">avoids active zones</span>
+              </div>
+              <RoutePanel
+                waypoints={waypoints}
+                waypointMode={waypointMode}
+                onPickMode={setWaypointMode}
+                onClearWaypoint={handleClearWaypoint}
+                onClearAll={handleClearAllWaypoints}
+                route={route}
+                loading={routeLoading}
+                error={routeError}
+              />
+            </section>
+          )}
         </div>
 
         {/* Activity log */}
@@ -2119,6 +2178,7 @@ export default function DisasterDashboard() {
           polygonDrawKind={polygonDrawKind}
           onPolygonDraw={handlePolygonDraw}
           weatherRegions={numberedWeatherRegions}
+          mockCameras={mockCameras}
         />
 
         <SettingsPanel

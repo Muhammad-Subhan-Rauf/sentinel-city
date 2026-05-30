@@ -54,6 +54,12 @@ class StationRef:
     lat: float
     lng: float
     dist_m: float          # haversine from the incident centroid
+    truck_count: int = 0   # total trucks the station owns
+    trucks_dispatched: int = 0  # trucks currently out on other dispatches
+
+    @property
+    def available(self) -> int:
+        return max(0, self.truck_count - self.trucks_dispatched)
 
 
 @dataclass
@@ -123,13 +129,17 @@ WHERE id = %s;
 
 
 # Note: lng comes first in ST_MakePoint. ST_DistanceSphere measures in meters.
+# truck_count + trucks_dispatched are surfaced so the AI dispatch agent can
+# see real per-station capacity (no more "max 2 per station" hardcoded cap).
 _STATIONS_SQL = """
 SELECT
     id, name, lat, lng,
     ST_DistanceSphere(
         ST_SetSRID(ST_MakePoint(lng, lat), 4326),
         ST_SetSRID(ST_MakePoint(%s, %s), 4326)
-    ) AS dist_m
+    ) AS dist_m,
+    COALESCE(truck_count, 0)        AS truck_count,
+    COALESCE(trucks_dispatched, 0)  AS trucks_dispatched
 FROM fire_stations
 ORDER BY dist_m ASC
 LIMIT %s;
@@ -228,7 +238,7 @@ def _fetch_stations(conn: Any, lng_lat: tuple, *, k: int) -> List[StationRef]:
         rows = cur.fetchall()
     out: List[StationRef] = []
     for r in rows:
-        _id, name, slat, slng, dist = r
+        _id, name, slat, slng, dist, total, out_now = r
         if slat is None or slng is None or dist is None:
             continue
         out.append(StationRef(
@@ -237,6 +247,8 @@ def _fetch_stations(conn: Any, lng_lat: tuple, *, k: int) -> List[StationRef]:
             lat=float(slat),
             lng=float(slng),
             dist_m=float(dist),
+            truck_count=int(total or 0),
+            trucks_dispatched=int(out_now or 0),
         ))
     return out
 

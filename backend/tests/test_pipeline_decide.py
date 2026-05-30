@@ -4,10 +4,14 @@ Covers:
   - should_declare gating: thresholds, cooldowns, active dedup
   - Consensus-severity damping (Trap 2b)
   - Confidence comes from cluster density, NOT from any LLM field (Trap 1)
-  - plan_dispatch severity → count table
   - plan_cordon respects existing cordons + severity radius
   - plan_alert directive-verb enforcement + critical→evacuation escalation
-  - plan_response composes the bundle correctly
+
+NB: plan_dispatch + FIRE_UNITS_BY_SEVERITY were removed when fire-truck
+dispatch counts moved into the AI dispatch agent
+(pipeline/dispatch_agent.py). The new flow is end-to-end tested by
+backend/test_pipeline_e2e.py against live Vertex; there is no
+deterministic unit test for it here.
 """
 
 from __future__ import annotations
@@ -27,13 +31,10 @@ from pipeline.decide import (
     ALERT_SEVERITIES_REQUIRING_DIRECTIVE,
     CORDON_RADIUS_BY_SEVERITY,
     DIRECTIVE_VERBS,
-    FIRE_UNITS_BY_SEVERITY,
     SEVERITY_TO_INT,
     _consensus_severity,
     plan_alert,
     plan_cordon,
-    plan_dispatch,
-    plan_response,
     severity_int_to_str,
     should_declare,
 )
@@ -226,44 +227,6 @@ def test_should_declare_respects_cooldown_on_cleared():
     assert should_declare(cluster, recent_cleared_incidents=recent_cleared) is None
 
 
-# ── plan_dispatch ───────────────────────────────────────────────────────
-
-
-def test_plan_dispatch_severity_to_count():
-    """high (sev=6) → 4 trucks → 2 stations × 2 each."""
-    inc = _make_incident(severity=6)
-    stations = [_make_station(sid="s1", dist=50), _make_station(sid="s2", dist=200)]
-    orders = plan_dispatch(inc, stations)
-    total = sum(o.count for o in orders)
-    assert total == FIRE_UNITS_BY_SEVERITY["high"]
-
-
-def test_plan_dispatch_low_severity_uses_one_truck():
-    inc = _make_incident(severity=2)  # low
-    stations = [_make_station()]
-    orders = plan_dispatch(inc, stations)
-    assert sum(o.count for o in orders) == FIRE_UNITS_BY_SEVERITY["low"]
-
-
-def test_plan_dispatch_empty_stations_returns_empty():
-    inc = _make_incident(severity=8)
-    assert plan_dispatch(inc, []) == []
-
-
-def test_plan_dispatch_subtracts_already_dispatched():
-    inc = _make_incident(severity=6)  # high → 4 needed
-    stations = [_make_station()]
-    orders = plan_dispatch(inc, stations, already_dispatched=2)
-    assert sum(o.count for o in orders) == 2
-
-
-def test_plan_dispatch_skips_when_already_covered():
-    inc = _make_incident(severity=4)  # medium → 2 needed
-    stations = [_make_station()]
-    orders = plan_dispatch(inc, stations, already_dispatched=2)
-    assert orders == []
-
-
 # ── plan_cordon ─────────────────────────────────────────────────────────
 
 
@@ -321,32 +284,6 @@ def test_plan_alert_falls_back_to_advisory_if_no_directive():
     assert alert.severity == "advisory"
 
 
-# ── plan_response ───────────────────────────────────────────────────────
-
-
-def test_plan_response_composes_all_three():
-    inc = _make_incident(severity=6)
-    world = WorldSlice(
-        incident=inc,
-        nearby_stations=[_make_station()],
-        nearby_cordons=[],
-        nearby_reports=[],
-    )
-    plan = plan_response(world, place="downtown")
-    assert plan.incident_id == "inc-1"
-    assert len(plan.dispatches) >= 1
-    assert plan.cordon is not None
-    assert plan.alert is not None
-
-
-def test_plan_response_skips_cordon_when_one_exists():
-    from pipeline.world_slice import CordonRef
-    inc = _make_incident(severity=6)
-    world = WorldSlice(
-        incident=inc,
-        nearby_stations=[_make_station()],
-        nearby_cordons=[CordonRef(id="c1", reason="prior", status="active", raw_geometry=None)],
-        nearby_reports=[],
-    )
-    plan = plan_response(world)
-    assert plan.cordon is None
+# plan_response is now async and calls Gemini's dispatch agent. It's
+# end-to-end covered by backend/test_pipeline_e2e.py against live Vertex.
+# No deterministic unit test for it lives here.

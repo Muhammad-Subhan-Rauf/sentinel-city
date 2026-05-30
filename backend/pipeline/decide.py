@@ -5,14 +5,17 @@ involvement; pure functions over typed inputs.
 
 Composition:
   - ``should_declare(cluster)``   → DeclareIncident | None
-  - ``plan_dispatch(incident, stations)`` → list[DispatchOrder]
   - ``plan_cordon(incident)``     → CordonOrder | None
   - ``plan_alert(incident)``      → AlertOrder  | None
-  - ``plan_response(world)``      → ResponsePlan  (bundles the above)
+  - ``plan_response(world)``      → ResponsePlan  (async — bundles the above
+                                    plus an AI-driven dispatch decision via
+                                    pipeline/dispatch_agent.py)
 
-The severity → unit-count table, cordon radius table, and alert wording
-templates all live here as Python constants. They moved out of the
-monitoring_prompt.md so they're unit-testable and version-controllable.
+Dispatch unit counts USED to be a hardcoded ``FIRE_UNITS_BY_SEVERITY`` map
+here. They are now produced per-incident by the AI dispatch agent, which
+takes the full incident profile + the live per-station capacity into
+account. The cordon-radius table and alert-template map still live here
+because those weren't called out for AI-isation in this iteration.
 """
 
 from __future__ import annotations
@@ -59,14 +62,13 @@ def severity_int_to_str(n: int) -> SeverityStr:
     return "critical"
 
 
-# Severity → fire truck count (from old monitoring_prompt.md lines 41-44).
-# Floods are fought identically to fires per the original prompt.
-FIRE_UNITS_BY_SEVERITY: Dict[SeverityStr, int] = {
-    "low": 1,
-    "medium": 2,
-    "high": 4,
-    "critical": 6,
-}
+# Fire-truck dispatch counts are NO LONGER a hardcoded table here. The AI
+# dispatch agent (pipeline/dispatch_agent.py) makes that call per-incident,
+# given the incident profile and the live capacity of each nearby station.
+# That lets it apply context (explicit casualties, n_reports, operator
+# notes, visual-triage notes) instead of mechanically reading a severity →
+# count map. The deterministic row-locked validation in execute.py is
+# still the final gate, so a misbehaving model can't over-dispatch.
 
 # Cordon radius (meters) by severity. Roughly: half the expected wave radius.
 CORDON_RADIUS_BY_SEVERITY: Dict[SeverityStr, int] = {
@@ -268,53 +270,9 @@ def _consensus_severity(cluster: ReportCluster) -> SeverityStr:
     return ladder[idx]  # type: ignore[return-value]
 
 
-# ── plan_dispatch ───────────────────────────────────────────────────────
-
-
-def plan_dispatch(
-    incident: IncidentRef,
-    stations: List[StationRef],
-    *,
-    already_dispatched: int = 0,
-) -> List[DispatchOrder]:
-    """Plan fire-truck dispatches against the nearest stations with capacity.
-
-    Args:
-        incident: target incident (lat/lng + severity)
-        stations: pre-sorted by distance (closest first)
-        already_dispatched: subtract from desired count so we don't
-            over-dispatch on repeat ticks. The caller passes the running
-            total for this incident.
-
-    Returns at most one DispatchOrder per station (multi-station split if
-    no single station has capacity). Empty list if no station has any.
-    The CALLER (execute.py) enforces capacity via SELECT ... FOR UPDATE —
-    this function plans based on the stale snapshot.
-    """
-    sev_str = severity_int_to_str(incident.severity)
-    desired = FIRE_UNITS_BY_SEVERITY[sev_str] - already_dispatched
-    if desired <= 0:
-        return []
-
-    orders: List[DispatchOrder] = []
-    remaining = desired
-    # Note: we don't have per-station available counts here in the WorldSlice.
-    # The plan is based on distance; execute.py reads the live count under
-    # the row lock and adjusts. So just split the desired count across the
-    # 1–2 nearest stations.
-    for station in stations[:2]:
-        if remaining <= 0:
-            break
-        take = remaining if remaining <= 2 else 2  # max 2 per station per tick
-        orders.append(DispatchOrder(
-            station_id=station.id,
-            station_name=station.name,
-            unit_type="firefighter",
-            count=take,
-        ))
-        remaining -= take
-
-    return orders
+# Fire-truck dispatch planning lives in pipeline/dispatch_agent.py — the AI
+# decides per-station counts based on the live capacity snapshot in
+# WorldSlice. There is intentionally no plan_dispatch() function here.
 
 
 # ── plan_cordon ─────────────────────────────────────────────────────────
@@ -404,17 +362,37 @@ def plan_alert(incident: IncidentRef, *, place: Optional[str] = None) -> Optiona
 # ── plan_response (bundle) ──────────────────────────────────────────────
 
 
-def plan_response(
+async def plan_response(
     world: WorldSlice,
     *,
-    already_dispatched: int = 0,
     place: Optional[str] = None,
+    casualties_mentioned: bool = False,
+    n_reports: int = 1,
+    derived_confidence: float = 0.0,
+    triage_rationale: Optional[str] = None,
 ) -> ResponsePlan:
-    """Bundle dispatch + cordon + alert orders for one active incident."""
+    """Bundle dispatch + cordon + alert orders for one active incident.
+
+    Dispatch counts come from the AI dispatch agent (one Vertex call).
+    Cordon and alert are still deterministic — cordon radius is a fixed
+    severity table, alert wording is a template — both flagged for future
+    AI-isation but not in scope here.
+    """
+    from pipeline.dispatch_agent import decide_dispatch
+
     incident = world.incident
-    dispatches = plan_dispatch(
-        incident, world.nearby_stations, already_dispatched=already_dispatched
+    severity_str = severity_int_to_str(incident.severity)
+
+    dispatches, dispatch_rationale = await decide_dispatch(
+        incident,
+        world.nearby_stations,
+        casualties_mentioned=casualties_mentioned,
+        n_reports=n_reports,
+        derived_confidence=derived_confidence,
+        severity_str=severity_str,
+        triage_rationale=triage_rationale,
     )
+
     # A cordon already exists if any active cordon is in the nearby slice.
     # (Cordons are city-scoped, so this is a soft check — execute.py does
     # the authoritative one with a row lock on the incident.)
@@ -427,9 +405,9 @@ def plan_response(
         cordon=cordon,
         alert=alert,
         rationale=(
-            f"severity={severity_int_to_str(incident.severity)} "
-            f"({incident.severity}) "
-            f"stations_considered={len(world.nearby_stations)} "
-            f"nearby_reports={len(world.nearby_reports)}"
+            f"severity={severity_str} ({incident.severity}); "
+            f"stations={len(world.nearby_stations)}; "
+            f"nearby_reports={len(world.nearby_reports)}; "
+            f"ai_dispatch: {dispatch_rationale}"
         ),
     )

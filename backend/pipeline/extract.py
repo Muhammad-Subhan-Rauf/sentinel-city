@@ -24,11 +24,13 @@ Memoization (the ``nlu_cache`` Postgres table) is handled by the caller
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import logging
 import os
 import time
-from typing import Literal, Optional
+from pathlib import Path
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -149,7 +151,7 @@ Return exactly one ReportExtraction object. No prose, no explanation.
 # does not need the 4-model survival chain we ran for the ReAct loops.
 _PRIMARY_MODEL = os.environ.get("SENTINEL_EXTRACT_MODEL", "gemini-2.5-flash-lite")
 _FALLBACK_MODEL = os.environ.get("SENTINEL_EXTRACT_FALLBACK", "gemini-2.0-flash-lite")
-_TIMEOUT_S = float(os.environ.get("SENTINEL_EXTRACT_TIMEOUT", "8.0"))
+_TIMEOUT_S = float(os.environ.get("SENTINEL_EXTRACT_TIMEOUT", "60.0"))
 
 # Lazy-built so import-time doesn't require Vertex creds. Tests can monkey-patch
 # _MODEL_INSTANCE directly.
@@ -203,8 +205,18 @@ def model_version() -> str:
     return f"{_PRIMARY_MODEL}|v1"
 
 
-async def extract_report(transcript: str) -> Optional[ReportExtraction]:
+async def extract_report(
+    transcript: str,
+    *,
+    cctv_image_path: Optional[Path] = None,
+) -> Optional[ReportExtraction]:
     """Run a single-pass NLU extraction on one citizen transcript.
+
+    If ``cctv_image_path`` is provided, the JPG/PNG bytes are inlined into the
+    HumanMessage as multimodal content so Gemini can ground its classification
+    in visible evidence. The image comes from a mock CCTV camera near the
+    citizen's location (see backend/cctv.py); the caller is responsible for
+    picking the camera and logging the implied tool call.
 
     Returns None on:
       - empty / whitespace-only transcript
@@ -224,9 +236,34 @@ async def extract_report(transcript: str) -> Optional[ReportExtraction]:
     started = time.time()
     try:
         model = _build_model()
+        human_content: Any = transcript.strip()[:2000]
+        if cctv_image_path is not None:
+            try:
+                with cctv_image_path.open("rb") as fh:
+                    b64 = base64.b64encode(fh.read()).decode("ascii")
+                mime = "image/png" if cctv_image_path.suffix.lower() == ".png" else "image/jpeg"
+                human_content = [
+                    {
+                        "type": "text",
+                        "text": (
+                            transcript.strip()[:2000]
+                            + "\n\n[Attached: still frame from a nearby CCTV camera. "
+                            "Use the visible evidence to ground your classification — "
+                            "do not override the transcript, but corroborate severity "
+                            "and incident_type against what you can see.]"
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ]
+                inc("extract.with_cctv")
+            except OSError as exc:
+                logger.warning(
+                    f"extract: failed to read CCTV image {cctv_image_path}: {exc}; falling back to text-only"
+                )
+                inc("extract.cctv_read_error")
         msgs = [
             SystemMessage(content=_SYSTEM_PROMPT),
-            HumanMessage(content=transcript.strip()[:2000]),
+            HumanMessage(content=human_content),
         ]
         result = await asyncio.wait_for(model.ainvoke(msgs), timeout=_TIMEOUT_S)
         observe("extract.latency_seconds", time.time() - started)

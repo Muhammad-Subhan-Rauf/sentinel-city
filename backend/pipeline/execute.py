@@ -35,6 +35,7 @@ import psycopg2
 from audit import AuditLogger
 from metrics import inc as _metric_inc
 from pipeline._geom import to_geom_sql, to_geom_params
+from pipeline.agent import decide_and_extract
 from pipeline.cluster import find_cluster, MIN_REPORTS_TO_DECLARE
 from pipeline.decide import (
     DeclareIncident,
@@ -45,7 +46,6 @@ from pipeline.decide import (
 )
 from pipeline.extract import (
     ReportExtraction,
-    extract_report,
     model_version,
     transcript_hash,
 )
@@ -87,6 +87,10 @@ async def process_report(report_id: str) -> Dict[str, Any]:
         trace["stage"] = "skip_no_db"
         return trace
 
+    # Preserved across the conn-block boundaries so plan_response can pass it
+    # to the dispatch agent as additional context.
+    triage_rationale: Optional[str] = None
+
     _metric_inc("pipeline.report_processed")
     try:
         # 1. Load the raw report row + ensure geom + nlu_extraction populated
@@ -114,14 +118,55 @@ async def process_report(report_id: str) -> Dict[str, Any]:
                 return trace
             _ensure_geom(conn, report_id, lat, lng)
 
-            # 2. NLU extraction (cache-first)
+            # 2. NLU extraction (cache-first). Cache hits skip the agent loop
+            # entirely — we already know the classification. Cache misses run
+            # the visual-triage agent, which decides whether the transcript
+            # warrants a CCTV pull before NLU.
             extraction = _cache_lookup(conn, transcript)
             cache_hit = extraction is not None
             if cache_hit:
                 _metric_inc("pipeline.nlu_cache_hit")
             else:
                 _metric_inc("pipeline.nlu_cache_miss")
-                extraction = await extract_report(transcript)
+                extraction, triage = await decide_and_extract(transcript, lat, lng)
+                triage_rationale = triage.reason
+
+                # Audit the triage decision (always) + the tool call (only if
+                # Gemini actually pulled a feed). The DECISION row in the
+                # AILogsDrawer makes Gemini's visual-triage reasoning visible
+                # to the operator regardless of which branch it took.
+                _AUDIT.log_decision(
+                    PIPELINE_AGENT_ID,
+                    context=(
+                        f"Visual triage for report {report_id} at ({lat:.5f}, {lng:.5f})"
+                        + (f"; nearest camera {triage.nearest_camera['id']}"
+                           if triage.nearest_camera else "; no camera in range")
+                    ),
+                    decision=(
+                        "get_cctv_feed (visual confirmation)"
+                        if triage.used_cctv
+                        else "skip CCTV (text-only NLU)"
+                    ),
+                    rationale=triage.reason,
+                )
+                if triage.used_cctv and triage.nearest_camera is not None:
+                    _AUDIT.log_tool_call(
+                        PIPELINE_AGENT_ID,
+                        tool_name="get_cctv_feed",
+                        arguments={
+                            "camera_id": triage.camera_id,
+                            "zone_id": triage.nearest_camera["zone_id"],
+                            "lat": triage.nearest_camera["lat"],
+                            "lng": triage.nearest_camera["lng"],
+                            "disaster_type": triage.nearest_camera["disaster_type"],
+                            "severity": triage.nearest_camera["severity"],
+                            "reason": triage.reason,
+                        },
+                        result={
+                            "image_available": triage.cctv_image_path is not None,
+                            "image_path": str(triage.cctv_image_path) if triage.cctv_image_path else None,
+                        },
+                    )
                 if extraction is not None:
                     _cache_store(conn, transcript, extraction)
             if extraction is None:
@@ -227,7 +272,11 @@ async def process_report(report_id: str) -> Dict[str, Any]:
         # 4. Plan + execute response orders
         conn = _connect()
         try:
-            world = slice_for_incident(conn, incident_id)
+            # k_stations=5 gives the AI dispatch agent more options under
+            # concurrent load. A 6-station Manhattan grid + the 3-nearest
+            # default left the 8th simultaneous dispatcher staring at empty
+            # rows; bumping to 5 lets it spill to mid-distance stations.
+            world = slice_for_incident(conn, incident_id, k_stations=5)
             if world is None:
                 trace["stage"] = "no_world_slice"
                 _AUDIT.log_recovery_action(
@@ -236,7 +285,14 @@ async def process_report(report_id: str) -> Dict[str, Any]:
                     "skip plan — incident missing coords or row",
                 )
                 return trace
-            plan = plan_response(world, place=extraction.location_hint or None)
+            plan = await plan_response(
+                world,
+                place=extraction.location_hint or None,
+                casualties_mentioned=bool(extraction.casualties_mentioned),
+                n_reports=declare.n_reports,
+                derived_confidence=float(declare.derived_confidence),
+                triage_rationale=triage_rationale,
+            )
             trace["plan"] = _plan_to_jsonable(plan)
             _AUDIT.log_decision(
                 PIPELINE_AGENT_ID,

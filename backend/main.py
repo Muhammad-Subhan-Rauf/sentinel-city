@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from dotenv import load_dotenv
 
+import cctv
+
 load_dotenv()
 
 
@@ -966,6 +968,17 @@ def trigger_disaster(payload: DisasterPayload):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database write failed: {exc}",
         )
+
+    # Mock CCTV cameras around the zone — AI agents will query the nearest
+    # one for visual context when a citizen report comes in. Skips
+    # Power_Outage (no images) and citywide events without geometry.
+    cctv.spawn_cameras_for_zone(
+        zone_id=str(returned_id),
+        disaster_type=payload.disaster_type,
+        severity=payload.severity,
+        centroid=cctv.centroid_from_geometry(payload.geometry),
+        geometry_kind=payload.geometry_kind,
+    )
 
     return {
         "success": True,
@@ -1926,6 +1939,7 @@ def delete_all_disasters():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Bulk delete failed: {exc}",
         )
+    cctv.clear_all_cameras()
     return {"success": True, "deleted": deleted}
 
 
@@ -1965,6 +1979,7 @@ def delete_disaster(event_id: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Delete failed: {exc}",
         )
+    cctv.clear_cameras_for_zone(event_id)
     return {"success": True}
 
 
@@ -2054,6 +2069,40 @@ def get_disaster(event_id: str):
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Disaster not found.")
     return _row_to_disaster(row)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Mock CCTV cameras. Spawned around every triggered zone (except
+# Power_Outage). Lifecycle is bound to the zone — cameras vanish when the
+# zone is deleted (DELETE /api/disasters/{id}) or cleared.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@app.get("/api/cctv/cameras", tags=["CCTV"])
+def list_cctv_cameras(zone_id: Optional[str] = Query(None)):
+    """Return every live mock camera, optionally filtered by zone_id.
+    The frontend MockCameraLayer polls this after every trigger / resolve."""
+    return {"cameras": cctv.list_cameras(zone_id=zone_id)}
+
+
+@app.get("/api/cctv/feed/{camera_id}", tags=["CCTV"])
+def get_cctv_feed(camera_id: str):
+    """Stream the pre-generated CCTV image bound to this camera's
+    (disaster_type, severity). Used by the operator UI popup and by the
+    Gemini multimodal call (which reads the file directly via cctv.resolve_image
+    rather than round-tripping through HTTP)."""
+    from fastapi.responses import FileResponse
+
+    cam = cctv.get_camera(camera_id)
+    if cam is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Camera not found.")
+    path = cctv.resolve_image(cam["disaster_type"], cam["severity"])
+    if path is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No CCTV feed available for this disaster type / severity.",
+        )
+    return FileResponse(path, media_type=cctv.image_mimetype(path))
 
 
 # ──────────────────────────────────────────────────────────────────────

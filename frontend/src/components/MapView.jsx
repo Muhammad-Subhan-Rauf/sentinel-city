@@ -9,6 +9,7 @@ import L from 'leaflet'
 import '@geoman-io/leaflet-geoman-free'
 import CitizenLayer from './CitizenLayer'
 import WaveLayer from './WaveLayer'
+import MockCameraLayer from './MockCameraLayer'
 
 delete L.Icon.Default.prototype._getIconUrl
 L.Icon.Default.mergeOptions({
@@ -998,6 +999,8 @@ export default function MapView({
   polygonDrawKind = null, // 'notification' | 'cordon' | null
   onPolygonDraw,
   weatherRegions = [],
+  // Mock CCTV cameras spawned by the backend around each active zone.
+  mockCameras = [],
 }) {
   const tileUrls = {
     colored: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
@@ -1029,6 +1032,7 @@ export default function MapView({
       <FocusController point={focusPoint} />
       <CameraOverlay enabled={showCameras} />
       <IntersectionOverlay enabled={showIntersections} />
+      <MockCameraLayer cameras={mockCameras} />
       {citizenEngine && <WaveLayer engine={citizenEngine} />}
       {citizenEngine && (
         <CitizenLayer
