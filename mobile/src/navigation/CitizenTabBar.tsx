@@ -2,18 +2,53 @@
 // pinned to the horizontal centre. The regular destinations are split into a
 // left and right group around it; tapping 911 jumps to the SOS screen. Only the
 // citizen navigator uses this bar — workers/admins keep the standard one.
+//
+// When the citizen is inside an active danger zone (signalled by
+// dangerSignal.setInDangerZone from CitizenMapScreen), the SOS button pulses
+// and grows a bright outer halo so the existing affordance lights up — we
+// deliberately do NOT spawn a second 911 button anywhere else.
 
-import React from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import React, { useEffect, useRef } from 'react';
+import { Animated, Easing, Pressable, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import type { BottomTabBarProps } from '@react-navigation/bottom-tabs';
 import { useTheme } from '@/theme';
 import { Text } from '@/components/ui';
+import { useInDangerZone } from '@/lib/dangerSignal';
 
 const SOS_ROUTE = 'SOS';
 
 export function CitizenTabBar({ state, descriptors, navigation }: BottomTabBarProps) {
   const t = useTheme();
+  const inDanger = useInDangerZone();
+  const pulse = useRef(new Animated.Value(0)).current;
+
+  // Drive a slow scale/opacity loop on the halo whenever the citizen is inside
+  // a zone. Stopped (and reset) the moment they step out so the bar settles.
+  // Respect reduceMotion by holding the halo fully visible without animating.
+  useEffect(() => {
+    pulse.stopAnimation();
+    if (!inDanger) {
+      pulse.setValue(0);
+      return;
+    }
+    if (t.reduceMotion) {
+      pulse.setValue(1);
+      return;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1, duration: 700, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 0, duration: 700, easing: Easing.in(Easing.quad), useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [inDanger, t.reduceMotion, pulse]);
+
+  const haloScale = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.35] });
+  const haloOpacity = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.55, 0] });
+  const buttonScale = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.06] });
 
   const routes = state.routes;
   const activeKey = routes[state.index]?.key;
@@ -63,30 +98,52 @@ export function CitizenTabBar({ state, descriptors, navigation }: BottomTabBarPr
       <View style={[styles.bar, { backgroundColor: t.color.surface, borderTopColor: t.color.border }]}>
         <View style={styles.group}>{left.map(renderItem)}</View>
 
-        {/* Centre: raised red 911 button */}
+        {/* Centre: raised red 911 button (with in-zone pulse halo) */}
         <View style={styles.centerSlot} pointerEvents="box-none">
-          <Pressable
-            onPress={onSosPress}
-            accessibilityRole="button"
-            accessibilityLabel="Call 911 for help"
-            accessibilityHint="Opens the emergency call-for-help screen"
-            style={({ pressed }) => [
-              styles.sosButton,
-              {
-                backgroundColor: pressed ? t.color.dangerStrong : t.color.danger,
-                borderColor: t.color.bg,
-                transform: [{ scale: pressed ? 0.96 : 1 }],
-                ...t.shadow(3),
-              },
-              sosFocused && { borderColor: t.color.onDanger },
-            ]}
+          <View style={styles.sosWrap} pointerEvents="box-none">
+            {inDanger && (
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.sosHalo,
+                  {
+                    backgroundColor: t.color.danger,
+                    opacity: haloOpacity,
+                    transform: [{ scale: haloScale }],
+                  },
+                ]}
+              />
+            )}
+            <Animated.View style={{ transform: [{ scale: buttonScale }] }}>
+              <Pressable
+                onPress={onSosPress}
+                accessibilityRole="button"
+                accessibilityLabel={inDanger ? 'Call 911 — you are inside a danger zone' : 'Call 911 for help'}
+                accessibilityHint="Opens the emergency call-for-help screen"
+                style={({ pressed }) => [
+                  styles.sosButton,
+                  {
+                    backgroundColor: pressed ? t.color.dangerStrong : t.color.danger,
+                    borderColor: inDanger ? t.color.onDanger : t.color.bg,
+                    transform: [{ scale: pressed ? 0.96 : 1 }],
+                    ...t.shadow(3),
+                  },
+                  sosFocused && !inDanger && { borderColor: t.color.onDanger },
+                ]}
+              >
+                <Text variant="h3" color={t.color.onDanger} style={{ letterSpacing: 0.5 }}>
+                  911
+                </Text>
+              </Pressable>
+            </Animated.View>
+          </View>
+          <Text
+            variant="caption"
+            color={inDanger ? t.color.danger : sosFocused ? t.color.danger : t.color.textMuted}
+            style={styles.sosLabel}
+            numberOfLines={1}
           >
-            <Text variant="h3" color={t.color.onDanger} style={{ letterSpacing: 0.5 }}>
-              911
-            </Text>
-          </Pressable>
-          <Text variant="caption" color={sosFocused ? t.color.danger : t.color.textMuted} style={styles.sosLabel} numberOfLines={1}>
-            Get help
+            {inDanger ? 'Tap for help' : 'Get help'}
           </Text>
         </View>
 
@@ -109,6 +166,10 @@ const styles = StyleSheet.create({
   label: { fontSize: 11, letterSpacing: 0.2 },
   // Reserve a fixed centre column; the button is lifted above the bar.
   centerSlot: { width: 76, alignItems: 'center' },
+  // The button is lifted above the bar; the halo lives inside the same wrap so
+  // it can scale out beyond the button bounds without disturbing layout.
+  sosWrap: { width: 62, height: 62, marginTop: -26, alignItems: 'center', justifyContent: 'center' },
+  sosHalo: { position: 'absolute', width: 62, height: 62, borderRadius: 31 },
   sosButton: {
     width: 62,
     height: 62,
@@ -116,7 +177,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 4,
-    marginTop: -26, // raise above the bar
   },
   sosLabel: { marginTop: 2 },
 });
