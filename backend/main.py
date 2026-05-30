@@ -3341,7 +3341,19 @@ SUBROLE_TO_SERVICE: Dict[str, str] = {
 class EmergencyCallPayload(BaseModel):
     """Body for POST /api/911/call. Citizen submits this on tap."""
     citizen_id: str = Field(..., description="Mobile device_id of the caller.")
-    disaster_id: str = Field(..., description="UUID of the disaster the citizen is reporting.")
+    # Optional. When the caller is reporting a specific declared disaster the app
+    # passes its id for context; for a direct SOS (the citizen calling for help
+    # with no declared disaster) it is omitted. We never reject a call based on
+    # the disaster's existence or status — help must always go through.
+    disaster_id: Optional[str] = Field(
+        None, description="UUID of the disaster being reported, if any."
+    )
+    # Free-form emergency category for a direct SOS (e.g. 'Medical', 'Fire',
+    # 'Crime', 'Accident', 'Trapped', 'Other'). Used as the call's headline when
+    # there is no linked disaster so dispatch still has context.
+    category: Optional[str] = Field(
+        None, description="Emergency category for a direct (non-disaster) SOS call."
+    )
     # Citizen's own coordinates at call time. Stored alongside the disaster
     # location so dispatch can see exactly where the caller is, even if they
     # walk away from the zone after placing the call.
@@ -3356,10 +3368,50 @@ class EmergencyCallPayload(BaseModel):
     requested_services: List[Literal["ambulance", "police", "firefighter"]] = Field(
         ..., min_length=1,
     )
+    # Optional photographic proof, as a base64 data URL ("data:image/jpeg;base64,…").
+    # The citizen captures it in-app; an AI authenticity check (see
+    # pipeline.prank_check) weighs it against the transcript so dispatch can tell a
+    # real emergency from a likely prank. Optional by design — a 911 call must never
+    # be blocked on a camera.
+    photo_data_url: Optional[str] = Field(
+        None, description="Base64 data URL of the proof photo, if the citizen attached one."
+    )
+
+
+def _public_call(call: Dict[str, Any]) -> Dict[str, Any]:
+    """A 911 call record safe to return in list/detail payloads: everything except
+    the heavy base64 photo blob (fetched on demand via /api/911/calls/{id}/photo).
+    Exposes `has_photo` so clients know whether to offer the photo view."""
+    public = {k: v for k, v in call.items() if k != "photo_data_url"}
+    public["has_photo"] = bool(call.get("photo_data_url"))
+    return public
+
+
+def _run_call_assessment(call_id: str, transcript: str, disaster_type: Optional[str],
+                         severity: Optional[int], photo_data_url: Optional[str]) -> None:
+    """Background task: run the AI authenticity check and attach the verdict to the
+    in-memory call. Advisory only — failures leave the call untouched-but-flagged."""
+    try:
+        from pipeline.prank_check import assess_call
+        assessment = assess_call(transcript, disaster_type, severity, photo_data_url)
+    except Exception as exc:  # noqa: BLE001 - never let a background task crash silently
+        logging.getLogger("sentinel.prank_check").warning(
+            "prank assessment failed for call %s: %s", call_id, exc
+        )
+        assessment = {
+            "status": "unavailable",
+            "verdict": "uncertain",
+            "confidence": 0.0,
+            "reasoning": "AI authenticity check could not run.",
+        }
+    for c in EMERGENCY_CALLS:
+        if c["id"] == call_id:
+            c["ai_assessment"] = assessment
+            break
 
 
 @app.post("/api/911/call", tags=["911"])
-def create_emergency_call(payload: EmergencyCallPayload):
+def create_emergency_call(payload: EmergencyCallPayload, background_tasks: BackgroundTasks):
     """Citizens-only endpoint. Builds an enriched call record by joining the
     citizen + disaster details and pushes it onto the in-memory call log."""
     # Citizen resolution — we surface the friendly name in the call log.
@@ -3371,45 +3423,54 @@ def create_emergency_call(payload: EmergencyCallPayload):
             detail="Citizen not found — sign in again.",
         )
 
-    # Disaster lookup — fail loud if the citizen claims they're inside a
-    # disaster the operator already cleared. Front-end checks this too, but
-    # we don't trust client state.
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
+    # Disaster context is OPTIONAL and best-effort. If the caller referenced a
+    # disaster we attach its details for dispatch context — but we deliberately
+    # do NOT reject the call if that disaster is missing or already cleared, and a
+    # direct SOS (no disaster_id) is always allowed. A 911 call must never fail on
+    # disaster state; help comes first, triage second.
+    row = None
+    if payload.disaster_id:
         try:
-            with conn:
-                with conn.cursor() as cur:
-                    geom_expr = _geometry_select_expr(cur)
-                    cur.execute(
-                        f"""
-                        SELECT id, disaster_type, severity, cause, status,
-                               {geom_expr}, geometry_kind
-                        FROM disaster_events
-                        WHERE id = %s;
-                        """,
-                        (payload.disaster_id,),
-                    )
-                    row = cur.fetchone()
-        finally:
-            conn.close()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Disaster lookup failed: {exc}",
-        )
-    if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Disaster no longer active.",
-        )
-    if row[4] != "active":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Disaster status is '{row[4]}', not active.",
-        )
+            conn = psycopg2.connect(DATABASE_URL)
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        geom_expr = _geometry_select_expr(cur)
+                        cur.execute(
+                            f"""
+                            SELECT id, disaster_type, severity, cause, status,
+                                   {geom_expr}, geometry_kind
+                            FROM disaster_events
+                            WHERE id = %s;
+                            """,
+                            (payload.disaster_id,),
+                        )
+                        row = cur.fetchone()
+            finally:
+                conn.close()
+        except Exception as exc:
+            # Log + continue as a direct call rather than failing the emergency.
+            logging.getLogger("sentinel.911").warning(
+                "disaster lookup failed for call (treating as direct SOS): %s", exc
+            )
+            row = None
 
-    disaster_geom = _coerce_geojson(row[5])
-    disaster_centroid = _geometry_centroid(disaster_geom)
+    is_direct = row is None
+    if is_direct:
+        # Direct SOS — no (usable) disaster context. Headline from the category.
+        disaster_id_out = None
+        disaster_type = (payload.category or "Direct emergency").strip() or "Direct emergency"
+        # Unverified urgency — dispatch + the AI authenticity check do the triage.
+        severity = 3
+        cause = None
+        disaster_centroid = None
+    else:
+        disaster_id_out = str(row[0])
+        disaster_type = row[1]
+        severity = row[2]
+        cause = row[3]
+        disaster_geom = _coerce_geojson(row[5])
+        disaster_centroid = _geometry_centroid(disaster_geom)
 
     # De-dupe + canonicalise requested_services. The citizen UI sends
     # ['ambulance','police','firefighter'] for "all services"; we keep it as a
@@ -3430,13 +3491,17 @@ def create_emergency_call(payload: EmergencyCallPayload):
         "caller_lat": payload.caller_lat,
         "caller_lng": payload.caller_lng,
         # Disaster context — frozen at call time so the log reads correctly
-        # even after the operator bumps severity or clears the event.
-        "disaster_id": str(row[0]),
-        "disaster_type": row[1],
-        "severity": row[2],
-        "cause": row[3],
+        # even after the operator bumps severity or clears the event. For a
+        # direct SOS these are derived from the category (see above).
+        "disaster_id": disaster_id_out,
+        "disaster_type": disaster_type,
+        "severity": severity,
+        "cause": cause,
         "disaster_lat": disaster_centroid["lat"] if disaster_centroid else None,
         "disaster_lng": disaster_centroid["lng"] if disaster_centroid else None,
+        # True when this is a direct SOS not tied to any declared disaster.
+        "is_direct": is_direct,
+        "category": (payload.category or None),
         # Pre-built script the citizen "spoke" on tap.
         "transcript": payload.transcript.strip() or "(no transcript provided)",
         # Service routing — which responder types the citizen asked for.
@@ -3449,12 +3514,25 @@ def create_emergency_call(payload: EmergencyCallPayload):
         # Identity of the worker(s) who acknowledged. Multiple responders can
         # roll on a single call (e.g. ambulance + police on a major incident).
         "responders": [],  # list of {worker_id, sub_role, acknowledged_at}
+        # Photographic proof + AI authenticity check. The photo blob is kept out
+        # of list payloads (see _public_call) and fetched on demand. The
+        # assessment is filled in by a background task moments after the call is
+        # created, so the call itself reaches dispatch with zero added latency.
+        "photo_data_url": (payload.photo_data_url or None),
+        "ai_assessment": {"status": "analyzing"},
     }
     EMERGENCY_CALLS.append(call)
     # Keep the log bounded so demo sessions don't grow unbounded in memory.
     if len(EMERGENCY_CALLS) > 500:
         del EMERGENCY_CALLS[:-500]
-    return call
+
+    # Kick off the AI authenticity check after the response is sent.
+    background_tasks.add_task(
+        _run_call_assessment,
+        call["id"], call["transcript"], call["disaster_type"], call["severity"],
+        call["photo_data_url"],
+    )
+    return _public_call(call)
 
 
 @app.get("/api/911/calls", tags=["911"])
@@ -3478,7 +3556,20 @@ def list_emergency_calls(
             )
         rows = [c for c in rows if service in c.get("requested_services", [])]
     rows.sort(key=lambda c: c["created_at"], reverse=True)
-    return {"calls": rows}
+    return {"calls": [_public_call(c) for c in rows]}
+
+
+@app.get("/api/911/calls/{call_id}/photo", tags=["911"])
+def get_emergency_call_photo(call_id: str):
+    """Return the proof photo (base64 data URL) for one call, on demand. Kept out
+    of the list feed so the frequently-polled dispatch queue stays lightweight."""
+    for c in EMERGENCY_CALLS:
+        if c["id"] == call_id:
+            data_url = c.get("photo_data_url")
+            if not data_url:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No photo on this call.")
+            return {"id": call_id, "photo_data_url": data_url}
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
 
 
 class EmergencyCallUpdate(BaseModel):
@@ -3514,7 +3605,7 @@ def update_emergency_call(call_id: str, update: EmergencyCallUpdate):
                 })
             # Keep the legacy single-string field populated for backward compat.
             c["acknowledged_by"] = update.worker_id
-        return c
+        return _public_call(c)
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
 
 
