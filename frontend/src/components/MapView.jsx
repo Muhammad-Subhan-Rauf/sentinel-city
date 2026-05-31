@@ -373,11 +373,12 @@ function weatherTooltipHtml(region) {
 function buildBadgeIcon(zoneNumber, colour) {
   // Circular numbered badge at the region's centroid. Acts as the operator's
   // visual link between the map polygon and the right-side WeatherRegionsPanel
-  // card for the same zone.
+  // card for the same zone. Clicking the badge scrolls the panel to the
+  // matching card (pointer-events:auto overrides the host pane).
   const num = zoneNumber ?? '·'
   return L.divIcon({
     className: '',
-    html: `<div style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:9999px;background:rgba(9,9,11,0.92);border:2px solid ${colour};color:${colour};font-size:12px;font-weight:700;line-height:1;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,0.45);transform:translate(-50%,-50%)">${num}</div>`,
+    html: `<div style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:9999px;background:rgba(9,9,11,0.92);border:2px solid ${colour};color:${colour};font-size:12px;font-weight:700;line-height:1;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,0.45);transform:translate(-50%,-50%);pointer-events:auto;cursor:pointer">${num}</div>`,
     iconSize: [0, 0],
   })
 }
@@ -405,10 +406,14 @@ function geomLatLngsFor(r) {
 // link from map to weather details, since direct map clicks were unreliable.
 // Layers are updated in place across ticks (never torn down) to keep the
 // browser's render path stable.
-function WeatherRegionOverlay({ regions = [] }) {
+function WeatherRegionOverlay({ regions = [], onBadgeClick }) {
   const map = useMap()
   // event_id → { layer, badge, kind, currentColour }
   const itemsRef = useRef(new Map())
+  // Keep the click handler in a ref so we don't re-bind every badge each
+  // time the parent re-renders.
+  const onBadgeClickRef = useRef(onBadgeClick)
+  useEffect(() => { onBadgeClickRef.current = onBadgeClick }, [onBadgeClick])
 
   // Custom panes — keep weather overlays above other map layers regardless of
   // creation order.
@@ -472,9 +477,15 @@ function WeatherRegionOverlay({ regions = [] }) {
         let badge = null
         if (r.centroid) {
           badge = L.marker([r.centroid.lat, r.centroid.lng], {
-            interactive: false,
+            interactive: true,
+            bubblingMouseEvents: false,
             pane: 'weather-overlay-labels',
             icon: buildBadgeIcon(r.zone_number, colour),
+          })
+          const eventId = r.event_id
+          badge.on('click', (e) => {
+            L.DomEvent.stopPropagation(e)
+            onBadgeClickRef.current?.(eventId)
           })
           badge.addTo(map)
         }
@@ -494,9 +505,15 @@ function WeatherRegionOverlay({ regions = [] }) {
         if (r.centroid) {
           if (!entry.badge) {
             entry.badge = L.marker([r.centroid.lat, r.centroid.lng], {
-              interactive: false,
+              interactive: true,
+              bubblingMouseEvents: false,
               pane: 'weather-overlay-labels',
               icon: buildBadgeIcon(r.zone_number, colour),
+            })
+            const eventId = r.event_id
+            entry.badge.on('click', (e) => {
+              L.DomEvent.stopPropagation(e)
+              onBadgeClickRef.current?.(eventId)
             })
             entry.badge.addTo(map)
           } else {
@@ -897,17 +914,16 @@ function GeomanControls({ zones, onZoneAdd, onZoneUpdate, onZoneRemove, drawingM
     })
   }, [map, drawingMode])
 
-  // Visually highlight the Geoman toolbar when a draw tool is available AND
-  // the operator hasn't placed any zone yet — guides their next action without
-  // text. The CSS animation lives in index.css under `.pm-highlight`.
+  // Visually highlight the Geoman toolbar whenever a draw tool is available
+  // for the active disaster — operators always know which buttons to use.
+  // The CSS animation lives in index.css under `.pm-highlight`.
   useEffect(() => {
     const container = map?.getContainer?.()
     if (!container) return
     const hasDrawTool = drawingMode === 'area' || drawingMode === 'point'
-    const shouldHighlight = hasDrawTool && zones.length === 0
-    container.classList.toggle('pm-highlight', shouldHighlight)
+    container.classList.toggle('pm-highlight', hasDrawTool)
     return () => container.classList.remove('pm-highlight')
-  }, [map, drawingMode, zones.length])
+  }, [map, drawingMode])
 
   // pm:create / pm:remove wiring, independent of which tool is enabled.
   useEffect(() => {
@@ -1011,6 +1027,7 @@ export default function MapView({
   polygonDrawKind = null, // 'notification' | 'cordon' | null
   onPolygonDraw,
   weatherRegions = [],
+  onWeatherBadgeClick,
   // Mock CCTV cameras spawned by the backend around each active zone.
   mockCameras = [],
 }) {
@@ -1087,7 +1104,7 @@ export default function MapView({
         style={{ color: '#f97316', weight: 2, dashArray: '4 6', fillColor: '#f97316', fillOpacity: 0.12 }}
       />
       <PolygonDrawer mode={!!polygonDrawKind} onComplete={onPolygonDraw} />
-      <WeatherRegionOverlay regions={weatherRegions} />
+      <WeatherRegionOverlay regions={weatherRegions} onBadgeClick={onWeatherBadgeClick} />
     </MapContainer>
   )
 }

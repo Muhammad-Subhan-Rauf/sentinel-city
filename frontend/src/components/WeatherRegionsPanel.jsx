@@ -1,6 +1,10 @@
 // Right-side stack of weather cards — one per active disaster region.
 // Each card carries a numbered badge that matches the badge on the map, so
 // operators can correlate the panel row with its footprint visually.
+// Clicking a map badge sets `focusedZoneId` and this panel scrolls + flashes
+// the matching card.
+
+import { useEffect, useRef } from 'react'
 
 const ALERT_TONE = {
   minor:    'bg-amber-500/15 text-amber-300 border-amber-500/30',
@@ -44,7 +48,7 @@ function Row({ label, value, suffix = '' }) {
   )
 }
 
-function ZoneCard({ region }) {
+function ZoneCard({ region, focused }) {
   const w = region.weather || {}
   const colour = tone(w.temperature_c, w.condition, region.bends_weather !== false)
   const num = region.zone_number ?? '·'
@@ -52,9 +56,11 @@ function ZoneCard({ region }) {
   const cleared = region.cleared === true
   return (
     <div
+      data-event-id={region.event_id}
       className={[
-        'border-b border-white/[0.05] last:border-b-0 px-3 py-3 transition-opacity',
+        'border-b border-white/[0.05] last:border-b-0 px-3 py-3 transition-all',
         cleared ? 'opacity-55' : 'opacity-100',
+        focused ? 'bg-sentinel-info/[0.12] ring-1 ring-sentinel-info/40 shadow-glow' : '',
       ].join(' ')}
     >
       <div className="flex items-start gap-2 mb-2">
@@ -114,10 +120,25 @@ function ZoneCard({ region }) {
   )
 }
 
-export default function WeatherRegionsPanel({ regions = [], onClearAll }) {
+export default function WeatherRegionsPanel({ regions = [], onClearAll, focusedZoneId = null }) {
   // Hide citywide-only entries (they don't get a map badge, so the operator
   // has no number to correlate with).
   const visible = regions.filter((r) => r && r.scope !== 'city' && r.event_id)
+
+  // Scroll the focused card into view whenever focusedZoneId changes. The
+  // visual highlight is applied via the `focused` prop and decays via the
+  // parent clearing focusedZoneId on a timer (or staying until next click).
+  const containerRef = useRef(null)
+  useEffect(() => {
+    if (!focusedZoneId || !containerRef.current) return
+    const el = containerRef.current.querySelector(
+      `[data-event-id="${CSS.escape(focusedZoneId)}"]`,
+    )
+    if (el && typeof el.scrollIntoView === 'function') {
+      el.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }
+  }, [focusedZoneId])
+
   if (visible.length === 0) return null
 
   // Stable order by assigned zone number so the panel doesn't shuffle each
@@ -129,7 +150,10 @@ export default function WeatherRegionsPanel({ regions = [], onClearAll }) {
   })
 
   return (
-    <div className="w-72 max-h-[60vh] overflow-y-auto glass-strong backdrop-blur border border-white/[0.05] rounded-md shadow-xl">
+    <div
+      ref={containerRef}
+      className="w-72 max-h-[60vh] overflow-y-auto glass-strong backdrop-blur border border-white/[0.05] rounded-md shadow-xl"
+    >
       <div className="sticky top-0 z-10 flex items-center justify-between gap-2 px-3 py-2 glass-strong backdrop-blur border-b border-white/[0.05]">
         <div className="flex items-center gap-2">
           <span className="text-[10px] uppercase tracking-wider text-sentinel-textDim font-semibold">
@@ -149,7 +173,11 @@ export default function WeatherRegionsPanel({ regions = [], onClearAll }) {
         )}
       </div>
       {sorted.map((r) => (
-        <ZoneCard key={r.event_id} region={r} />
+        <ZoneCard
+          key={r.event_id}
+          region={r}
+          focused={focusedZoneId === r.event_id}
+        />
       ))}
     </div>
   )

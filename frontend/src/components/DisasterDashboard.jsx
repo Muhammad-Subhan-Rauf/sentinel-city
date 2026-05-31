@@ -200,6 +200,15 @@ export default function DisasterDashboard() {
   const [helpOpen, setHelpOpen] = useState(false)
   const [focusMode, setFocusMode] = useState(false)
   const [paletteOpen, setPaletteOpen] = useState(false)
+  // event_id of the weather-zone currently highlighted in the right panel.
+  // Set when the operator clicks a numbered badge on the map; clears on a
+  // 3s timer so the visual cue fades.
+  const [focusedWeatherZoneId, setFocusedWeatherZoneId] = useState(null)
+  useEffect(() => {
+    if (!focusedWeatherZoneId) return
+    const t = setTimeout(() => setFocusedWeatherZoneId(null), 3000)
+    return () => clearTimeout(t)
+  }, [focusedWeatherZoneId])
   const [callFilter, setCallFilter] = useState('all')
   const [engine, setEngine] = useState(null)
   const zonesRef = useRef(zones)
@@ -2424,6 +2433,7 @@ export default function DisasterDashboard() {
           polygonDrawKind={polygonDrawKind}
           onPolygonDraw={handlePolygonDraw}
           weatherRegions={numberedWeatherRegions}
+          onWeatherBadgeClick={setFocusedWeatherZoneId}
           mockCameras={mockCameras}
         />
 
@@ -2479,6 +2489,7 @@ export default function DisasterDashboard() {
           <WeatherRegionsPanel
             regions={numberedWeatherRegions}
             onClearAll={handleClearAllZones}
+            focusedZoneId={focusedWeatherZoneId}
           />
           {(() => {
             const totals = zones.reduce(
