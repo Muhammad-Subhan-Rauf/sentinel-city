@@ -84,6 +84,48 @@ export function circleRing(
   return out;
 }
 
+// A lat/lng bounding box (closed interval on both axes).
+export type Bbox = { minLat: number; maxLat: number; minLng: number; maxLng: number };
+
+// Build a bbox around the [start, end] segment expanded by `marginM` metres in
+// every direction. Used to scope avoid_polygons to only those that could
+// plausibly intersect a route — at city-wide hazard scale we can't dump every
+// polygon on Valhalla (it caps avoid_polygons count + per-polygon perimeter).
+export function routeCorridorBbox(start: LatLng, end: LatLng, marginM: number): Bbox {
+  const midLat = (start.lat + end.lat) / 2;
+  const latDeg = marginM / 110_540;
+  const lngDeg = marginM / (111_320 * Math.max(0.05, Math.cos((midLat * Math.PI) / 180)));
+  return {
+    minLat: Math.min(start.lat, end.lat) - latDeg,
+    maxLat: Math.max(start.lat, end.lat) + latDeg,
+    minLng: Math.min(start.lng, end.lng) - lngDeg,
+    maxLng: Math.max(start.lng, end.lng) + lngDeg,
+  };
+}
+
+// Axis-aligned bbox of a [lng, lat] ring.
+export function ringBbox(ring: Array<[number, number]>): Bbox {
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  for (const [lng, lat] of ring) {
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+    if (lng < minLng) minLng = lng;
+    if (lng > maxLng) maxLng = lng;
+  }
+  return { minLat, maxLat, minLng, maxLng };
+}
+
+export function bboxesIntersect(a: Bbox, b: Bbox): boolean {
+  return !(a.maxLng < b.minLng || a.minLng > b.maxLng || a.maxLat < b.minLat || a.minLat > b.maxLat);
+}
+
+// Centroid of a [lng, lat] ring (simple average — fine for distance ranking).
+export function ringCentroid(ring: Array<[number, number]>): LatLng {
+  let sLat = 0, sLng = 0;
+  for (const [lng, lat] of ring) { sLat += lat; sLng += lng; }
+  return { lat: sLat / ring.length, lng: sLng / ring.length };
+}
+
 // Perimeter of a [lng, lat] ring, in metres. Used to enforce Valhalla's 10 km
 // avoid_polygons cap.
 export function ringPerimeterMeters(ring: Array<[number, number]>): number {
@@ -98,11 +140,12 @@ export function ringPerimeterMeters(ring: Array<[number, number]>): number {
 }
 
 // Valhalla rejects avoid polygons exceeding service_limits.max_exclude_polygons_length.
-// Our valhalla.json is configured to 100 km — the cap below is for our own
-// sanity (a truly absurd polygon still gets shrunk to a 14 km-radius circle).
-// If you raise the server limit further, raise this in step.
-const VALHALLA_AVOID_PERIMETER_LIMIT_M = 100_000;
-const VALHALLA_SAFE_RADIUS_M = 14_000; // 2πr ≈ 87.96 km, comfortably under cap
+// The hosted endpoint we use defaults to 10 km (error 167: "exceeded maximum
+// circumference for exclude polygon"). Stay under that; the fallback below
+// shrinks any oversized hazard footprint to a 1.5 km-radius circle
+// (perimeter ≈ 9.42 km, comfortably under the 10 km cap).
+const VALHALLA_AVOID_PERIMETER_LIMIT_M = 10_000;
+const VALHALLA_SAFE_RADIUS_M = 1_500; // 2πr ≈ 9.42 km, under the 10 km cap
 
 export function ringForValhallaAvoid(
   ring: Array<[number, number]>,

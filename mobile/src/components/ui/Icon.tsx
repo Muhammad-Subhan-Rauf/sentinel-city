@@ -44,6 +44,8 @@ const REGISTRY = {
   alert: { lib: 'ion', glyph: 'warning' },
   megaphone: { lib: 'ion', glyph: 'megaphone' },
   'megaphone-outline': { lib: 'ion', glyph: 'megaphone-outline' },
+  'volume-high': { lib: 'ion', glyph: 'volume-high' },
+  'volume-mute': { lib: 'ion', glyph: 'volume-mute' },
 
   // Disaster types
   flood: { lib: 'ion', glyph: 'water' },
@@ -100,6 +102,13 @@ const REGISTRY = {
   acknowledge: { lib: 'ion', glyph: 'hand-left' },
   enroute: { lib: 'mci', glyph: 'navigation-variant' },
   resolved: { lib: 'ion', glyph: 'checkmark-done' },
+  // Turn-by-turn navigation
+  'turn-right': { lib: 'ion', glyph: 'arrow-forward' },
+  'turn-left': { lib: 'ion', glyph: 'arrow-back' },
+  'turn-straight': { lib: 'ion', glyph: 'arrow-up' },
+  'turn-uturn': { lib: 'mci', glyph: 'arrow-u-left-top' },
+  flag: { lib: 'ion', glyph: 'flag' },
+  play: { lib: 'ion', glyph: 'play' },
 } as const satisfies Record<string, Entry>;
 
 export type IconName = keyof typeof REGISTRY;

@@ -1,13 +1,15 @@
 // Slide-up panel anchored over the map area (left edge clears the sidebar).
 // Presentational: parent owns the reports array and lifecycle.
 
+import { AnimatePresence, motion } from 'framer-motion'
+
 const KIND_LABEL = {
   observation: 'OBSERVED',
   affected: 'AFFECTED',
 }
 
 const KIND_COLORS = {
-  observation: 'text-amber-400 bg-amber-500/10 border-amber-500/30',
+  observation: 'text-sentinel-warn bg-sentinel-warn/10 border-sentinel-warn/30',
   affected: 'text-pink-400 bg-pink-500/10 border-pink-500/30',
 }
 
@@ -32,18 +34,24 @@ export default function CallsDrawer({
   const filtered = reports.filter((r) => filter === 'all' || r.report_kind === filter)
 
   return (
-    <div
-      className={[
-        'absolute left-[360px] right-0 bottom-0 z-40 transition-transform duration-300 ease-out',
-        open ? 'translate-y-0' : 'translate-y-full',
-      ].join(' ')}
-      style={{ pointerEvents: open ? 'auto' : 'none' }}
-    >
-      <div className="bg-zinc-950/95 backdrop-blur border-t border-zinc-800 shadow-[0_-10px_30px_rgba(0,0,0,0.5)] flex flex-col max-h-[55vh]">
-        <div className="flex items-center justify-between px-5 py-3 border-b border-zinc-800">
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          id="calls-drawer"
+          role="dialog"
+          aria-label="911 calls"
+          initial={{ y: '100%', opacity: 0 }}
+          animate={{ y: 0, opacity: 1 }}
+          exit={{ y: '100%', opacity: 0 }}
+          transition={{ duration: 0.32, ease: [0.22, 1, 0.36, 1] }}
+          className="absolute left-[360px] right-0 bottom-0 z-40"
+          style={{ willChange: 'transform' }}
+        >
+          <div className="glass-strong border-t border-white/[0.06] rounded-t-2xl flex flex-col max-h-[55vh] shadow-[0_-20px_60px_rgba(0,0,0,0.6)]">
+        <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.05]">
           <div className="flex items-center gap-3">
-            <h2 className="text-[14px] font-semibold text-zinc-100">911 Calls</h2>
-            <span className="text-[11px] text-zinc-500 tabular-nums">{filtered.length} / {reports.length} total</span>
+            <h2 className="text-[14px] font-semibold text-sentinel-text">911 Calls</h2>
+            <span className="text-[11px] text-sentinel-textMuted tabular-nums">{filtered.length} / {reports.length} total</span>
           </div>
           <div className="flex items-center gap-1.5">
             {['all', 'observation', 'affected'].map((k) => (
@@ -53,26 +61,26 @@ export default function CallsDrawer({
                 className={[
                   'px-2.5 py-1 text-[11px] rounded transition-colors',
                   filter === k
-                    ? 'bg-zinc-800 text-zinc-100'
-                    : 'text-zinc-500 hover:text-zinc-300',
+                    ? 'bg-white/[0.06] text-sentinel-text'
+                    : 'text-sentinel-textMuted hover:text-sentinel-text',
                 ].join(' ')}
               >
                 {k === 'all' ? 'All' : k === 'observation' ? 'Observed' : 'Affected'}
               </button>
             ))}
-            <span className="w-px h-4 bg-zinc-800 mx-1" />
+            <span className="w-px h-4 bg-white/[0.06] mx-1" />
             <button
               onClick={onClear}
               disabled={reports.length === 0}
-              className="text-[11px] text-zinc-500 hover:text-red-400 disabled:text-zinc-700 disabled:cursor-not-allowed px-2 py-1 transition-colors"
+              className="text-[11px] text-sentinel-textMuted hover:text-red-400 disabled:text-sentinel-textMuted disabled:cursor-not-allowed px-2 py-1 transition-colors"
               title="Clear all visible calls"
             >
               Clear
             </button>
-            <span className="w-px h-4 bg-zinc-800" />
+            <span className="w-px h-4 bg-white/[0.06]" />
             <button
               onClick={onClose}
-              className="text-zinc-500 hover:text-zinc-200 px-2 text-[14px] leading-none transition-colors"
+              className="text-sentinel-textMuted hover:text-sentinel-text px-2 text-[14px] leading-none transition-colors"
               title="Close"
             >
               ×
@@ -82,7 +90,7 @@ export default function CallsDrawer({
 
         <div className="flex-1 overflow-y-auto px-5 py-3">
           {filtered.length === 0 ? (
-            <div className="text-center text-[12px] text-zinc-600 py-6">
+            <div className="text-center text-[12px] text-sentinel-textMuted py-6">
               No calls yet. Drop a disaster on the map and watch the citizens react.
             </div>
           ) : (
@@ -90,10 +98,10 @@ export default function CallsDrawer({
               {filtered.map((r) => (
                 <li
                   key={r.id}
-                  className="flex items-start gap-3 px-3 py-2 rounded-md border border-zinc-800 bg-zinc-900/60 hover:bg-zinc-900 transition-colors cursor-pointer"
+                  className="flex items-start gap-3 px-3 py-2 rounded-md border border-white/[0.05] bg-white/[0.03] hover:bg-white/[0.02] transition-colors cursor-pointer"
                   onClick={() => onReportClick?.(r)}
                 >
-                  <span className="font-mono text-[10px] text-zinc-600 tabular-nums w-16 shrink-0 pt-0.5">
+                  <span className="font-mono text-[10px] text-sentinel-textMuted tabular-nums w-16 shrink-0 pt-0.5">
                     {formatTime(r.reported_at)}
                   </span>
                   <span
@@ -110,10 +118,10 @@ export default function CallsDrawer({
                     </span>
                   )}
                   <div className="flex-1 min-w-0">
-                    <div className="text-[12px] text-zinc-200 leading-snug break-words">
+                    <div className="text-[12px] text-sentinel-text leading-snug break-words">
                       {r.transcript}
                     </div>
-                    <div className="text-[10px] text-zinc-500 mt-0.5 tabular-nums">
+                    <div className="text-[10px] text-sentinel-textMuted mt-0.5 tabular-nums">
                       Citizen #{r.citizen_idx}
                       {r.perceived_severity != null && (
                         <> · Severity {r.perceived_severity}</>
@@ -129,6 +137,8 @@ export default function CallsDrawer({
           )}
         </div>
       </div>
-    </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   )
 }

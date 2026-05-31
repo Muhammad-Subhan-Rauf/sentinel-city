@@ -8,7 +8,7 @@
 // poll keep status pills fresh while the screen is open.
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { FlatList, RefreshControl, StyleSheet, View } from 'react-native';
+import { FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
 import { Screen } from '@/components/Screen';
 import {
   Text,
@@ -23,6 +23,9 @@ import {
 import { useTheme } from '@/theme';
 import { useAuth } from '@/lib/auth';
 import { api, EmergencyCall, EmergencyService } from '@/lib/api';
+import { CaseDetailModal } from '@/components/CaseDetailModal';
+
+type HistoryTab = 'active' | 'past';
 
 type StatusMeta = { tone: BadgeTone; label: string };
 
@@ -74,6 +77,8 @@ export default function CitizenHistoryScreen() {
   const [calls, setCalls] = useState<EmergencyCall[] | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<HistoryTab>('active');
+  const [selected, setSelected] = useState<EmergencyCall | null>(null);
 
   const load = useCallback(async () => {
     if (!session) return;
@@ -102,6 +107,13 @@ export default function CitizenHistoryScreen() {
     setRefreshing(false);
   }, [load]);
 
+  const { activeCalls, pastCalls } = useMemo(() => {
+    const active: EmergencyCall[] = [];
+    const past: EmergencyCall[] = [];
+    for (const c of calls ?? []) (c.status === 'closed' ? past : active).push(c);
+    return { activeCalls: active, pastCalls: past };
+  }, [calls]);
+
   const counts = useMemo(() => {
     const c = { open: 0, total: 0 };
     if (!calls) return c;
@@ -109,6 +121,9 @@ export default function CitizenHistoryScreen() {
     c.open = calls.filter((x) => x.status !== 'closed').length;
     return c;
   }, [calls]);
+
+  // Keep the open detail modal in sync with freshly-polled data.
+  const selectedLive = selected ? (calls?.find((c) => c.id === selected.id) ?? selected) : null;
 
   const subtitle =
     calls === null
@@ -151,36 +166,98 @@ export default function CitizenHistoryScreen() {
     );
   }
 
+  const visible = tab === 'active' ? activeCalls : pastCalls;
+
   return (
-    <Screen title="History" subtitle={subtitle} scroll={false}>
-      <FlatList
-        data={calls}
-        keyExtractor={(c) => c.id}
-        contentContainerStyle={{ paddingTop: t.spacing.xs, paddingBottom: t.spacing.xxxl }}
-        ItemSeparatorComponent={() => <View style={{ height: t.spacing.sm }} />}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={t.color.primary} />
-        }
-        ListHeaderComponent={
-          error ? (
-            <Text variant="caption" tone="danger" style={{ marginBottom: t.spacing.sm }}>
-              {error}
-            </Text>
-          ) : null
-        }
-        renderItem={({ item }) => <CallRow call={item} />}
-      />
+    <Screen title="History" subtitle={subtitle} scroll={false} padded={false}>
+      <View style={{ flex: 1, paddingHorizontal: t.spacing.lg }}>
+        <View style={styles.tabRow}>
+          <Segment id="active" label="Active" icon="alert" count={activeCalls.length} tone={t.color.danger} current={tab} onPress={setTab} />
+          <Segment id="past" label="Done" icon="time" count={pastCalls.length} tone={t.color.primary} current={tab} onPress={setTab} />
+        </View>
+
+        <FlatList
+          data={visible}
+          keyExtractor={(c) => c.id}
+          style={{ flex: 1 }}
+          contentContainerStyle={{ paddingTop: t.spacing.xs, paddingBottom: t.spacing.xxxl, flexGrow: 1 }}
+          ItemSeparatorComponent={() => <View style={{ height: t.spacing.sm }} />}
+          refreshControl={
+            <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={t.color.primary} />
+          }
+          ListHeaderComponent={
+            error ? (
+              <Text variant="caption" tone="danger" style={{ marginBottom: t.spacing.sm }}>
+                {error}
+              </Text>
+            ) : null
+          }
+          ListEmptyComponent={
+            tab === 'active' ? (
+              <EmptyState icon="shield" tone={t.color.success} title="No active cases" body="Calls you place will appear here while responders are on the way." />
+            ) : (
+              <EmptyState icon="time" tone={t.color.textMuted} title="No past cases" body="Resolved calls move here so you can look back on them." />
+            )
+          }
+          renderItem={({ item }) => <CallRow call={item} onPress={() => setSelected(item)} />}
+        />
+      </View>
+
+      <CaseDetailModal call={selectedLive} visible={!!selected} onClose={() => setSelected(null)} />
     </Screen>
   );
 }
 
-function CallRow({ call }: { call: EmergencyCall }) {
+function Segment({
+  id,
+  label,
+  icon,
+  count,
+  tone,
+  current,
+  onPress,
+}: {
+  id: HistoryTab;
+  label: string;
+  icon: 'alert' | 'time';
+  count: number;
+  tone: string;
+  current: HistoryTab;
+  onPress: (id: HistoryTab) => void;
+}) {
+  const t = useTheme();
+  const on = current === id;
+  return (
+    <Pressable
+      onPress={() => onPress(id)}
+      accessibilityRole="tab"
+      accessibilityState={{ selected: on }}
+      style={({ pressed }) => [
+        styles.segment,
+        {
+          borderRadius: t.radius.md,
+          borderColor: on ? tone : t.color.border,
+          backgroundColor: on ? t.color.surfaceHover : t.color.surface,
+          opacity: pressed ? 0.85 : 1,
+        },
+      ]}
+    >
+      <Icon name={icon} size={16} color={on ? tone : t.color.textMuted} />
+      <Text variant="label" color={on ? t.color.textPrimary : t.color.textMuted} style={{ flex: 1 }}>
+        {label}
+      </Text>
+      <Badge label={String(count)} solid={on} tone={id === 'active' ? 'danger' : 'accent'} color={on ? tone : undefined} />
+    </Pressable>
+  );
+}
+
+function CallRow({ call, onPress }: { call: EmergencyCall; onPress: () => void }) {
   const t = useTheme();
   const status = statusMeta(call.status);
   const ai = aiBadge(call);
 
   return (
-    <Card elevation={1}>
+    <Card elevation={1} onPress={onPress} accessibilityLabel={`${headline(call)}, ${status.label}`} accessibilityHint="Opens case details">
       <View style={styles.headerRow}>
         <View style={{ flex: 1, paddingRight: t.spacing.sm }}>
           <Text variant="bodyStrong" numberOfLines={1}>
@@ -191,7 +268,10 @@ function CallRow({ call }: { call: EmergencyCall }) {
             {call.is_direct ? ' · direct SOS' : ''}
           </Text>
         </View>
-        <Badge tone={status.tone} label={status.label} />
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <Badge tone={status.tone} label={status.label} />
+          <Icon name="chevronRight" size={16} color={t.color.textMuted} />
+        </View>
       </View>
 
       <View style={styles.metaRow}>
@@ -244,6 +324,8 @@ function ServiceChip({ service }: { service: EmergencyService }) {
 }
 
 const styles = StyleSheet.create({
+  tabRow: { flexDirection: 'row', gap: 10, marginBottom: 14, marginTop: 4 },
+  segment: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 11, paddingHorizontal: 12, borderWidth: 1.5, minHeight: 44 },
   headerRow: { flexDirection: 'row', alignItems: 'flex-start' },
   metaRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 8 },
   chip: {

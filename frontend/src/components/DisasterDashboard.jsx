@@ -1,12 +1,23 @@
-import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
+import { useState, useCallback, useEffect, useMemo, useRef, lazy, Suspense, memo } from 'react'
+import { motion } from 'framer-motion'
 import MapView from './MapView'
 import CityPicker from './CityPicker'
 import RoutePanel from './RoutePanel'
 import CallsDrawer from './CallsDrawer'
-import AILogsDrawer from './AILogsDrawer'
 import SeveritySelector from './SeveritySelector'
 import WeatherRegionsPanel from './WeatherRegionsPanel'
 import SettingsPanel from './SettingsPanel'
+import AnimatedCounter from './ui/AnimatedCounter'
+import StatusStrip from './ui/StatusStrip'
+import MapLegend from './ui/MapLegend'
+import KeyboardShortcutsHelp from './ui/KeyboardShortcutsHelp'
+import CommandPalette from './ui/CommandPalette'
+import useKeyboardShortcuts from '../lib/useKeyboardShortcuts'
+import { useToast } from './ui/ToastProvider'
+
+// Lazy: AILogsDrawer pulls heavy state/metrics code that only runs when opened.
+// Splitting it shaves ~80-120KB off the initial JS bundle (915KB total today).
+const AILogsDrawer = lazy(() => import('./AILogsDrawer'))
 import { requestRoute } from '../lib/routing'
 import { loadRoadGraph } from '../lib/roadGraph'
 import { useWeather } from '../lib/useWeather'
@@ -90,6 +101,7 @@ const DEFAULT_CITY = {
 const now = () => new Date().toLocaleTimeString('en-US', { hour12: false })
 
 export default function DisasterDashboard() {
+  const toast = useToast()
   const [disasterType, setDisasterType] = useState('Flood')
   const [severity, setSeverity] = useState(3)
   const [notes, setNotes] = useState('')
@@ -183,6 +195,20 @@ export default function DisasterDashboard() {
   const [simSpeed, setSimSpeed] = useState(1)
   const [citizenReports, setCitizenReports] = useState([])
   const [drawerOpen, setDrawerOpen] = useState(false)
+  // UI overlays — controlled by keyboard shortcuts + their own buttons.
+  const [legendOpen, setLegendOpen] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
+  const [focusMode, setFocusMode] = useState(false)
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  // event_id of the weather-zone currently highlighted in the right panel.
+  // Set when the operator clicks a numbered badge on the map; clears on a
+  // 3s timer so the visual cue fades.
+  const [focusedWeatherZoneId, setFocusedWeatherZoneId] = useState(null)
+  useEffect(() => {
+    if (!focusedWeatherZoneId) return
+    const t = setTimeout(() => setFocusedWeatherZoneId(null), 3000)
+    return () => clearTimeout(t)
+  }, [focusedWeatherZoneId])
   const [callFilter, setCallFilter] = useState('all')
   const [engine, setEngine] = useState(null)
   const zonesRef = useRef(zones)
@@ -425,6 +451,22 @@ export default function DisasterDashboard() {
         const next = [...enriched, ...prev]
         return next.length > 500 ? next.slice(0, 500) : next
       })
+
+      // Pop a toast for the highest-severity new report in this batch. We toast
+      // at most once per intake to avoid drowning the operator if a flood of
+      // 911 calls comes in at once (the calls drawer is the durable record).
+      const highSev = enriched.reduce((max, r) => {
+        if (r.report_kind !== 'affected') return max
+        const sev = r.perceived_severity ?? 0
+        return sev > (max?.perceived_severity ?? 0) ? r : max
+      }, null)
+      if (highSev && (highSev.perceived_severity ?? 0) >= 4) {
+        const more = enriched.length > 1 ? ` (+${enriched.length - 1} other)` : ''
+        toast.warn(
+          `High-severity 911 call`,
+          `Sev ${highSev.perceived_severity} · Citizen #${highSev.citizen_idx}${more}`,
+        )
+      }
 
       // Fire-and-forget POST. Failures are not fatal; reports remain in UI.
       // Filter out reports whose event_id isn't a real disaster UUID — crime
@@ -1418,31 +1460,244 @@ export default function DisasterDashboard() {
           }
         }
         addLog('success', `${zone.typeLabel} activated.`)
+        toast.info(
+          `${zone.typeLabel} activated`,
+          `Severity ${zone.severity}${zone.geometryKind === 'city' ? ' · Citywide' : ''}`,
+        )
       } catch (err) {
         addLog('error', `${zone.typeLabel}: ${err.message}`)
+        toast.danger(`${zone.typeLabel} failed`, err.message)
       }
     }
     refreshWeather()
     setLoading(false)
   }
 
+  // ─── Keyboard shortcuts ────────────────────────────────────
+  // Esc cascades: closes whichever overlay is "on top" first. The order
+  // here matches the visual z-index — palette/help dialog > drawers > inline
+  // overlays.
+  const closeTopmost = () => {
+    if (paletteOpen) return setPaletteOpen(false)
+    if (helpOpen) return setHelpOpen(false)
+    if (legendOpen) return setLegendOpen(false)
+    if (aiLogsOpen) return setAiLogsOpen(false)
+    if (drawerOpen) return setDrawerOpen(false)
+    if (settingsOpen) return setSettingsOpen(false)
+    if (crimeMenu) return setCrimeMenu(null)
+    if (inspectedCitizen) return setInspectedCitizen(null)
+  }
+  useKeyboardShortcuts({
+    '?': () => setHelpOpen((v) => !v),
+    'cmd+k': (e) => { e.preventDefault(); setPaletteOpen((v) => !v) },
+    'ctrl+k': (e) => { e.preventDefault(); setPaletteOpen((v) => !v) },
+    'Escape': closeTopmost,
+    'c': () => setDrawerOpen((v) => !v),
+    'a': () => setAiLogsOpen((v) => !v),
+    'l': () => setLegendOpen((v) => !v),
+    'f': () => setFocusMode((v) => !v),
+    '1': () => DISASTER_TYPES[0] && setDisasterType(DISASTER_TYPES[0].value),
+    '2': () => DISASTER_TYPES[1] && setDisasterType(DISASTER_TYPES[1].value),
+    '3': () => DISASTER_TYPES[2] && setDisasterType(DISASTER_TYPES[2].value),
+    '4': () => DISASTER_TYPES[3] && setDisasterType(DISASTER_TYPES[3].value),
+    '5': () => DISASTER_TYPES[4] && setDisasterType(DISASTER_TYPES[4].value),
+    '6': () => DISASTER_TYPES[5] && setDisasterType(DISASTER_TYPES[5].value),
+    '7': () => DISASTER_TYPES[6] && setDisasterType(DISASTER_TYPES[6].value),
+    '8': () => DISASTER_TYPES[7] && setDisasterType(DISASTER_TYPES[7].value),
+    '9': () => DISASTER_TYPES[8] && setDisasterType(DISASTER_TYPES[8].value),
+  })
+
+  // ─── Command palette: list of executable actions ─────────────
+  // Built fresh per render so it always sees current zone count, etc.
+  // Memoization is unnecessary at this scale and would obscure the dataflow.
+  const paletteCommands = (() => {
+    const cmds = []
+    // Disasters
+    DISASTER_TYPES.forEach((d, i) => {
+      cmds.push({
+        id: `disaster:${d.value}`,
+        group: 'Disasters',
+        title: `Select: ${d.label}`,
+        description: `Quick-pick ${d.label.toLowerCase()} as next zone type`,
+        shortcut: i < 9 ? [String(i + 1)] : undefined,
+        keywords: ['disaster', 'type', 'select', d.value, d.label],
+        onSelect: () => setDisasterType(d.value),
+      })
+    })
+    // Zones (jump to)
+    zones.slice(0, 12).forEach((z) => {
+      const coords = z.geometry?.coordinates
+      const pt = z.geometry?.type === 'Point' && Array.isArray(coords)
+        ? { lat: coords[1], lng: coords[0] }
+        : null
+      cmds.push({
+        id: `zone:${z.id}`,
+        group: 'Zones',
+        title: `${z.typeLabel} · ${z.status === 'active' ? 'Active' : 'Draft'}`,
+        description: `Sev ${z.severity}${pt ? ` · ${pt.lat.toFixed(3)}, ${pt.lng.toFixed(3)}` : ''}`,
+        keywords: ['zone', 'focus', 'goto', z.typeLabel, z.type],
+        onSelect: () => {
+          if (pt) setFocusPoint(pt)
+        },
+      })
+    })
+    // Drawers
+    cmds.push({
+      id: 'drawer:calls',
+      group: 'Drawers',
+      title: drawerOpen ? 'Close 911 calls' : 'Open 911 calls',
+      description: `${citizenReports.length} call${citizenReports.length === 1 ? '' : 's'} in queue`,
+      shortcut: ['C'],
+      keywords: ['calls', '911', 'reports', 'drawer'],
+      onSelect: () => setDrawerOpen((v) => !v),
+    })
+    cmds.push({
+      id: 'drawer:ai',
+      group: 'Drawers',
+      title: aiLogsOpen ? 'Close AI logs' : 'Open AI logs',
+      description: 'AI orchestrator reasoning + metrics',
+      shortcut: ['A'],
+      keywords: ['ai', 'logs', 'agent', 'reasoning', 'metrics'],
+      onSelect: () => setAiLogsOpen((v) => !v),
+    })
+    cmds.push({
+      id: 'drawer:legend',
+      group: 'Drawers',
+      title: legendOpen ? 'Hide map legend' : 'Show map legend',
+      description: 'Explanations for every map symbol',
+      shortcut: ['L'],
+      keywords: ['legend', 'key', 'symbols', 'map'],
+      onSelect: () => setLegendOpen((v) => !v),
+    })
+    cmds.push({
+      id: 'drawer:settings',
+      group: 'Drawers',
+      title: settingsOpen ? 'Close settings' : 'Open settings',
+      description: 'Stations, hospitals, police capacity & placement',
+      keywords: ['settings', 'stations', 'hospitals', 'police', 'capacity'],
+      onSelect: () => setSettingsOpen((v) => !v),
+    })
+    // Workspace
+    cmds.push({
+      id: 'mode:focus',
+      group: 'Workspace',
+      title: focusMode ? 'Exit focus mode' : 'Enter focus mode',
+      description: focusMode ? 'Restore the sidebar' : 'Hide sidebar for max map view',
+      shortcut: ['F'],
+      keywords: ['focus', 'hide', 'sidebar', 'minimal', 'distraction'],
+      onSelect: () => setFocusMode((v) => !v),
+    })
+    cmds.push({
+      id: 'mode:advanced',
+      group: 'Workspace',
+      title: advancedSidebar ? 'Hide advanced controls' : 'Show advanced controls',
+      description: 'Toggle dispatch, routing, cordons in sidebar',
+      keywords: ['advanced', 'sidebar', 'dispatch', 'cordons'],
+      onSelect: () => setAdvancedSidebar((v) => !v),
+    })
+    // Map style
+    MAP_STYLES.forEach((m) => {
+      cmds.push({
+        id: `map:${m.value}`,
+        group: 'Map',
+        title: `Map style: ${m.label}`,
+        description: mapStyle === m.value ? 'Currently active' : undefined,
+        keywords: ['map', 'style', 'tiles', m.value, m.label],
+        onSelect: () => setMapStyle(m.value),
+      })
+    })
+    cmds.push({
+      id: 'map:cameras',
+      group: 'Map',
+      title: showCameras ? 'Hide mock CCTV cameras' : 'Show mock CCTV cameras',
+      keywords: ['cameras', 'cctv', 'surveillance'],
+      onSelect: () => setShowCameras((v) => !v),
+    })
+    cmds.push({
+      id: 'map:intersections',
+      group: 'Map',
+      title: showIntersections ? 'Hide road intersections' : 'Show road intersections',
+      keywords: ['intersections', 'roads', 'graph', 'nodes'],
+      onSelect: () => setShowIntersections((v) => !v),
+    })
+    // Actions
+    if (zones.length > 0) {
+      cmds.push({
+        id: 'action:clear',
+        group: 'Actions',
+        title: 'Clear all zones',
+        description: `Remove ${zones.length} active zone${zones.length === 1 ? '' : 's'}`,
+        keywords: ['clear', 'reset', 'zones', 'remove', 'all'],
+        onSelect: () => handleClearAllZones(),
+      })
+    }
+    cmds.push({
+      id: 'action:help',
+      group: 'Navigation',
+      title: 'Keyboard shortcuts',
+      description: 'See every key binding',
+      shortcut: ['?'],
+      keywords: ['help', 'shortcuts', 'keys', 'bindings', '?'],
+      onSelect: () => setHelpOpen(true),
+    })
+    return cmds
+  })()
+
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#0a0a0a] text-zinc-100">
+    <div className="relative flex h-screen w-screen overflow-hidden text-sentinel-text">
       {/* ─── Sidebar ─────────────────────────────────────────── */}
-      <aside className="w-[360px] shrink-0 border-r border-zinc-800 bg-zinc-950 flex flex-col">
-        <header className="px-5 py-4 border-b border-zinc-800 flex items-center justify-between">
+      <aside
+        className={[
+          'relative shrink-0 flex flex-col glass-strong rounded-none border-l-0 border-y-0 border-r border-white/[0.05] z-10 transition-all duration-300',
+          focusMode
+            ? 'w-0 opacity-0 -ml-[360px] pointer-events-none'
+            : 'w-[360px] 3xl:w-[400px] opacity-100',
+        ].join(' ')}
+        aria-hidden={focusMode}
+      >
+        <header className="px-5 py-4 border-b border-white/[0.05] flex items-center justify-between">
           <div>
-            <h1 className="text-[15px] font-semibold tracking-tight">Sentinel-City</h1>
-            <p className="text-[11px] text-zinc-500 mt-0.5">Municipal emergency orchestration</p>
+            <h1 className="text-[15px] font-semibold tracking-tight bg-gradient-to-r from-sentinel-text to-sentinel-info bg-clip-text text-transparent">
+              Sentinel-City
+            </h1>
+            <p className="text-[11px] text-sentinel-textMuted mt-0.5">Municipal emergency orchestration</p>
           </div>
-          <span className="inline-flex items-center gap-1.5 text-[11px] text-zinc-400">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+          <span className="inline-flex items-center gap-1.5 text-[11px] text-sentinel-textDim">
+            <span className="relative flex h-1.5 w-1.5">
+              <span className="absolute inset-0 rounded-full bg-sentinel-safe animate-ping opacity-60" />
+              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-sentinel-safe" />
+            </span>
             Online
           </span>
         </header>
 
-        <div className="px-5 py-2.5 border-b border-zinc-800 flex items-center justify-between">
-          <span className="text-[11px] text-zinc-400">Advance sidebar</span>
+        <StatusStrip
+          online={true}
+          activeIncidents={zones.filter((z) => z.status === 'active').length}
+          simReady={simReady}
+        />
+
+        <button
+          type="button"
+          onClick={() => setPaletteOpen(true)}
+          className="mx-5 mt-3 mb-1 group flex items-center gap-2 px-3 py-2 rounded-lg glass hover:border-sentinel-info/40 hover:shadow-glow transition-all text-left"
+          aria-label="Open command palette"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-sentinel-textMuted group-hover:text-sentinel-info transition-colors shrink-0" aria-hidden="true">
+            <circle cx="11" cy="11" r="8" />
+            <path d="m21 21-4.3-4.3" />
+          </svg>
+          <span className="flex-1 text-[11px] text-sentinel-textMuted group-hover:text-sentinel-textDim transition-colors">
+            Search commands…
+          </span>
+          <span className="inline-flex items-center gap-0.5">
+            <kbd className="font-mono text-[9px] px-1 py-0.5 rounded bg-white/[0.05] border border-white/[0.08] text-sentinel-textDim">⌘</kbd>
+            <kbd className="font-mono text-[9px] px-1 py-0.5 rounded bg-white/[0.05] border border-white/[0.08] text-sentinel-textDim">K</kbd>
+          </span>
+        </button>
+
+        <div className="px-5 py-2.5 border-b border-white/[0.05] flex items-center justify-between">
+          <span className="text-[11px] text-sentinel-textDim">Advance sidebar</span>
           <button
             type="button"
             role="switch"
@@ -1450,7 +1705,7 @@ export default function DisasterDashboard() {
             onClick={() => setAdvancedSidebar((v) => !v)}
             className={[
               'relative inline-flex items-center h-5 w-9 rounded-full transition-colors',
-              advancedSidebar ? 'bg-emerald-600' : 'bg-zinc-700',
+              advancedSidebar ? 'bg-sentinel-info shadow-glow' : 'bg-white/10',
             ].join(' ')}
           >
             <span
@@ -1462,7 +1717,7 @@ export default function DisasterDashboard() {
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
+        <div className="sidebar-stagger flex-1 overflow-y-auto px-5 py-5 space-y-6">
           {/* Operating area */}
           <section>
             <SectionLabel>Operating area</SectionLabel>
@@ -1472,7 +1727,7 @@ export default function DisasterDashboard() {
               onClear={handleCityClear}
             />
             {!city && (
-              <p className="text-[11px] text-zinc-600 mt-1.5 leading-snug">
+              <p className="text-[11px] text-sentinel-textMuted mt-1.5 leading-snug">
                 Optional — scope the map to a specific city, or leave empty for global view.
               </p>
             )}
@@ -1482,7 +1737,7 @@ export default function DisasterDashboard() {
           <section>
             <div className="flex items-center justify-between mb-2.5">
               <SectionLabel className="mb-0">Emergency classification</SectionLabel>
-              <span className="text-[10px] text-zinc-600">for next zone</span>
+              <span className="text-[10px] text-sentinel-textMuted">for next zone</span>
             </div>
             <div className="grid grid-cols-2 gap-1.5">
               {DISASTER_TYPES.map((d) => {
@@ -1491,18 +1746,22 @@ export default function DisasterDashboard() {
                   <button
                     key={d.value}
                     onClick={() => setDisasterType(d.value)}
+                    aria-pressed={sel}
                     className={[
-                      'flex items-center gap-2 px-2.5 py-2 rounded-md text-left text-[12px] transition-colors font-medium',
+                      'flex items-center gap-2 px-2.5 py-2 rounded-lg text-left text-[12px] transition-all font-medium',
                       sel
-                        ? 'bg-zinc-800 border border-zinc-700 text-zinc-100'
-                        : 'bg-zinc-900 border border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200',
+                        ? 'bg-white/[0.06] border border-sentinel-info/40 text-sentinel-text shadow-glow'
+                        : 'bg-white/[0.02] border border-white/[0.05] text-sentinel-textDim hover:border-white/[0.12] hover:text-sentinel-text hover:bg-white/[0.04]',
                     ].join(' ')}
                   >
                     <span className="text-base leading-none shrink-0">{d.icon}</span>
                     <span className="truncate flex-1">{d.label}</span>
                     <span
-                      className="w-1.5 h-1.5 rounded-full shrink-0"
-                      style={{ background: d.color, boxShadow: sel ? `0 0 6px ${d.color}` : 'none' }}
+                      className="w-1.5 h-1.5 rounded-full shrink-0 transition-shadow"
+                      style={{
+                        background: d.color,
+                        boxShadow: sel ? `0 0 8px ${d.color}, 0 0 2px ${d.color}` : 'none',
+                      }}
                     />
                   </button>
                 )
@@ -1541,12 +1800,12 @@ export default function DisasterDashboard() {
                     max={10000}
                     value={peopleInside}
                     onChange={(e) => setPeopleInside(Math.max(1, parseInt(e.target.value, 10) || 1))}
-                    className="w-20 bg-zinc-900 border border-zinc-800 rounded px-2 py-0.5 text-[12px] text-zinc-100 tabular-nums focus:outline-none focus:border-zinc-600"
+                    className="w-20 bg-white/[0.02] border border-white/[0.05] rounded px-2 py-0.5 text-[12px] text-sentinel-text tabular-nums focus:outline-none focus:border-white/[0.12]"
                   />
                 </div>
                 <div className="flex items-center justify-between mb-2">
                   <SectionLabel className="mb-0">Safe exit</SectionLabel>
-                  <span className="text-[11px] text-zinc-400 tabular-nums">{safeExitPct}%</span>
+                  <span className="text-[11px] text-sentinel-textDim tabular-nums">{safeExitPct}%</span>
                 </div>
                 <input
                   type="range"
@@ -1557,7 +1816,7 @@ export default function DisasterDashboard() {
                   onChange={(e) => setSafeExitPct(parseInt(e.target.value, 10))}
                   className="w-full accent-red-500"
                 />
-                <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-zinc-500">
+                <div className="mt-2 grid grid-cols-2 gap-2 text-[10px] text-sentinel-textMuted">
                   <div>
                     Escaping <span className="text-emerald-400 tabular-nums">{Math.round(peopleInside * safeExitPct / 100)}</span>
                   </div>
@@ -1573,7 +1832,7 @@ export default function DisasterDashboard() {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <SectionLabel className="mb-0">Spread in</SectionLabel>
-                  <span className="text-[11px] text-zinc-400 tabular-nums">{spreadInSeconds}s</span>
+                  <span className="text-[11px] text-sentinel-textDim tabular-nums">{spreadInSeconds}s</span>
                 </div>
                 <input
                   type="range"
@@ -1584,7 +1843,7 @@ export default function DisasterDashboard() {
                   onChange={(e) => setSpreadInSeconds(parseInt(e.target.value, 10))}
                   className="w-full accent-amber-500"
                 />
-                <div className="flex justify-between text-[10px] text-zinc-600 mt-1">
+                <div className="flex justify-between text-[10px] text-sentinel-textMuted mt-1">
                   <span>5s</span>
                   <span>30s</span>
                   <span>5m</span>
@@ -1600,7 +1859,7 @@ export default function DisasterDashboard() {
             <section>
               <div className="flex items-center justify-between mb-2">
                 <SectionLabel className="mb-0">Spread speed</SectionLabel>
-                <span className="text-[11px] text-zinc-400 tabular-nums">{spreadSpeed.toFixed(2)}×</span>
+                <span className="text-[11px] text-sentinel-textDim tabular-nums">{spreadSpeed.toFixed(2)}×</span>
               </div>
               <input
                 type="range"
@@ -1611,7 +1870,7 @@ export default function DisasterDashboard() {
                 onChange={(e) => setSpreadSpeed(parseFloat(e.target.value))}
                 className="w-full accent-red-500"
               />
-              <div className="flex justify-between text-[10px] text-zinc-600 mt-1">
+              <div className="flex justify-between text-[10px] text-sentinel-textMuted mt-1">
                 <span>0.25× slow</span>
                 <span>0.5× max</span>
               </div>
@@ -1625,7 +1884,7 @@ export default function DisasterDashboard() {
           {CAUSE_AMBIGUOUS_TYPES.includes(disasterType) && (
             <section>
               <SectionLabel>Caused by</SectionLabel>
-              <div className="inline-flex items-center bg-zinc-900 border border-zinc-800 rounded-md p-0.5">
+              <div role="radiogroup" className="glass inline-flex items-center rounded-lg p-0.5 gap-0.5">
                 {[
                   { value: 'infrastructure', label: 'Infrastructure' },
                   { value: 'weather',        label: 'Weather' },
@@ -1637,7 +1896,7 @@ export default function DisasterDashboard() {
                       onClick={() => setCause(o.value)}
                       className={[
                         'px-2.5 py-1 text-[11px] rounded transition-colors',
-                        sel ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300',
+                        sel ? 'bg-sentinel-info/20 text-sentinel-info' : 'text-sentinel-textDim hover:text-sentinel-text hover:bg-white/[0.04]',
                       ].join(' ')}
                     >
                       {o.label}
@@ -1645,7 +1904,7 @@ export default function DisasterDashboard() {
                   )
                 })}
               </div>
-              <p className="text-[10px] text-zinc-600 mt-1.5 leading-snug">
+              <p className="text-[10px] text-sentinel-textMuted mt-1.5 leading-snug">
                 Weather causes can affect the weather report.
               </p>
             </section>
@@ -1656,7 +1915,7 @@ export default function DisasterDashboard() {
           {allowedGeometries.length > 1 && (
             <section>
               <SectionLabel>Scope</SectionLabel>
-              <div className="inline-flex items-center bg-zinc-900 border border-zinc-800 rounded-md p-0.5">
+              <div role="radiogroup" className="glass inline-flex items-center rounded-lg p-0.5 gap-0.5">
                 {allowedGeometries.map((g) => {
                   const sel = activeGeometryMode === g
                   return (
@@ -1667,7 +1926,7 @@ export default function DisasterDashboard() {
                       }
                       className={[
                         'px-2.5 py-1 text-[11px] rounded transition-colors',
-                        sel ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300',
+                        sel ? 'bg-sentinel-info/20 text-sentinel-info' : 'text-sentinel-textDim hover:text-sentinel-text hover:bg-white/[0.04]',
                       ].join(' ')}
                     >
                       {g === 'city' ? 'Citywide' : g === 'area' ? 'Area' : 'Point'}
@@ -1682,14 +1941,14 @@ export default function DisasterDashboard() {
           {advancedSidebar && (
             <section>
               <SectionLabel>
-                Directives <span className="text-zinc-600 font-normal">(optional)</span>
+                Directives <span className="text-sentinel-textMuted font-normal">(optional)</span>
               </SectionLabel>
               <textarea
                 rows={3}
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
                 placeholder="Evacuation routes, hazmat details, road units…"
-                className="w-full bg-zinc-900 border border-zinc-800 rounded-md px-3 py-2 text-[13px] text-zinc-100 placeholder:text-zinc-600 resize-none focus:outline-none focus:border-zinc-600 transition-colors"
+                className="w-full bg-white/[0.02] border border-white/[0.05] rounded-md px-3 py-2 text-[13px] text-sentinel-text placeholder:text-sentinel-textMuted resize-none focus:outline-none focus:border-white/[0.12] transition-colors"
               />
             </section>
           )}
@@ -1698,37 +1957,33 @@ export default function DisasterDashboard() {
           <section>
             <div className="flex items-center justify-between mb-2.5">
               <SectionLabel className="mb-0">Zones</SectionLabel>
-              <span className="text-[11px] text-zinc-500 tabular-nums">{zones.length}</span>
+              <span className="text-[11px] text-sentinel-textMuted tabular-nums">{zones.length}</span>
             </div>
 
             {/* Mode-specific entry hint / action */}
             {activeGeometryMode === 'city' ? (
               <button
                 onClick={handleAddCitywideZone}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-md border border-dashed border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-[12px] text-zinc-200 transition-colors mb-2"
+                className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-md border border-dashed border-white/[0.08] bg-white/[0.02] hover:bg-white/[0.06] text-[12px] text-sentinel-text transition-colors mb-2"
               >
                 <span>+</span>
                 Add citywide {currentDisaster.label}
               </button>
             ) : activeGeometryMode === 'point' ? (
-              <div className="px-3 py-2 rounded-md border border-zinc-800 bg-zinc-900 text-[11px] text-zinc-500 leading-snug mb-2">
+              <div className="px-3 py-2 rounded-md border border-white/[0.05] bg-white/[0.02] text-[11px] text-sentinel-textMuted leading-snug mb-2">
                 Click once on the map to mark a {currentDisaster.label.toLowerCase()} location.
               </div>
-            ) : (
-              <div className="px-3 py-2 rounded-md border border-zinc-800 bg-zinc-900 text-[11px] text-zinc-500 leading-snug mb-2">
-                Use the drawing tools (top-left) to outline the {currentDisaster.label.toLowerCase()} area.
-              </div>
-            )}
+            ) : null}
 
             {zones.length === 0 ? (
-              <div className="px-3 py-2.5 rounded-md border border-zinc-800 bg-zinc-900 text-[11px] text-zinc-500 leading-snug">
+              <div className="px-3 py-2.5 rounded-md border border-white/[0.05] bg-white/[0.02] text-[11px] text-sentinel-textMuted leading-snug">
                 No active zones yet.
               </div>
             ) : (
               <ZoneList
                 zones={zones}
                 onRemove={handleZoneRemove}
-                onStartNesting={(id) => setNestingParentId(id)}
+                onStartNesting={setNestingParentId}
                 nestingParentId={nestingParentId}
               />
             )}
@@ -1744,7 +1999,7 @@ export default function DisasterDashboard() {
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setDispatchTrucks((v) => Math.max(DISPATCH_MIN_TRUCKS, v - 1))}
-                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+                className="w-7 h-7 rounded bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text"
               >−</button>
               <input
                 type="number"
@@ -1755,13 +2010,13 @@ export default function DisasterDashboard() {
                   const v = parseInt(e.target.value, 10) || DISPATCH_MIN_TRUCKS
                   setDispatchTrucks(Math.max(DISPATCH_MIN_TRUCKS, Math.min(DISPATCH_MAX_TRUCKS, v)))
                 }}
-                className="w-14 bg-zinc-900 border border-zinc-800 rounded px-2 py-0.5 text-[12px] text-zinc-100 tabular-nums text-center focus:outline-none focus:border-zinc-600"
+                className="w-14 bg-white/[0.02] border border-white/[0.05] rounded px-2 py-0.5 text-[12px] text-sentinel-text tabular-nums text-center focus:outline-none focus:border-white/[0.12]"
               />
               <button
                 onClick={() => setDispatchTrucks((v) => Math.min(DISPATCH_MAX_TRUCKS, v + 1))}
-                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+                className="w-7 h-7 rounded bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text"
               >+</button>
-              <span className="text-[10px] text-zinc-500">
+              <span className="text-[10px] text-sentinel-textMuted">
                 {dispatchTrucks * FIRE_TRUCK_CAPACITY} firefighters
               </span>
             </div>
@@ -1771,7 +2026,7 @@ export default function DisasterDashboard() {
                 'w-full py-1.5 rounded text-[11px] transition-colors',
                 dispatchTargetMode
                   ? 'bg-amber-500/30 text-amber-100 border border-amber-500/60'
-                  : 'bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100',
+                  : 'bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text',
               ].join(' ')}
             >
               {dispatchTargetMode
@@ -1781,7 +2036,7 @@ export default function DisasterDashboard() {
                   : 'Pick search area on map'}
             </button>
             <div className="flex items-center gap-2">
-              <span className="text-[11px] text-zinc-400 whitespace-nowrap">Search radius</span>
+              <span className="text-[11px] text-sentinel-textDim whitespace-nowrap">Search radius</span>
               <input
                 type="range"
                 min={200}
@@ -1797,28 +2052,28 @@ export default function DisasterDashboard() {
                 }}
                 className="flex-1"
               />
-              <span className="text-[11px] text-zinc-400 tabular-nums w-12 text-right">{dispatchRadius}m</span>
+              <span className="text-[11px] text-sentinel-textDim tabular-nums w-12 text-right">{dispatchRadius}m</span>
             </div>
             <button
               onClick={handleDispatch}
               disabled={!dispatchTarget || fireStations.length === 0}
-              className="w-full py-2 rounded text-[12px] font-medium text-white bg-amber-600 hover:bg-amber-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed transition-colors"
+              className="w-full py-2 rounded text-[12px] font-medium text-white bg-amber-600 hover:bg-amber-500 disabled:bg-white/[0.06] disabled:text-sentinel-textMuted disabled:cursor-not-allowed transition-colors"
             >
               Dispatch {dispatchTrucks} truck{dispatchTrucks === 1 ? '' : 's'}
             </button>
             {fireStations.length === 0 && (
-              <p className="text-[10px] text-zinc-600">No stations — open ⚙ Settings to place one.</p>
+              <p className="text-[10px] text-sentinel-textMuted">No stations — open ⚙ Settings to place one.</p>
             )}
             {activeDispatches.length > 0 && (
               <div className="space-y-1 pt-1">
-                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Active dispatches</div>
+                <div className="text-[10px] uppercase tracking-wide text-sentinel-textMuted">Active dispatches</div>
                 {activeDispatches.map((d) => (
-                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 rounded border border-zinc-800 bg-zinc-950 text-[10px]">
+                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 rounded border border-white/[0.05] bg-black/30 text-[10px]">
                     <span>🚒 {d.trucks}</span>
-                    <span className="text-zinc-500 flex-1 truncate">from {d.stationName}</span>
+                    <span className="text-sentinel-textMuted flex-1 truncate">from {d.stationName}</span>
                     <button
                       onClick={() => handleRecall(d.id)}
-                      className="text-zinc-500 hover:text-amber-300 text-[10px]"
+                      className="text-sentinel-textMuted hover:text-amber-300 text-[10px]"
                     >Recall</button>
                   </div>
                 ))}
@@ -1832,7 +2087,7 @@ export default function DisasterDashboard() {
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setAmbDispatchUnits((v) => Math.max(1, v - 1))}
-                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+                className="w-7 h-7 rounded bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text"
               >−</button>
               <input
                 type="number"
@@ -1843,13 +2098,13 @@ export default function DisasterDashboard() {
                   const v = parseInt(e.target.value, 10) || 1
                   setAmbDispatchUnits(Math.max(1, Math.min(20, v)))
                 }}
-                className="w-14 bg-zinc-900 border border-zinc-800 rounded px-2 py-0.5 text-[12px] text-zinc-100 tabular-nums text-center focus:outline-none focus:border-zinc-600"
+                className="w-14 bg-white/[0.02] border border-white/[0.05] rounded px-2 py-0.5 text-[12px] text-sentinel-text tabular-nums text-center focus:outline-none focus:border-white/[0.12]"
               />
               <button
                 onClick={() => setAmbDispatchUnits((v) => Math.min(20, v + 1))}
-                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+                className="w-7 h-7 rounded bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text"
               >+</button>
-              <span className="text-[10px] text-zinc-500">ambulances</span>
+              <span className="text-[10px] text-sentinel-textMuted">ambulances</span>
             </div>
             <button
               onClick={() => setAmbDispatchTargetMode((v) => !v)}
@@ -1857,7 +2112,7 @@ export default function DisasterDashboard() {
                 'w-full py-1.5 rounded text-[11px] transition-colors',
                 ambDispatchTargetMode
                   ? 'bg-rose-500/30 text-rose-100 border border-rose-500/60'
-                  : 'bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100',
+                  : 'bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text',
               ].join(' ')}
             >
               {ambDispatchTargetMode
@@ -1867,7 +2122,7 @@ export default function DisasterDashboard() {
                   : '🏥 Pick pickup area on map'}
             </button>
             <div className="flex items-center gap-2">
-              <span className="text-[11px] text-zinc-400 whitespace-nowrap">Search radius</span>
+              <span className="text-[11px] text-sentinel-textDim whitespace-nowrap">Search radius</span>
               <input
                 type="range"
                 min={50}
@@ -1881,28 +2136,28 @@ export default function DisasterDashboard() {
                 }}
                 className="flex-1"
               />
-              <span className="text-[11px] text-zinc-400 tabular-nums w-12 text-right">{ambDispatchRadius}m</span>
+              <span className="text-[11px] text-sentinel-textDim tabular-nums w-12 text-right">{ambDispatchRadius}m</span>
             </div>
             <button
               onClick={handleAmbulanceDispatch}
               disabled={!ambDispatchTarget || hospitals.length === 0}
-              className="w-full py-2 rounded text-[12px] font-medium text-white bg-rose-600 hover:bg-rose-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed transition-colors"
+              className="w-full py-2 rounded text-[12px] font-medium text-white bg-rose-600 hover:bg-rose-500 disabled:bg-white/[0.06] disabled:text-sentinel-textMuted disabled:cursor-not-allowed transition-colors"
             >
               Dispatch {ambDispatchUnits} ambulance{ambDispatchUnits === 1 ? '' : 's'}
             </button>
             {hospitals.length === 0 && (
-              <p className="text-[10px] text-zinc-600">No hospitals — open ⚙ Settings to place one.</p>
+              <p className="text-[10px] text-sentinel-textMuted">No hospitals — open ⚙ Settings to place one.</p>
             )}
             {activeAmbulanceDispatches.length > 0 && (
               <div className="space-y-1 pt-1">
-                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Active dispatches</div>
+                <div className="text-[10px] uppercase tracking-wide text-sentinel-textMuted">Active dispatches</div>
                 {activeAmbulanceDispatches.map((d) => (
-                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 rounded border border-zinc-800 bg-zinc-950 text-[10px]">
+                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 rounded border border-white/[0.05] bg-black/30 text-[10px]">
                     <span>🚑 {d.units}</span>
-                    <span className="text-zinc-500 flex-1 truncate">from {d.stationName}</span>
+                    <span className="text-sentinel-textMuted flex-1 truncate">from {d.stationName}</span>
                     <button
                       onClick={() => handleAmbulanceRecall(d.id)}
-                      className="text-zinc-500 hover:text-rose-300 text-[10px]"
+                      className="text-sentinel-textMuted hover:text-rose-300 text-[10px]"
                     >Recall</button>
                   </div>
                 ))}
@@ -1916,7 +2171,7 @@ export default function DisasterDashboard() {
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setPoliceDispatchUnits((v) => Math.max(1, v - 1))}
-                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+                className="w-7 h-7 rounded bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text"
               >−</button>
               <input
                 type="number"
@@ -1927,13 +2182,13 @@ export default function DisasterDashboard() {
                   const v = parseInt(e.target.value, 10) || 1
                   setPoliceDispatchUnits(Math.max(1, Math.min(50, v)))
                 }}
-                className="w-14 bg-zinc-900 border border-zinc-800 rounded px-2 py-0.5 text-[12px] text-zinc-100 tabular-nums text-center focus:outline-none focus:border-zinc-600"
+                className="w-14 bg-white/[0.02] border border-white/[0.05] rounded px-2 py-0.5 text-[12px] text-sentinel-text tabular-nums text-center focus:outline-none focus:border-white/[0.12]"
               />
               <button
                 onClick={() => setPoliceDispatchUnits((v) => Math.min(50, v + 1))}
-                className="w-7 h-7 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100"
+                className="w-7 h-7 rounded bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text"
               >+</button>
-              <span className="text-[10px] text-zinc-500">officers</span>
+              <span className="text-[10px] text-sentinel-textMuted">officers</span>
             </div>
             <button
               onClick={() => setPoliceDispatchTargetMode((v) => !v)}
@@ -1941,7 +2196,7 @@ export default function DisasterDashboard() {
                 'w-full py-1.5 rounded text-[11px] transition-colors',
                 policeDispatchTargetMode
                   ? 'bg-blue-500/30 text-blue-100 border border-blue-500/60'
-                  : 'bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100',
+                  : 'bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text',
               ].join(' ')}
             >
               {policeDispatchTargetMode
@@ -1951,7 +2206,7 @@ export default function DisasterDashboard() {
                   : '🚓 Pick patrol area on map'}
             </button>
             <div className="flex items-center gap-2">
-              <span className="text-[11px] text-zinc-400 whitespace-nowrap">Patrol radius</span>
+              <span className="text-[11px] text-sentinel-textDim whitespace-nowrap">Patrol radius</span>
               <input
                 type="range"
                 min={150}
@@ -1965,34 +2220,34 @@ export default function DisasterDashboard() {
                 }}
                 className="flex-1"
               />
-              <span className="text-[11px] text-zinc-400 tabular-nums w-12 text-right">{policeDispatchRadius}m</span>
+              <span className="text-[11px] text-sentinel-textDim tabular-nums w-12 text-right">{policeDispatchRadius}m</span>
             </div>
             <button
               onClick={handlePoliceDispatchManual}
               disabled={!policeDispatchTarget || policeStations.length === 0}
-              className="w-full py-2 rounded text-[12px] font-medium text-white bg-blue-600 hover:bg-blue-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed transition-colors"
+              className="w-full py-2 rounded text-[12px] font-medium text-white bg-blue-600 hover:bg-blue-500 disabled:bg-white/[0.06] disabled:text-sentinel-textMuted disabled:cursor-not-allowed transition-colors"
             >
               Dispatch {policeDispatchUnits} officer{policeDispatchUnits === 1 ? '' : 's'}
             </button>
             {policeStations.length === 0 && (
-              <p className="text-[10px] text-zinc-600">No police stations — open ⚙ Settings to place one.</p>
+              <p className="text-[10px] text-sentinel-textMuted">No police stations — open ⚙ Settings to place one.</p>
             )}
             {activePoliceDispatches.length > 0 && (
               <div className="space-y-1 pt-1">
-                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Active patrols</div>
+                <div className="text-[10px] uppercase tracking-wide text-sentinel-textMuted">Active patrols</div>
                 {activePoliceDispatches.map((d) => (
-                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 rounded border border-zinc-800 bg-zinc-950 text-[10px]">
+                  <div key={d.id} className="flex items-center gap-2 px-2 py-1 rounded border border-white/[0.05] bg-black/30 text-[10px]">
                     <span>🚓 {d.units}</span>
-                    <span className="text-zinc-500 flex-1 truncate">from {d.stationName}</span>
+                    <span className="text-sentinel-textMuted flex-1 truncate">from {d.stationName}</span>
                     <button
                       onClick={() => handlePoliceRecall(d.id)}
-                      className="text-zinc-500 hover:text-blue-300 text-[10px]"
+                      className="text-sentinel-textMuted hover:text-blue-300 text-[10px]"
                     >Recall</button>
                   </div>
                 ))}
               </div>
             )}
-            <p className="text-[10px] text-zinc-600">
+            <p className="text-[10px] text-sentinel-textMuted">
               ~50% of each station's roster auto-patrols nearby looking for crime. Right-click any citizen to trigger a robbery.
             </p>
           </section>
@@ -2004,7 +2259,7 @@ export default function DisasterDashboard() {
               value={notifReason}
               onChange={(e) => setNotifReason(e.target.value)}
               placeholder="Reason (e.g. Toxic plume)"
-              className="w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1 text-[11px] text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600"
+              className="w-full bg-white/[0.02] border border-white/[0.05] rounded px-2 py-1 text-[11px] text-sentinel-text placeholder:text-sentinel-textMuted focus:outline-none focus:border-white/[0.12]"
             />
             <div className="grid grid-cols-2 gap-2">
               <button
@@ -2013,7 +2268,7 @@ export default function DisasterDashboard() {
                   'py-1.5 rounded text-[11px] transition-colors',
                   polygonDrawKind === 'notification'
                     ? 'bg-yellow-500/30 text-yellow-100 border border-yellow-500/60'
-                    : 'bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100',
+                    : 'bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text',
                 ].join(' ')}
               >
                 {polygonDrawKind === 'notification' ? 'Draw…' : '📢 Notify area'}
@@ -2024,7 +2279,7 @@ export default function DisasterDashboard() {
                   'py-1.5 rounded text-[11px] transition-colors',
                   polygonDrawKind === 'cordon'
                     ? 'bg-orange-500/30 text-orange-100 border border-orange-500/60'
-                    : 'bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-zinc-100',
+                    : 'bg-white/[0.02] border border-white/[0.05] text-sentinel-text hover:text-sentinel-text',
                 ].join(' ')}
               >
                 {polygonDrawKind === 'cordon' ? 'Draw…' : '🚧 Cordon'}
@@ -2035,15 +2290,15 @@ export default function DisasterDashboard() {
                 {notifications.map((n) => (
                   <div key={n.id} className="flex items-center gap-2 px-2 py-1 rounded border border-yellow-500/30 bg-yellow-500/5 text-[10px]">
                     <span>📢</span>
-                    <span className="text-zinc-200 flex-1 truncate">{n.reason}</span>
-                    <button onClick={() => handleClearNotification(n.id)} className="text-zinc-500 hover:text-red-400">×</button>
+                    <span className="text-sentinel-text flex-1 truncate">{n.reason}</span>
+                    <button onClick={() => handleClearNotification(n.id)} className="text-sentinel-textMuted hover:text-red-400">×</button>
                   </div>
                 ))}
                 {cordons.map((c) => (
                   <div key={c.id} className="flex items-center gap-2 px-2 py-1 rounded border border-orange-500/30 bg-orange-500/5 text-[10px]">
                     <span>🚧</span>
-                    <span className="text-zinc-200 flex-1 truncate">{c.reason || 'No entry'}</span>
-                    <button onClick={() => handleClearCordon(c.id)} className="text-zinc-500 hover:text-red-400">×</button>
+                    <span className="text-sentinel-text flex-1 truncate">{c.reason || 'No entry'}</span>
+                    <button onClick={() => handleClearCordon(c.id)} className="text-sentinel-textMuted hover:text-red-400">×</button>
                   </div>
                 ))}
               </div>
@@ -2060,7 +2315,7 @@ export default function DisasterDashboard() {
                 id="btn-trigger-disaster"
                 onClick={handleTrigger}
                 disabled={loading || draftCount === 0}
-                className="w-full py-2.5 rounded-md font-medium text-[13px] text-white bg-red-600 hover:bg-red-500 disabled:bg-zinc-800 disabled:text-zinc-500 disabled:cursor-not-allowed transition-colors"
+                className="w-full py-2.5 rounded-md font-medium text-[13px] text-white bg-red-600 hover:bg-red-500 disabled:bg-white/[0.06] disabled:text-sentinel-textMuted disabled:cursor-not-allowed transition-colors"
               >
                 {loading ? (
                   <span className="inline-flex items-center gap-2">
@@ -2081,7 +2336,7 @@ export default function DisasterDashboard() {
           <button
             onClick={handleClearAllZones}
             disabled={loading}
-            className="w-full mt-2 py-1.5 rounded-md text-[11px] text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900 disabled:text-zinc-700 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-colors"
+            className="w-full mt-2 py-1.5 rounded-md text-[11px] text-sentinel-textMuted hover:text-sentinel-text hover:bg-white/[0.02] disabled:text-sentinel-textMuted disabled:hover:bg-transparent disabled:cursor-not-allowed transition-colors"
           >
             Clear all zones
           </button>
@@ -2097,7 +2352,7 @@ export default function DisasterDashboard() {
             <section>
               <div className="flex items-center justify-between mb-2.5">
                 <SectionLabel className="mb-0">Routing</SectionLabel>
-                <span className="text-[10px] text-zinc-600">avoids active zones</span>
+                <span className="text-[10px] text-sentinel-textMuted">avoids active zones</span>
               </div>
               <RoutePanel
                 waypoints={waypoints}
@@ -2114,13 +2369,13 @@ export default function DisasterDashboard() {
         </div>
 
         {/* Activity log */}
-        <div className="border-t border-zinc-800">
+        <div className="border-t border-white/[0.05]">
           <button
             onClick={() => setLogOpen((o) => !o)}
-            className="w-full flex items-center justify-between px-5 py-3 text-[12px] text-zinc-400 hover:text-zinc-200 transition-colors"
+            className="w-full flex items-center justify-between px-5 py-3 text-[12px] text-sentinel-textDim hover:text-sentinel-text transition-colors"
           >
             <span className="font-medium">Activity</span>
-            <span className="text-zinc-600 text-[10px]">{logOpen ? '▾' : '▸'}</span>
+            <span className="text-sentinel-textMuted text-[10px]">{logOpen ? '▾' : '▸'}</span>
           </button>
           {logOpen && (
             <div className="max-h-[180px] overflow-y-auto px-5 pb-4 space-y-1.5">
@@ -2178,6 +2433,7 @@ export default function DisasterDashboard() {
           polygonDrawKind={polygonDrawKind}
           onPolygonDraw={handlePolygonDraw}
           weatherRegions={numberedWeatherRegions}
+          onWeatherBadgeClick={setFocusedWeatherZoneId}
           mockCameras={mockCameras}
         />
 
@@ -2221,14 +2477,19 @@ export default function DisasterDashboard() {
         <div className="absolute top-4 right-4 z-30 flex flex-col items-end gap-2">
           <button
             onClick={() => setSettingsOpen((v) => !v)}
-            className="inline-flex items-center justify-center w-8 h-8 bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md text-zinc-300 hover:text-zinc-100 hover:border-zinc-700 transition-colors"
+            className="glass inline-flex items-center justify-center w-9 h-9 rounded-lg text-sentinel-textDim hover:text-sentinel-info hover:shadow-glow hover:border-sentinel-info/40 transition-all"
+            aria-label="Open settings"
             title="Settings"
           >
-            ⚙
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
           </button>
           <WeatherRegionsPanel
             regions={numberedWeatherRegions}
             onClearAll={handleClearAllZones}
+            focusedZoneId={focusedWeatherZoneId}
           />
           {(() => {
             const totals = zones.reduce(
@@ -2245,13 +2506,21 @@ export default function DisasterDashboard() {
             if (totals.escaped === 0 && totals.trapped === 0) return null
             return (
               <div
-                className="inline-flex items-center gap-2 bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md px-3 py-1.5 text-[12px] text-zinc-200"
+                role="status"
+                aria-label={`${totals.escaped} escaped, ${totals.trapped} trapped`}
+                className="glass inline-flex items-center gap-2.5 rounded-lg px-3 py-1.5 text-[12px] text-sentinel-text"
                 title="Cumulative people accounted for across active building fires"
               >
                 <span className="text-base leading-none" aria-hidden>🏢</span>
-                <span className="text-emerald-400 tabular-nums">{totals.escaped} out</span>
-                <span className="text-zinc-600">·</span>
-                <span className="text-red-400 tabular-nums">{totals.trapped} trapped</span>
+                <span className="inline-flex items-baseline gap-1 text-sentinel-safe font-medium">
+                  <AnimatedCounter value={totals.escaped} />
+                  <span>out</span>
+                </span>
+                <span className="text-sentinel-textMuted">·</span>
+                <span className="inline-flex items-baseline gap-1 text-sentinel-danger font-medium">
+                  <AnimatedCounter value={totals.trapped} />
+                  <span>trapped</span>
+                </span>
               </div>
             )
           })()}
@@ -2259,17 +2528,18 @@ export default function DisasterDashboard() {
 
           <button
             onClick={() => setShowCameras((c) => !c)}
+            aria-pressed={showCameras}
             className={[
-              'inline-flex items-center gap-1.5 bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md px-3 py-1.5 text-[12px] transition-colors',
+              'glass inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] transition-all',
               showCameras
-                ? 'text-zinc-100 hover:border-zinc-700'
-                : 'text-zinc-500 hover:text-zinc-300 hover:border-zinc-700',
+                ? 'text-sentinel-warn border-sentinel-warn/40 shadow-[0_0_16px_rgba(245,158,11,0.25)]'
+                : 'text-sentinel-textDim hover:text-sentinel-text',
             ].join(' ')}
           >
             <span
               className={[
                 'w-1.5 h-1.5 rounded-full',
-                showCameras ? 'bg-amber-400' : 'bg-zinc-600',
+                showCameras ? 'bg-sentinel-warn' : 'bg-sentinel-textMuted',
               ].join(' ')}
             />
             Cameras {showCameras ? 'on' : 'off'}
@@ -2277,17 +2547,18 @@ export default function DisasterDashboard() {
 
           <button
             onClick={() => setShowIntersections((v) => !v)}
+            aria-pressed={showIntersections}
             className={[
-              'inline-flex items-center gap-1.5 bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md px-3 py-1.5 text-[12px] transition-colors',
+              'glass inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[12px] transition-all',
               showIntersections
-                ? 'text-zinc-100 hover:border-zinc-700'
-                : 'text-zinc-500 hover:text-zinc-300 hover:border-zinc-700',
+                ? 'text-sentinel-info border-sentinel-info/40 shadow-glow'
+                : 'text-sentinel-textDim hover:text-sentinel-text',
             ].join(' ')}
           >
             <span
               className={[
                 'w-1.5 h-1.5 rounded-full',
-                showIntersections ? 'bg-sky-400' : 'bg-zinc-600',
+                showIntersections ? 'bg-sentinel-info' : 'bg-sentinel-textMuted',
               ].join(' ')}
             />
             Intersections {showIntersections ? 'on' : 'off'}
@@ -2296,68 +2567,83 @@ export default function DisasterDashboard() {
 
         {/* Citizen inspector — appears when a dot is clicked on the map */}
         {inspectedCitizen && (
-          <div className="absolute top-4 left-16 z-40 bg-zinc-900/95 backdrop-blur border border-zinc-700 rounded-md text-[11px] text-zinc-200 w-[280px] font-mono">
-            <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800">
-              <span className="font-semibold text-zinc-100">Citizen #{inspectedCitizen.idx}</span>
+          <div
+            role="dialog"
+            aria-label={`Citizen ${inspectedCitizen.idx} inspector`}
+            className="absolute top-4 left-16 z-40 glass-info rounded-xl text-[11px] text-sentinel-text w-[290px] font-mono overflow-hidden"
+          >
+            <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.06]">
+              <span className="font-semibold text-sentinel-info uppercase tracking-wider text-[10px]">Citizen #{inspectedCitizen.idx}</span>
               <button
                 onClick={() => setInspectedCitizen(null)}
-                className="text-zinc-500 hover:text-zinc-200 text-[14px] leading-none"
+                aria-label="Close citizen inspector"
+                className="text-sentinel-textMuted hover:text-sentinel-text text-[16px] leading-none w-5 h-5 flex items-center justify-center rounded hover:bg-white/5 transition-colors"
               >
                 ×
               </button>
             </div>
             <div className="px-3 py-2 space-y-0.5 leading-relaxed">
-              <div><span className="text-zinc-500">state</span> <span className="text-zinc-100">{inspectedCitizen.state}</span> <span className="text-zinc-500">({inspectedCitizen.speed} m/s)</span></div>
-              <div><span className="text-zinc-500">pos</span> {inspectedCitizen.lat.toFixed(5)}, {inspectedCitizen.lng.toFixed(5)}</div>
-              <div><span className="text-zinc-500">node</span> {String(inspectedCitizen.currentNode).slice(0, 18)}</div>
-              <div><span className="text-zinc-500">→ target</span> {String(inspectedCitizen.targetNode).slice(0, 18)}</div>
-              <div><span className="text-zinc-500">path</span> {inspectedCitizen.pathLength} nodes, {Math.round(inspectedCitizen.pathRemainingM)} m left</div>
-              <div><span className="text-zinc-500">nbrs</span> {inspectedCitizen.neighborCount}</div>
-              <div className="pt-1 border-t border-zinc-800 mt-1" />
-              <div><span className="text-zinc-500">total moved</span> {Math.round(inspectedCitizen.totalMovedM)} m</div>
+              <div><span className="text-sentinel-textMuted">state</span> <span className="text-sentinel-text">{inspectedCitizen.state}</span> <span className="text-sentinel-textMuted">({inspectedCitizen.speed} m/s)</span></div>
+              <div><span className="text-sentinel-textMuted">pos</span> <span className="tabular">{inspectedCitizen.lat.toFixed(5)}, {inspectedCitizen.lng.toFixed(5)}</span></div>
+              <div><span className="text-sentinel-textMuted">node</span> {String(inspectedCitizen.currentNode).slice(0, 18)}</div>
+              <div><span className="text-sentinel-textMuted">→ target</span> {String(inspectedCitizen.targetNode).slice(0, 18)}</div>
+              <div><span className="text-sentinel-textMuted">path</span> <span className="tabular">{inspectedCitizen.pathLength}</span> nodes, <span className="tabular">{Math.round(inspectedCitizen.pathRemainingM)}</span> m left</div>
+              <div><span className="text-sentinel-textMuted">nbrs</span> <span className="tabular">{inspectedCitizen.neighborCount}</span></div>
+              <div className="pt-1 border-t border-white/[0.04] mt-1" />
+              <div><span className="text-sentinel-textMuted">total moved</span> <span className="tabular">{Math.round(inspectedCitizen.totalMovedM)}</span> m</div>
               <div>
-                <span className="text-zinc-500">last moved</span>{' '}
-                <span className={inspectedCitizen.ticksStillSinceMove > 2 ? 'text-amber-400' : 'text-zinc-100'}>
+                <span className="text-sentinel-textMuted">last moved</span>{' '}
+                <span className={inspectedCitizen.ticksStillSinceMove > 2 ? 'text-sentinel-warn tabular' : 'text-sentinel-text tabular'}>
                   {inspectedCitizen.lastMovedSimT > 0
                     ? `t=${inspectedCitizen.lastMovedSimT.toFixed(1)} (Δ${inspectedCitizen.ticksStillSinceMove.toFixed(1)}s ago)`
                     : 'never'}
                 </span>
               </div>
-              <div><span className="text-zinc-500">retargets</span> {inspectedCitizen.retargetCount} <span className="text-zinc-500">· last at</span> t={inspectedCitizen.lastRetargetSimT.toFixed(1)}</div>
-              <div className="pt-1 border-t border-zinc-800 mt-1" />
-              <div><span className="text-zinc-500">cause zone</span> {inspectedCitizen.causeZoneId ? String(inspectedCitizen.causeZoneId).slice(0, 12) + '…' : '—'}</div>
-              <div><span className="text-zinc-500">state expires</span> {inspectedCitizen.stateExpiresAt === Infinity ? '∞' : inspectedCitizen.stateExpiresAt.toFixed(1)}</div>
-              <div><span className="text-zinc-500">recovery at</span> {inspectedCitizen.recoveryAt > 0 ? inspectedCitizen.recoveryAt.toFixed(1) : '—'}</div>
-              <div><span className="text-zinc-500">sim time</span> {inspectedCitizen.simTimeS.toFixed(1)}</div>
-              <div><span className="text-zinc-500">reports logged</span> {inspectedCitizen.reportLogSize}</div>
+              <div><span className="text-sentinel-textMuted">retargets</span> <span className="tabular">{inspectedCitizen.retargetCount}</span> <span className="text-sentinel-textMuted">· last at</span> <span className="tabular">t={inspectedCitizen.lastRetargetSimT.toFixed(1)}</span></div>
+              <div className="pt-1 border-t border-white/[0.04] mt-1" />
+              <div><span className="text-sentinel-textMuted">cause zone</span> {inspectedCitizen.causeZoneId ? String(inspectedCitizen.causeZoneId).slice(0, 12) + '…' : '—'}</div>
+              <div><span className="text-sentinel-textMuted">state expires</span> <span className="tabular">{inspectedCitizen.stateExpiresAt === Infinity ? '∞' : inspectedCitizen.stateExpiresAt.toFixed(1)}</span></div>
+              <div><span className="text-sentinel-textMuted">recovery at</span> <span className="tabular">{inspectedCitizen.recoveryAt > 0 ? inspectedCitizen.recoveryAt.toFixed(1) : '—'}</span></div>
+              <div><span className="text-sentinel-textMuted">sim time</span> <span className="tabular">{inspectedCitizen.simTimeS.toFixed(1)}</span></div>
+              <div><span className="text-sentinel-textMuted">reports logged</span> <span className="tabular">{inspectedCitizen.reportLogSize}</span></div>
             </div>
-            <div className="px-3 pb-2 pt-1 text-[10px] text-zinc-600 border-t border-zinc-800">
+            <div className="px-3 pb-2 pt-1 text-[10px] text-sentinel-textMuted border-t border-white/[0.04]">
               snapshot at click — not live. click again to refresh.
             </div>
           </div>
         )}
 
         {/* Sim status + speed slider (bottom-left of map area) */}
-        <div className="absolute bottom-4 left-4 z-30 bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md px-3 py-2 text-[11px] text-zinc-400 min-w-[260px]">
+        <div
+          role="region"
+          aria-label="Simulation status"
+          className="absolute bottom-4 left-4 z-30 glass rounded-xl px-3.5 py-2.5 text-[11px] text-sentinel-textDim min-w-[280px]"
+        >
           <div className="flex items-center gap-2 mb-2">
-            <span
-              className={[
-                'w-1.5 h-1.5 rounded-full shrink-0',
-                simReady ? 'bg-emerald-500' : 'bg-amber-400 animate-pulse',
-              ].join(' ')}
-            />
+            <span className="relative flex h-1.5 w-1.5 shrink-0">
+              {!simReady && (
+                <span className="absolute inset-0 rounded-full bg-sentinel-warn animate-ping opacity-70" />
+              )}
+              <span className={[
+                'relative inline-flex rounded-full h-1.5 w-1.5',
+                simReady ? 'bg-sentinel-safe' : 'bg-sentinel-warn',
+              ].join(' ')} />
+            </span>
             <span className="truncate">
               {simStatus}
               {simReady && (
                 <>
                   {' · '}
-                  <span className="tabular-nums text-zinc-200">{citizenCount}</span> citizens active
+                  <AnimatedCounter
+                    value={citizenCount}
+                    className="text-sentinel-text font-medium"
+                  /> citizens active
                 </>
               )}
             </span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[10px] text-zinc-500 shrink-0 w-10">Speed</span>
+            <span className="text-[10px] text-sentinel-textMuted shrink-0 w-10">Speed</span>
             <input
               type="range"
               min={0}
@@ -2366,38 +2652,52 @@ export default function DisasterDashboard() {
               value={simSpeed}
               onChange={(e) => setSimSpeed(Number(e.target.value))}
               disabled={!simReady}
+              aria-label="Simulation speed"
+              aria-valuetext={simSpeed === 0 ? 'Paused' : `${simSpeed} times`}
               className="flex-1"
               style={{
                 '--range-pct': `${(simSpeed / 8) * 100}%`,
-                '--range-color': simSpeed === 0 ? '#71717a' : '#fafafa',
+                '--range-color': simSpeed === 0 ? '#6b82a8' : '#22d3ee',
               }}
             />
-            <span className="text-[10px] text-zinc-300 tabular-nums w-12 text-right shrink-0">
+            <span className="text-[10px] text-sentinel-text tabular w-12 text-right shrink-0 font-medium">
               {simSpeed === 0 ? 'Paused' : `${simSpeed}×`}
             </span>
           </div>
         </div>
 
+        <MapLegend open={legendOpen} onOpenChange={setLegendOpen} />
+
         {/* Floating 911 calls button */}
         <button
           onClick={() => setDrawerOpen((v) => !v)}
-          className={[
-            'absolute bottom-4 right-4 z-40 inline-flex items-center gap-2 px-4 py-2 rounded-full text-[12px] font-medium transition-colors',
-            'bg-zinc-900/95 backdrop-blur border border-zinc-800 text-zinc-100 hover:border-zinc-600 shadow-lg shadow-black/50',
-            drawerOpen ? 'ring-2 ring-amber-500/60' : '',
-          ].join(' ')}
+          aria-expanded={drawerOpen}
+          aria-controls="calls-drawer"
+          aria-label={`${drawerOpen ? 'Close' : 'Open'} 911 calls panel, ${citizenReports.length} calls`}
           title={drawerOpen ? 'Close 911 calls' : 'Open 911 calls'}
+          className={[
+            'group absolute bottom-4 right-4 z-40 inline-flex items-center gap-2.5 px-4 py-2.5 rounded-full text-[12px] font-medium transition-all',
+            'glass-strong text-sentinel-text',
+            drawerOpen
+              ? 'border-sentinel-accent/60 shadow-glow-accent'
+              : 'hover:border-sentinel-info/40 hover:shadow-glow',
+          ].join(' ')}
         >
-          <span className="text-base leading-none">📞</span>
-          <span className="tabular-nums">{citizenReports.length}</span>
-          <span className="text-zinc-500">calls</span>
+          <span className="text-base leading-none transition-transform group-hover:scale-110" aria-hidden>📞</span>
+          <AnimatedCounter
+            value={citizenReports.length}
+            className="text-sentinel-text font-semibold"
+          />
+          <span className="text-sentinel-textMuted">calls</span>
         </button>
 
-        <AILogsDrawer
-          open={aiLogsOpen}
-          onClose={() => setAiLogsOpen(false)}
-          backendUrl={BACKEND_URL}
-        />
+        <Suspense fallback={null}>
+          <AILogsDrawer
+            open={aiLogsOpen}
+            onClose={() => setAiLogsOpen(false)}
+            backendUrl={BACKEND_URL}
+          />
+        </Suspense>
 
         <CallsDrawer
           open={drawerOpen}
@@ -2413,28 +2713,33 @@ export default function DisasterDashboard() {
         {/* Right-click crime menu (operator triggers a robbery on a citizen). */}
         {crimeMenu && (
           <div
-            className="fixed z-[1000] bg-zinc-900/97 backdrop-blur border border-zinc-700 rounded-md shadow-xl py-1 text-[11px] text-zinc-100"
+            role="menu"
+            aria-label={`Crime menu for citizen ${crimeMenu.citizenIdx}`}
+            className="fixed z-[1000] glass-strong rounded-xl py-1.5 text-[11px] text-sentinel-text overflow-hidden min-w-[200px]"
             style={{ left: crimeMenu.x + 4, top: crimeMenu.y + 4 }}
             onClick={(e) => e.stopPropagation()}
             onContextMenu={(e) => e.preventDefault()}
           >
-            <div className="px-3 py-1 text-zinc-500 text-[10px] uppercase tracking-wide">
+            <div className="px-3 py-1.5 text-sentinel-textMuted text-[10px] uppercase tracking-[0.12em] border-b border-white/[0.04]">
               Citizen #{crimeMenu.citizenIdx}
             </div>
             <button
-              className="w-full text-left px-3 py-1.5 hover:bg-amber-500/20 hover:text-amber-200"
+              role="menuitem"
+              className="w-full text-left px-3 py-2 hover:bg-sentinel-warn/15 hover:text-sentinel-warn transition-colors"
               onClick={() => handleTriggerRobbery(1)}
             >
               💰 Trigger Robbery (L1 – pickpocket)
             </button>
             <button
-              className="w-full text-left px-3 py-1.5 hover:bg-red-500/20 hover:text-red-200"
+              role="menuitem"
+              className="w-full text-left px-3 py-2 hover:bg-sentinel-danger/15 hover:text-sentinel-danger transition-colors"
               onClick={() => handleTriggerRobbery(2)}
             >
               🔫 Trigger Robbery (L2 – armed)
             </button>
             <button
-              className="w-full text-left px-3 py-1.5 text-zinc-500 hover:text-zinc-300"
+              role="menuitem"
+              className="w-full text-left px-3 py-2 text-sentinel-textMuted hover:text-sentinel-text hover:bg-white/[0.04] transition-colors border-t border-white/[0.04]"
               onClick={() => setCrimeMenu(null)}
             >
               Cancel
@@ -2442,14 +2747,56 @@ export default function DisasterDashboard() {
           </div>
         )}
       </main>
+
+      {/* Focus mode pill — visible only when sidebar is hidden, lets user exit. */}
+      {focusMode && (
+        <motion.button
+          initial={{ opacity: 0, x: -8 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: -8 }}
+          onClick={() => setFocusMode(false)}
+          aria-label="Exit focus mode (or press F)"
+          title="Exit focus mode (F)"
+          className="absolute top-4 left-4 z-50 glass inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-[11px] text-sentinel-info hover:shadow-glow transition-all"
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
+          Show sidebar
+          <kbd className="font-mono text-[10px] px-1 py-0.5 rounded bg-white/[0.06] border border-white/[0.08]">F</kbd>
+        </motion.button>
+      )}
+
+      {/* Keyboard shortcuts help overlay (toggle: ?) */}
+      <KeyboardShortcutsHelp open={helpOpen} onClose={() => setHelpOpen(false)} />
+
+      {/* Command palette (Cmd+K / Ctrl+K) */}
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        commands={paletteCommands}
+      />
+
+      {/* Subtle help-hint at the bottom-right corner (auto-hides after focus interaction). */}
+      <button
+        onClick={() => setHelpOpen(true)}
+        aria-label="Open keyboard shortcuts (?)"
+        title="Keyboard shortcuts (?)"
+        className="fixed bottom-4 right-[3.75rem] z-30 glass w-9 h-9 rounded-lg inline-flex items-center justify-center text-sentinel-textMuted hover:text-sentinel-info hover:shadow-glow transition-all"
+      >
+        <span className="font-mono text-[14px] font-semibold">?</span>
+      </button>
     </div>
   )
 }
 
 function SectionLabel({ children, className = '' }) {
   return (
-    <h2 className={`text-[12px] font-medium text-zinc-300 mb-2.5 ${className}`}>
-      {children}
+    <h2 className={`text-[10px] font-semibold uppercase tracking-[0.14em] text-sentinel-info/80 mb-2.5 ${className}`}>
+      <span className="inline-flex items-center gap-2">
+        <span className="w-1 h-1 rounded-full bg-sentinel-info shadow-glow" aria-hidden="true" />
+        {children}
+      </span>
     </h2>
   )
 }
@@ -2473,7 +2820,7 @@ function ZoneList({ zones, onRemove, onStartNesting, nestingParentId }) {
               isNestingTarget={z.id === nestingParentId}
             />
             {children.length > 0 && (
-              <div className="ml-3 pl-2 border-l border-zinc-800 space-y-1.5">
+              <div className="ml-3 pl-2 border-l border-white/[0.05] space-y-1.5">
                 {children.map((c) => (
                   <ZoneCard
                     key={c.id}
@@ -2493,7 +2840,7 @@ function ZoneList({ zones, onRemove, onStartNesting, nestingParentId }) {
   )
 }
 
-function ZoneCard({ zone: z, onRemove, onStartNesting, isNestingTarget, isChild }) {
+const ZoneCard = memo(function ZoneCard({ zone: z, onRemove, onStartNesting, isNestingTarget, isChild }) {
   const kindLabel =
     z.geometryKind === 'city'
       ? 'Citywide'
@@ -2511,26 +2858,26 @@ function ZoneCard({ zone: z, onRemove, onStartNesting, isNestingTarget, isChild 
   return (
     <div
       className={[
-        'pl-2 pr-1.5 py-2 rounded-md border bg-zinc-900',
-        isNestingTarget ? 'border-amber-500/60' : 'border-zinc-800',
+        'pl-2 pr-1.5 py-2 rounded-md border bg-white/[0.02]',
+        isNestingTarget ? 'border-amber-500/60' : 'border-white/[0.05]',
       ].join(' ')}
     >
       <div className="flex items-center gap-2.5">
         <span className="w-1 h-8 rounded-full shrink-0" style={{ background: z.color }} />
         <span className="text-base leading-none shrink-0">{z.typeIcon}</span>
         <div className="flex-1 min-w-0">
-          <div className="text-[12px] text-zinc-200 truncate font-medium">
+          <div className="text-[12px] text-sentinel-text truncate font-medium">
             {z.typeLabel}
-            {isChild && <span className="text-zinc-600 ml-1.5">(spread)</span>}
+            {isChild && <span className="text-sentinel-textMuted ml-1.5">(spread)</span>}
           </div>
-          <div className="text-[10px] text-zinc-500 tabular-nums flex items-center gap-1.5">
+          <div className="text-[10px] text-sentinel-textMuted tabular-nums flex items-center gap-1.5">
             <span>Sev {z.severity} · {kindLabel}</span>
             <span
               className={[
                 'px-1.5 py-0.5 rounded text-[9px] font-medium uppercase tracking-wide',
                 z.status === 'active'
                   ? 'bg-red-500/20 text-red-300'
-                  : 'bg-zinc-700/60 text-zinc-300',
+                  : 'bg-white/[0.08] text-sentinel-text',
               ].join(' ')}
             >
               {z.status === 'active' ? 'Active' : 'Draft'}
@@ -2539,7 +2886,7 @@ function ZoneCard({ zone: z, onRemove, onStartNesting, isNestingTarget, isChild 
         </div>
         <button
           onClick={() => onRemove(z.id)}
-          className="text-zinc-600 hover:text-red-400 text-[16px] leading-none w-6 h-6 flex items-center justify-center rounded transition-colors"
+          className="text-sentinel-textMuted hover:text-red-400 text-[16px] leading-none w-6 h-6 flex items-center justify-center rounded transition-colors"
           title="Remove zone"
         >
           ×
@@ -2547,7 +2894,7 @@ function ZoneCard({ zone: z, onRemove, onStartNesting, isNestingTarget, isChild 
       </div>
       {isBuilding && escaping != null && (
         <div className="mt-1.5 pl-3 text-[10px] flex items-center gap-3 tabular-nums">
-          <span className="text-zinc-500">{z.peopleInside} inside</span>
+          <span className="text-sentinel-textMuted">{z.peopleInside} inside</span>
           <span className="text-emerald-400">{escaping} out</span>
           <span className="text-red-400">{trapped} trapped</span>
         </div>
@@ -2557,7 +2904,7 @@ function ZoneCard({ zone: z, onRemove, onStartNesting, isNestingTarget, isChild 
           <button
             onClick={() => onStartNesting(z.id)}
             disabled={isNestingTarget}
-            className="text-[10px] text-amber-400 hover:text-amber-300 disabled:text-zinc-600 disabled:cursor-not-allowed"
+            className="text-[10px] text-amber-400 hover:text-amber-300 disabled:text-sentinel-textMuted disabled:cursor-not-allowed"
           >
             {isNestingTarget ? '✓ Awaiting placement on map' : '+ Spread to neighbour'}
           </button>
@@ -2565,20 +2912,27 @@ function ZoneCard({ zone: z, onRemove, onStartNesting, isNestingTarget, isChild 
       )}
     </div>
   )
-}
+})
 
 function Segmented({ value, onChange, options }) {
   return (
-    <div className="inline-flex items-center bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md p-0.5">
+    <div
+      role="radiogroup"
+      className="glass inline-flex items-center rounded-lg p-0.5 gap-0.5"
+    >
       {options.map((o) => {
         const sel = value === o.value
         return (
           <button
             key={o.value}
             onClick={() => onChange(o.value)}
+            role="radio"
+            aria-checked={sel}
             className={[
-              'px-2.5 py-1 text-[12px] rounded transition-colors',
-              sel ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300',
+              'px-2.5 py-1 text-[12px] rounded-md transition-all',
+              sel
+                ? 'bg-sentinel-info/20 text-sentinel-info shadow-[inset_0_0_0_1px_rgba(34,211,238,0.3)]'
+                : 'text-sentinel-textDim hover:text-sentinel-text hover:bg-white/[0.04]',
             ].join(' ')}
           >
             {o.label}
@@ -2589,20 +2943,20 @@ function Segmented({ value, onChange, options }) {
   )
 }
 
-function LogRow({ entry }) {
+const LogRow = memo(function LogRow({ entry }) {
   const dot =
     {
-      success: 'bg-emerald-500',
-      error: 'bg-red-500',
-      info: 'bg-zinc-500',
-      pending: 'bg-amber-500',
-    }[entry.type] || 'bg-zinc-500'
+      success: 'bg-sentinel-safe',
+      error: 'bg-sentinel-danger',
+      info: 'bg-sentinel-info',
+      pending: 'bg-sentinel-warn',
+    }[entry.type] || 'bg-sentinel-textMuted'
 
   return (
     <div className="flex items-start gap-2 text-[11px] leading-relaxed">
       <span className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${dot}`} />
-      <span className="font-mono text-zinc-600 shrink-0">{entry.time}</span>
-      <span className="text-zinc-300 break-words">{entry.message}</span>
+      <span className="font-mono text-sentinel-textMuted shrink-0">{entry.time}</span>
+      <span className="text-sentinel-text break-words">{entry.message}</span>
     </div>
   )
-}
+})

@@ -2,7 +2,7 @@
 // accessible pressable. `accent` paints a 4px left status stripe (severity/role).
 
 import React, { useRef } from 'react';
-import { Animated, Pressable, StyleSheet, View, ViewStyle } from 'react-native';
+import { Animated, Pressable, StyleProp, StyleSheet, View, ViewStyle } from 'react-native';
 import { useTheme } from '@/theme/ThemeProvider';
 
 type Props = {
@@ -11,7 +11,8 @@ type Props = {
   accent?: string;
   elevation?: 0 | 1 | 2 | 3;
   padded?: boolean;
-  style?: ViewStyle;
+  // Accept a single style or an array, like a normal RN View.
+  style?: StyleProp<ViewStyle>;
   accessibilityLabel?: string;
   accessibilityHint?: string;
 };
