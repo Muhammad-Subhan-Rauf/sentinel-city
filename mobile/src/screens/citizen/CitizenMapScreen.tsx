@@ -9,8 +9,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AccessibilityInfo, ActivityIndicator, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DisasterMap } from '@/components/DisasterMap';
 import { DestinationSearch } from '@/components/DestinationSearch';
+import { DisasterDetailModal } from '@/components/DisasterDetailModal';
 import { api, fetchRoute, MobileCitizen, Notification, Cordon, Route, Disaster } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
@@ -66,6 +68,25 @@ export default function CitizenMapScreen() {
   const [disasters, setDisasters] = useState<Disaster[]>([]);
   const avoidSignature = useRef<string>('');
 
+  // Tap-a-zone detail sheet.
+  const [zoneModalOpen, setZoneModalOpen] = useState(false);
+  const [zoneLoading, setZoneLoading] = useState(false);
+  const [zoneDisaster, setZoneDisaster] = useState<Disaster | null>(null);
+  const [zoneFallback, setZoneFallback] = useState<string | null>(null);
+  const [zoneError, setZoneError] = useState<string | null>(null);
+
+  // One-time hint: "tap the map to set a destination" shows until the user sets
+  // their first destination, then is hidden for good so it stops eating space.
+  const ROUTED_KEY = 'sentinel.routed-hint.v1';
+  const [routedBefore, setRoutedBefore] = useState(true); // assume seen until storage loads (avoids a flash)
+  useEffect(() => {
+    AsyncStorage.getItem(ROUTED_KEY).then((v) => setRoutedBefore(v === '1')).catch(() => setRoutedBefore(true));
+  }, []);
+  const markRouted = useCallback(() => {
+    setRoutedBefore(true);
+    AsyncStorage.setItem(ROUTED_KEY, '1').catch(() => {});
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
@@ -88,6 +109,10 @@ export default function CitizenMapScreen() {
   const myLatLng: LatLng | null = me ? { lat: me.lat, lng: me.lng } : null;
   const insideDangers = useMemo(() => activeDangersContaining(myLatLng, disasters), [myLatLng, disasters]);
   const activeCount = disasters.filter((d) => d.status === 'active').length;
+
+  // The top search bar grows to a taller two-line "Destination" bar once a
+  // destination is set, so drop the hazard banner below it to avoid an overlap.
+  const bannerTop = insets.top + (destination ? 100 : 72);
 
   // Announce hazard entry for screen-reader users (once per entry) and signal
   // the tab bar so the centre SOS button pulses.
@@ -183,6 +208,7 @@ export default function CitizenMapScreen() {
     if (!myLatLng) return;
     const dest = { lat, lng };
     setDestination(dest);
+    markRouted();
     computeRoute(myLatLng, dest);
   };
 
@@ -190,6 +216,7 @@ export default function CitizenMapScreen() {
   const onSearchSelect = (p: { lat: number; lng: number }) => {
     const dest = { lat: p.lat, lng: p.lng };
     setDestination(dest);
+    markRouted();
     if (myLatLng) computeRoute(myLatLng, dest);
   };
 
@@ -203,9 +230,35 @@ export default function CitizenMapScreen() {
     setRouting(false);
   };
 
+  // Tap a hazard zone → show what it is, how severe, and any details.
+  const onPolygonPress = async (eventId: string | null, label: string) => {
+    setZoneModalOpen(true);
+    setZoneDisaster(null);
+    setZoneFallback(label);
+    setZoneError(null);
+    if (!eventId) {
+      setZoneLoading(false);
+      return;
+    }
+    setZoneLoading(true);
+    try {
+      setZoneDisaster(await api.getDisaster(eventId));
+    } catch (err) {
+      setZoneError(err instanceof Error ? err.message : 'Could not load zone details.');
+    } finally {
+      setZoneLoading(false);
+    }
+  };
+
   if (!session) return null;
 
   const worstSeverity = insideDangers.length ? Math.max(...insideDangers.map((d) => d.severity)) : 0;
+
+  // Lift the bottom-right legend only as much as the current bottom content
+  // needs: the full route panel (~88), the one-time hint pill (~56), or nothing
+  // (0) so the chip sits near the bottom instead of floating in mid-air.
+  const routePanelUp = !!(destination || routing || routeError);
+  const legendClearance = routePanelUp ? 88 : !routedBefore ? 56 : 0;
 
   return (
     <View style={{ flex: 1, backgroundColor: t.color.bg }}>
@@ -217,8 +270,9 @@ export default function CitizenMapScreen() {
         destination={destination}
         route={route}
         onMapPress={onMapPress}
+        onPolygonPress={onPolygonPress}
         onDisastersChange={setDisasters}
-        legendTop={insets.top + 128}
+        legendBottom={legendClearance}
       />
 
       {/* Destination search — pinned to the top, above the hazard banners.
@@ -230,7 +284,7 @@ export default function CitizenMapScreen() {
       {/* In-zone DANGER banner */}
       {insideDangers.length > 0 && (
         <View
-          style={[styles.topBanner, { top: insets.top + 72, backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]}
+          style={[styles.topBanner, { top: bannerTop, backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]}
           accessibilityRole="alert"
         >
           <Icon name="alert" size={22} color={t.color.onDanger} />
@@ -248,7 +302,7 @@ export default function CitizenMapScreen() {
 
       {/* Advisory banner — hazards nearby but not on you */}
       {insideDangers.length === 0 && activeCount > 0 && (
-        <View style={[styles.topBanner, { top: insets.top + 72, backgroundColor: t.color.warning, borderRadius: t.radius.lg, ...t.shadow(2) }]}>
+        <View style={[styles.topBanner, { top: bannerTop, backgroundColor: t.color.warning, borderRadius: t.radius.lg, ...t.shadow(2) }]}>
           <Icon name="alert" size={20} color={t.color.alwaysWhite} />
           <Text variant="bodyStrong" color={t.color.alwaysWhite} style={{ flex: 1, marginLeft: t.spacing.md }}>
             {activeCount} active danger zone{activeCount === 1 ? '' : 's'} nearby — stay clear of red areas
@@ -259,35 +313,57 @@ export default function CitizenMapScreen() {
       {/* When inside a zone, the centre SOS button in the tab bar pulses red
           (see CitizenTabBar + dangerSignal) — no extra button is drawn here. */}
 
-      {/* Destination / route panel */}
-      <Card style={styles.routePanel} elevation={2}>
-        <View style={{ flex: 1 }}>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-            <Icon name={destination ? 'route' : 'location'} size={16} color={t.color.primary} />
-            <Text variant="bodyStrong" style={{ flex: 1 }}>
-              {destination ? 'Safe route set' : 'Search above or tap the map to set a destination'}
-            </Text>
-          </View>
-          {route && !routing && (
-            <Text variant="caption" tone="secondary" style={{ marginTop: 4 }}>
-              {route.distanceKm.toFixed(1)} km · ~{Math.round(route.durationMin)} min · avoiding active hazards
-            </Text>
-          )}
-          {routing && (
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
-              <ActivityIndicator color={t.color.primary} size="small" />
-              <Text variant="caption" tone="secondary">
-                Calculating safer path…
+      {/* Route panel — shown only while a route is active. The "tap to set a
+          destination" hint shows once (until the first route is set) then is
+          hidden for good, so it doesn't permanently eat the bottom of the map. */}
+      {destination || routing || routeError ? (
+        <Card style={styles.routePanel} elevation={2}>
+          <View style={{ flex: 1 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <Icon name="route" size={16} color={t.color.primary} />
+              <Text variant="bodyStrong" style={{ flex: 1 }}>
+                Safe route set
               </Text>
             </View>
-          )}
-          {routeError && (
-            <Text variant="caption" tone="danger" style={{ marginTop: 4 }}>
-              {routeError}
+            {route && !routing && (
+              <Text variant="caption" tone="secondary" style={{ marginTop: 4 }}>
+                {route.distanceKm.toFixed(1)} km · ~{Math.round(route.durationMin)} min · avoiding active hazards
+              </Text>
+            )}
+            {routing && (
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                <ActivityIndicator color={t.color.primary} size="small" />
+                <Text variant="caption" tone="secondary">
+                  Calculating safer path…
+                </Text>
+              </View>
+            )}
+            {routeError && (
+              <Text variant="caption" tone="danger" style={{ marginTop: 4 }}>
+                {routeError}
+              </Text>
+            )}
+          </View>
+        </Card>
+      ) : !routedBefore ? (
+        <View style={[styles.hintWrap, { bottom: insets.bottom + 24 }]} pointerEvents="none">
+          <View style={[styles.hintPill, { backgroundColor: t.color.surface, borderColor: t.color.border, borderRadius: t.radius.pill, ...t.shadow(1) }]}>
+            <Icon name="location" size={14} color={t.color.primary} />
+            <Text variant="caption" tone="secondary" numberOfLines={1}>
+              Tap the map or search to set a destination
             </Text>
-          )}
+          </View>
         </View>
-      </Card>
+      ) : null}
+
+      <DisasterDetailModal
+        visible={zoneModalOpen}
+        loading={zoneLoading}
+        disaster={zoneDisaster}
+        fallbackLabel={zoneFallback}
+        error={zoneError}
+        onClose={() => setZoneModalOpen(false)}
+      />
     </View>
   );
 }
@@ -316,4 +392,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 12,
   },
+  hintWrap: { position: 'absolute', left: 0, right: 0, alignItems: 'center' },
+  hintPill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, paddingHorizontal: 14, borderWidth: 1, maxWidth: '90%' },
 });

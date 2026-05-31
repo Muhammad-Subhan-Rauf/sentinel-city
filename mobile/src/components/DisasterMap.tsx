@@ -11,7 +11,8 @@ import { WebView } from 'react-native-webview';
 import type { WebView as WebViewType } from 'react-native-webview';
 import { api, MobileCitizen, StationPoint, Notification, Cordon, Route, Disaster, WorkerSubRole } from '@/lib/api';
 import { useTheme } from '@/theme';
-import { disasterRing } from '@/lib/geo';
+import { disasterRing, geometryCentroid } from '@/lib/geo';
+import { disasterColor, disasterEmoji, disasterLabel } from '@/lib/disasterMeta';
 import { MapLegend } from './MapLegend';
 
 const MANHATTAN = { lat: 40.758, lng: -73.9855 };
@@ -30,8 +31,9 @@ type Props = {
   onPolygonPress?: (eventId: string | null, label: string) => void;
   pins?: DisasterMapPin[];
   onDisastersChange?: (disasters: Disaster[]) => void;
-  /** Top offset for the floating legend so it clears each screen's chrome. */
-  legendTop?: number;
+  /** Extra px to lift the bottom-right legend above this screen's own bottom
+   *  panel (route / dispatch card) so the chip never collides with it. */
+  legendBottom?: number;
 };
 
 type PolygonItem = {
@@ -60,8 +62,15 @@ function buildLeafletHtml(p: MapPalette): string {
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
   html, body, #map { height: 100%; margin: 0; padding: 0; background: ${p.bg}; }
-  .me-dot { width: 18px; height: 18px; border-radius: 50%; border: 3px solid #fff; box-shadow: 0 0 0 4px rgba(255,255,255,0.25); }
-  .pin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid ${p.pinBorder}; box-shadow: 0 0 6px rgba(0,0,0,0.5); }
+  /* --mscale is updated on every zoom so markers shrink as you zoom out
+     instead of staying huge over the whole city. transform-origin keeps them
+     pinned to their anchor point. */
+  .me-dot { width: 18px; height: 18px; border-radius: 50%; border: 3px solid #fff; box-shadow: 0 0 0 4px rgba(255,255,255,0.25); transform: scale(var(--mscale,1)); transform-origin: center; }
+  .pin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid ${p.pinBorder}; box-shadow: 0 0 6px rgba(0,0,0,0.5); transform: scale(var(--mscale,1)); transform-origin: center; }
+  .station-ico { font-size: 20px; line-height: 20px; text-shadow: 0 1px 2px #000; display: inline-block; transform: scale(var(--mscale,1)); transform-origin: center; }
+  /* Emoji chip dropped at a disaster's centroid so its TYPE is readable on the
+     map without tapping. Non-interactive so taps fall through to the zone. */
+  .disaster-ico { font-size: 16px; line-height: 26px; width: 26px; height: 26px; text-align: center; border-radius: 50%; background: rgba(10,14,23,0.6); box-shadow: 0 0 0 1.5px rgba(255,255,255,0.45); transform: scale(var(--mscale,1)); transform-origin: center; }
 </style>
 </head>
 <body>
@@ -74,7 +83,20 @@ function buildLeafletHtml(p: MapPalette): string {
   L.tileLayer('${p.tiles}', { subdomains: 'abcd', maxZoom: 20, keepBuffer: 8 }).addTo(map);
   map.on('click', function (e) { post({ type: 'press', lat: e.latlng.lat, lng: e.latlng.lng }); });
 
+  // Scale markers with zoom: full size at street zoom (>=14), shrinking as the
+  // map zooms out so icons don't blanket the whole city. Capped at 1 so they
+  // never balloon when zoomed in.
+  function applyMarkerScale() {
+    var z = map.getZoom();
+    var s = Math.max(0.4, Math.min(1, (z - 9) / 5));
+    document.documentElement.style.setProperty('--mscale', String(s));
+  }
+  map.on('zoom', applyMarkerScale);
+  map.on('zoomend', applyMarkerScale);
+  applyMarkerScale();
+
   var polygonLayer = L.layerGroup().addTo(map);
+  var labelLayer = L.layerGroup().addTo(map);
   var stationLayer = L.layerGroup().addTo(map);
   var pinLayer = L.layerGroup().addTo(map);
   var otherUserLayer = L.layerGroup().addTo(map);
@@ -87,7 +109,10 @@ function buildLeafletHtml(p: MapPalette): string {
   // (🚒 fire · 🏥 hospital · 🚓 police) with the station name as a tooltip.
   var STATION_EMOJI = { fire: '🚒', hospital: '🏥', police: '🚓' };
   function makeStationIcon(kind) {
-    return L.divIcon({ className: '', html: '<div style="font-size:20px;line-height:20px;text-shadow:0 1px 2px #000;">' + (STATION_EMOJI[kind] || '📍') + '</div>', iconSize: [24, 24], iconAnchor: [12, 12] });
+    return L.divIcon({ className: '', html: '<div class="station-ico">' + (STATION_EMOJI[kind] || '📍') + '</div>', iconSize: [24, 24], iconAnchor: [12, 12] });
+  }
+  function makeDisasterIcon(emoji) {
+    return L.divIcon({ className: '', html: '<div class="disaster-ico">' + emoji + '</div>', iconSize: [26, 26], iconAnchor: [13, 13] });
   }
   function makePinIcon(color) {
     return L.divIcon({ className: '', html: '<div class="pin" style="background:' + color + '"></div>', iconSize: [14, 14], iconAnchor: [7, 7] });
@@ -105,6 +130,13 @@ function buildLeafletHtml(p: MapPalette): string {
         var poly = L.polygon(latlngs, { color: pg.color, weight: 2, fillColor: pg.color, fillOpacity: pg.fillOpacity, dashArray: pg.dashArray || undefined });
         poly.on('click', function (ev) { L.DomEvent.stopPropagation(ev); post({ type: 'polygonPress', eventId: pg.eventId, label: pg.label }); });
         poly.addTo(polygonLayer);
+      });
+
+      // Disaster type-emoji chips at each zone centroid (non-interactive → taps
+      // pass through to the polygon so the detail sheet still opens).
+      labelLayer.clearLayers();
+      (state.disasterLabels || []).forEach(function (d) {
+        L.marker([d.lat, d.lng], { icon: makeDisasterIcon(d.emoji), interactive: false, keyboard: false }).addTo(labelLayer);
       });
 
       stationLayer.clearLayers();
@@ -155,7 +187,7 @@ export function DisasterMap({
   onPolygonPress,
   pins,
   onDisastersChange,
-  legendTop,
+  legendBottom,
 }: Props) {
   const t = useTheme();
   const webviewRef = useRef<WebViewType | null>(null);
@@ -234,7 +266,9 @@ export function DisasterMap({
       if (d.status !== 'active') continue;
       const ring = disasterRing(d.area_geometry, d.severity);
       if (ring.length < 3) continue;
-      merged.push({ id: `d-${d.id}`, ring, color: t.color.danger, fillOpacity: 0.22, label: `${d.disaster_type.replace('_', ' ')} · severity ${d.severity}`, eventId: d.id });
+      // Color each disaster by TYPE (synced with the web console) so the map
+      // reads "what happened where" at a glance, not just "a hazard".
+      merged.push({ id: `d-${d.id}`, ring, color: disasterColor(d.disaster_type), fillOpacity: 0.25, label: `${disasterLabel(d.disaster_type)} · severity ${d.severity}`, eventId: d.id });
     }
     for (const n of notifs) {
       const ring = polygonToRing(n.geometry);
@@ -246,6 +280,14 @@ export function DisasterMap({
     }
     return merged;
   }, [notifs, cordons, disasters, t.color.danger, t.color.hazardNotification, t.color.hazardCordon]);
+
+  // Distinct active disaster TYPES (with zone counts) for the legend, so it
+  // lists exactly what's on the map right now — color + emoji per type.
+  const disasterTypeCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const d of disasters) if (d.status === 'active') counts.set(d.disaster_type, (counts.get(d.disaster_type) ?? 0) + 1);
+    return [...counts.entries()].map(([type, count]) => ({ type, count }));
+  }, [disasters]);
 
   useEffect(() => {
     if (!ready) return;
@@ -265,9 +307,19 @@ export function DisasterMap({
       ...policeStations.map((s) => ({ lat: s.lat, lng: s.lng, kind: 'police', label: s.name ?? 'Police station' })),
     ];
 
+    // One type-emoji chip per active disaster, dropped at its centroid.
+    const disasterLabels = disasters
+      .filter((d) => d.status === 'active')
+      .map((d) => {
+        const c = geometryCentroid(d.area_geometry);
+        return c ? { lat: c.lat, lng: c.lng, emoji: disasterEmoji(d.disaster_type) } : null;
+      })
+      .filter(Boolean);
+
     const state = {
       polygons,
       stations,
+      disasterLabels,
       pins: pins ?? [],
       otherUsers,
       destination: destination ?? null,
@@ -307,12 +359,13 @@ export function DisasterMap({
       <MapLegend
         myRole={myRole}
         mySubRole={mySubRole}
-        topOffset={legendTop}
+        bottomOffset={legendBottom}
         showOtherUsers={showOtherUsers}
         hasDestination={!!destination}
         hasRoute={!!(route && route.coordinates.length > 1)}
         hasPins={!!(pins && pins.length > 0)}
         stationCounts={{ fire: fireStations.length, hospital: hospitals.length, police: policeStations.length }}
+        disasterTypes={disasterTypeCounts}
         citizenCount={citizens.filter((c) => c.id !== myUserId).length}
         stats={{ dangerZones: disasters.filter((d) => d.status === 'active').length, advisories: notifs.length, cordons: cordons.length }}
       />

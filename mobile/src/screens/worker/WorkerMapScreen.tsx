@@ -233,7 +233,7 @@ export default function WorkerMapScreen() {
         route={route}
         onMapPress={onMapPress}
         onPolygonPress={onPolygonPress}
-        legendTop={insets.top + (dispatchTarget ? 128 : 64)}
+        legendBottom={88}
       />
 
       {/* Destination search — type/choose a place to route to, just like citizens.
