@@ -3,7 +3,7 @@
 //   - Admins: identity card + sign-out only (no map; admins have no position)
 
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LeafletPicker } from '@/components/LeafletPicker';
 import { useAuth } from '@/lib/auth';
@@ -11,6 +11,8 @@ import { api } from '@/lib/api';
 import { useTheme } from '@/theme';
 import { Text, Card, Button, IconBadge, Badge, Icon, SectionHeader, IconName } from '@/components/ui';
 import { PlaceLabel } from '@/lib/geocode';
+import { ProfileModal } from '@/components/ProfileModal';
+import { profileRoleKind } from '@/lib/profile';
 
 const MANHATTAN = { lat: 40.758, lng: -73.9855 };
 
@@ -25,9 +27,11 @@ export default function SettingsScreen() {
   const [pin, setPin] = useState<{ lat: number; lng: number } | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
 
   const role = session?.role;
   const isField = role === 'citizen' || role === 'worker';
+  const profileKind = profileRoleKind(session); // 'civilian' | 'responder' | 'none'
 
   const accent =
     role === 'citizen'
@@ -102,7 +106,12 @@ export default function SettingsScreen() {
         Settings
       </Text>
 
-      <View style={{ flex: 1, paddingHorizontal: t.spacing.lg }}>
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={{ paddingHorizontal: t.spacing.lg, paddingBottom: t.spacing.xl }}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled"
+      >
         <Card style={{ marginBottom: t.spacing.lg }}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: t.spacing.md }}>
             <IconBadge name={roleIcon} color={accent} size={52} iconSize={26} />
@@ -118,10 +127,32 @@ export default function SettingsScreen() {
           </View>
         </Card>
 
+        {profileKind !== 'none' && (
+          <Card
+            onPress={() => setProfileOpen(true)}
+            style={{ marginBottom: t.spacing.lg }}
+            accessibilityLabel="Manage profile"
+            accessibilityHint={profileKind === 'civilian' ? 'Edit the emergency info shared with 911' : 'Edit your service details'}
+          >
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: t.spacing.md }}>
+              <IconBadge name={profileKind === 'civilian' ? 'person' : roleIcon} color={accent} size={44} />
+              <View style={{ flex: 1 }}>
+                <Text variant="h3">Manage profile</Text>
+                <Text variant="caption" tone="secondary" style={{ marginTop: 2 }}>
+                  {profileKind === 'civilian'
+                    ? 'Vitals, medical info & emergency contact — shared with 911 when you call'
+                    : 'Badge, unit & service details shown to dispatch'}
+                </Text>
+              </View>
+              <Icon name="chevronRight" size={20} color={t.color.textMuted} />
+            </View>
+          </Card>
+        )}
+
         {isField && (
           <>
             <SectionHeader title="Your location" hint="Drag the pin or tap the map to update where alerts reach you." />
-            <Card padded={false} style={{ overflow: 'hidden', flex: 1, marginBottom: t.spacing.md }}>
+            <Card padded={false} style={{ overflow: 'hidden', height: 340, marginBottom: t.spacing.md }}>
               {pin ? (
                 <LeafletPicker
                   pin={pin}
@@ -132,7 +163,7 @@ export default function SettingsScreen() {
                   }}
                 />
               ) : (
-                <View style={{ flex: 1, minHeight: 220, alignItems: 'center', justifyContent: 'center' }}>
+                <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
                   <ActivityIndicator color={t.color.primary} />
                 </View>
               )}
@@ -166,17 +197,27 @@ export default function SettingsScreen() {
           </>
         )}
 
-        {!isField && <View style={{ flex: 1 }} />}
-
-        <View style={styles.appearanceRow}>
+        <View style={[styles.appearanceRow, { marginTop: isField ? 4 : t.spacing.lg }]}>
           <Icon name={t.scheme === 'light' ? 'eye' : 'eye-off'} size={14} color={t.color.textMuted} />
           <Text variant="caption" tone="muted" style={{ marginLeft: 6 }}>
             Appearance follows your device ({t.scheme} mode)
           </Text>
         </View>
 
-        <Button label="Sign out" variant="danger" icon="signout" onPress={signOut} style={{ marginBottom: t.spacing.lg }} />
-      </View>
+        <Button label="Sign out" variant="danger" icon="signout" onPress={signOut} />
+      </ScrollView>
+
+      {profileKind !== 'none' && (
+        <ProfileModal
+          visible={profileOpen}
+          onClose={() => setProfileOpen(false)}
+          userId={session.userId}
+          kind={profileKind}
+          subRole={session.sub_role}
+          name={session.name}
+          accent={accent}
+        />
+      )}
     </SafeAreaView>
   );
 }
