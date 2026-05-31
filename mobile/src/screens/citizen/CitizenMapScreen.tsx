@@ -12,11 +12,12 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DisasterMap } from '@/components/DisasterMap';
 import { DestinationSearch } from '@/components/DestinationSearch';
+import { NavBanner } from '@/components/NavBanner';
 import { DisasterDetailModal } from '@/components/DisasterDetailModal';
 import { api, fetchRoute, MobileCitizen, Notification, Cordon, Route, Disaster } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
-import { Text, Card, Icon } from '@/components/ui';
+import { Text, Card, Button, Icon } from '@/components/ui';
 import { disasterRing, pointInPolygon, ringForValhallaAvoid } from '@/lib/geo';
 import { setInDangerZone } from '@/lib/dangerSignal';
 
@@ -66,6 +67,7 @@ export default function CitizenMapScreen() {
   const [routing, setRouting] = useState(false);
   const [routeError, setRouteError] = useState<string | null>(null);
   const [disasters, setDisasters] = useState<Disaster[]>([]);
+  const [navigating, setNavigating] = useState(false);
   const avoidSignature = useRef<string>('');
 
   // Tap-a-zone detail sheet.
@@ -197,7 +199,7 @@ export default function CitizenMapScreen() {
         /* ignore */
       }
     };
-    const handle = setInterval(tick, 2000);
+    const handle = setInterval(tick, 5000);
     return () => {
       cancelled = true;
       clearInterval(handle);
@@ -228,6 +230,7 @@ export default function CitizenMapScreen() {
     setRoute(null);
     setRouteError(null);
     setRouting(false);
+    setNavigating(false);
   };
 
   // Tap a hazard zone → show what it is, how severe, and any details.
@@ -273,16 +276,20 @@ export default function CitizenMapScreen() {
         onPolygonPress={onPolygonPress}
         onDisastersChange={setDisasters}
         legendBottom={legendClearance}
+        navMode={navigating}
       />
 
       {/* Destination search — pinned to the top, above the hazard banners.
-          Higher z-index so the autocomplete dropdown overlays everything. */}
-      <View style={[styles.searchWrap, { top: insets.top + 8, zIndex: 30 }]}>
-        <DestinationSearch focus={myLatLng} destination={destination} onSelect={onSearchSelect} onClear={clearRoute} />
-      </View>
+          Higher z-index so the autocomplete dropdown overlays everything.
+          Hidden during turn-by-turn so the nav banner owns the screen. */}
+      {!navigating && (
+        <View style={[styles.searchWrap, { top: insets.top + 8, zIndex: 30 }]}>
+          <DestinationSearch focus={myLatLng} destination={destination} onSelect={onSearchSelect} onClear={clearRoute} />
+        </View>
+      )}
 
       {/* In-zone DANGER banner */}
-      {insideDangers.length > 0 && (
+      {!navigating && insideDangers.length > 0 && (
         <View
           style={[styles.topBanner, { top: bannerTop, backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]}
           accessibilityRole="alert"
@@ -301,7 +308,7 @@ export default function CitizenMapScreen() {
       )}
 
       {/* Advisory banner — hazards nearby but not on you */}
-      {insideDangers.length === 0 && activeCount > 0 && (
+      {!navigating && insideDangers.length === 0 && activeCount > 0 && (
         <View style={[styles.topBanner, { top: bannerTop, backgroundColor: t.color.warning, borderRadius: t.radius.lg, ...t.shadow(2) }]}>
           <Icon name="alert" size={20} color={t.color.alwaysWhite} />
           <Text variant="bodyStrong" color={t.color.alwaysWhite} style={{ flex: 1, marginLeft: t.spacing.md }}>
@@ -316,7 +323,7 @@ export default function CitizenMapScreen() {
       {/* Route panel — shown only while a route is active. The "tap to set a
           destination" hint shows once (until the first route is set) then is
           hidden for good, so it doesn't permanently eat the bottom of the map. */}
-      {destination || routing || routeError ? (
+      {!navigating && (destination || routing || routeError) ? (
         <Card style={styles.routePanel} elevation={2}>
           <View style={{ flex: 1 }}>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
@@ -344,6 +351,9 @@ export default function CitizenMapScreen() {
               </Text>
             )}
           </View>
+          {route && !routing ? (
+            <Button label="Start" variant="primary" size="sm" icon="play" fullWidth={false} onPress={() => setNavigating(true)} />
+          ) : null}
         </Card>
       ) : !routedBefore ? (
         <View style={[styles.hintWrap, { bottom: insets.bottom + 24 }]} pointerEvents="none">
@@ -354,6 +364,11 @@ export default function CitizenMapScreen() {
             </Text>
           </View>
         </View>
+      ) : null}
+
+      {/* Turn-by-turn navigation overlay (zooms + follows via navMode above). */}
+      {navigating && route ? (
+        <NavBanner route={route} location={myLatLng} onEnd={() => setNavigating(false)} />
       ) : null}
 
       <DisasterDetailModal

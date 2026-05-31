@@ -14,10 +14,11 @@ import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
 import { Text, Card, Button, Badge, Icon, IconBadge, EmptyState, serviceIcon, BadgeTone } from '@/components/ui';
 import { CallEvidence } from '@/components/CallEvidence';
+import { CallerDetailsModal } from '@/components/CallerDetailsModal';
 import { PlaceLabel } from '@/lib/geocode';
 import { setDispatchTarget, scopeKeyFor } from '@/lib/dispatchTarget';
 
-const POLL_MS = 4000;
+const POLL_MS = 6000;
 
 const CLEARED_CALLS_KEY = (userId: string, subRole: string) => `sentinel.cleared-calls.v1:${userId}:${subRole}`;
 
@@ -43,6 +44,7 @@ export default function WorkerCallLogsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [firstLoad, setFirstLoad] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [detailsCall, setDetailsCall] = useState<EmergencyCall | null>(null);
 
   const subRole = (session?.role === 'worker' ? session?.sub_role : undefined) ?? 'police';
   const service: EmergencyService = SUBROLE_TO_SERVICE[subRole as keyof typeof SUBROLE_TO_SERVICE] ?? 'police';
@@ -148,6 +150,10 @@ export default function WorkerCallLogsScreen() {
         sub_role: subRole as 'paramedic' | 'police' | 'firefighter',
       });
       setCalls((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+      // Accepting a call is the only way a worker goes 'dispatched' — manual
+      // status cycling on the map was removed in favour of this single source of
+      // truth. Off-duty workers can still ack (they're committing to the call).
+      api.updateWorker(session.userId, { status: 'dispatched' }).catch(() => { /* non-fatal */ });
       const scope = scopeKeyFor(session.userId, subRole);
       setDispatchTarget(scope, {
         callId: updated.id,
@@ -174,8 +180,15 @@ export default function WorkerCallLogsScreen() {
     if (!session) return;
     setBusyId(call.id);
     try {
-      const updated = await api.updateEmergencyCall(call.id, { status: 'closed' });
+      const updated = await api.updateEmergencyCall(call.id, {
+        status: 'closed',
+        worker_id: session.userId,
+        sub_role: subRole as 'paramedic' | 'police' | 'firefighter',
+      });
       setCalls((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+      // Resolving a call frees the worker — flip back to available so dispatch
+      // sees them again. (Settings is the only other place that toggles status.)
+      api.updateWorker(session.userId, { status: 'available' }).catch(() => { /* non-fatal */ });
       const scope = scopeKeyFor(session.userId, subRole);
       setDispatchTarget(scope, null);
     } catch {
@@ -185,22 +198,40 @@ export default function WorkerCallLogsScreen() {
     }
   };
 
+  // This worker only cares about THEIR service's lane — so a call the citizen
+  // also sent to other services stays in this worker's queue until THIS service
+  // resolves it, regardless of what the other responders do.
+  const laneStatus = useCallback(
+    (c: EmergencyCall) => c.service_status?.[service] ?? c.status,
+    [service],
+  );
+
   const [tab, setTab] = useState<'active' | 'history'>('active');
+  // Which calls have their full operator transcript expanded (the concise
+  // summary is the default brief; the full call is one tap away).
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggleExpanded = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }, []);
   const { activeCalls, historyCalls, newCount, hiddenHistoryCount } = useMemo(() => {
     const active: EmergencyCall[] = [];
     const historyAll: EmergencyCall[] = [];
     for (const c of calls) {
-      if (c.status === 'closed') historyAll.push(c);
+      if (laneStatus(c) === 'closed') historyAll.push(c);
       else active.push(c);
     }
     const history = historyAll.filter((c) => !cleared.has(c.id));
     return {
       activeCalls: active,
       historyCalls: history,
-      newCount: active.filter((c) => c.status === 'new').length,
+      newCount: active.filter((c) => laneStatus(c) === 'new').length,
       hiddenHistoryCount: historyAll.length - history.length,
     };
-  }, [calls, cleared]);
+  }, [calls, cleared, laneStatus]);
 
   const visibleCalls = tab === 'active' ? activeCalls : historyCalls;
 
@@ -301,9 +332,9 @@ export default function WorkerCallLogsScreen() {
               ) : null
             }
             renderItem={({ item }) => {
-              const accent = STATUS_ACCENT[item.status];
+              const my = laneStatus(item); // this service's own lane
+              const accent = STATUS_ACCENT[my];
               const busy = busyId === item.id;
-              const meAcknowledged = item.responders?.some((r) => r.worker_id === session?.userId);
 
               const cardBody = (
                 <Card accent={accent} style={{ marginBottom: t.spacing.md }}>
@@ -317,7 +348,7 @@ export default function WorkerCallLogsScreen() {
                         Caller: {item.citizen_name} · sev {item.severity}
                       </Text>
                     </View>
-                    <Badge label={item.status} tone={STATUS_TONE[item.status]} />
+                    <Badge label={my} tone={STATUS_TONE[my]} />
                   </View>
 
                   <View style={styles.tagRow}>
@@ -327,10 +358,47 @@ export default function WorkerCallLogsScreen() {
                     ))}
                   </View>
 
+                  {/* Responder brief: the AI-operator summary is the headline;
+                      the full caller↔operator transcript is one tap away. Plain
+                      tap calls have no summary, so we show the transcript. */}
                   <View style={[styles.transcript, { backgroundColor: t.color.surfaceAlt, borderRadius: t.radius.sm }]}>
-                    <Text variant="caption" tone="secondary">
-                      {item.transcript}
-                    </Text>
+                    {item.summary ? (
+                      <>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginBottom: 4 }}>
+                          <Icon name="sparkles" size={12} color={t.color.primary} />
+                          <Text variant="overline" tone="accent">
+                            Operator brief
+                          </Text>
+                        </View>
+                        <Text variant="caption" tone="secondary">
+                          {item.summary}
+                        </Text>
+                        {item.transcript ? (
+                          <>
+                            <Pressable
+                              onPress={() => toggleExpanded(item.id)}
+                              hitSlop={8}
+                              accessibilityRole="button"
+                              style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 8 }}
+                            >
+                              <Icon name={expanded.has(item.id) ? 'chevronDown' : 'chevronRight'} size={13} color={t.color.textMuted} />
+                              <Text variant="caption" tone="muted">
+                                {expanded.has(item.id) ? 'Hide full call' : 'View full call transcript'}
+                              </Text>
+                            </Pressable>
+                            {expanded.has(item.id) && (
+                              <Text variant="caption" tone="muted" style={{ marginTop: 6 }}>
+                                {item.transcript}
+                              </Text>
+                            )}
+                          </>
+                        ) : null}
+                      </>
+                    ) : (
+                      <Text variant="caption" tone="secondary">
+                        {item.transcript}
+                      </Text>
+                    )}
                   </View>
 
                   <View style={styles.metaRow}>
@@ -356,9 +424,18 @@ export default function WorkerCallLogsScreen() {
                   {/* AI authenticity verdict + caller's proof photo */}
                   <CallEvidence call={item} />
 
-                  {item.status !== 'closed' && (
+                  {/* Caller's saved profile (vitals/medical/contact), on demand. */}
+                  <Button
+                    label="Caller details"
+                    variant="ghost"
+                    icon="person"
+                    onPress={() => setDetailsCall(item)}
+                    style={{ marginTop: t.spacing.sm }}
+                  />
+
+                  {my !== 'closed' && (
                     <View style={{ marginTop: t.spacing.md }}>
-                      {!meAcknowledged ? (
+                      {my === 'new' ? (
                         <Button label="Acknowledge + route to caller" variant="danger" icon="route" loading={busy} onPress={() => acknowledgeAndRoute(item)} />
                       ) : (
                         <Button label="Mark resolved" variant="secondary" icon="resolved" loading={busy} onPress={() => closeCall(item)} />
@@ -376,15 +453,16 @@ export default function WorkerCallLogsScreen() {
                       ))}
                     </View>
                   )}
-                  {item.status === 'closed' && item.closed_at && (
+                  {my === 'closed' && item.closed_at && (
                     <Text variant="caption" tone="muted" style={{ marginTop: 6 }}>
-                      Closed at {formatTime(item.closed_at)}
+                      Resolved by your unit at {formatTime(item.closed_at)}
                     </Text>
                   )}
                 </Card>
               );
 
-              if (item.status !== 'closed') return cardBody;
+              // Only this service's resolved (history) rows are swipe-to-clear.
+              if (my !== 'closed') return cardBody;
 
               return (
                 <Swipeable
@@ -411,6 +489,13 @@ export default function WorkerCallLogsScreen() {
           />
         )}
       </GestureHandlerRootView>
+
+      <CallerDetailsModal
+        visible={!!detailsCall}
+        onClose={() => setDetailsCall(null)}
+        profile={detailsCall?.caller_profile}
+        fallbackName={detailsCall?.citizen_name}
+      />
     </Screen>
   );
 }

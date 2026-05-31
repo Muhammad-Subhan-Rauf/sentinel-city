@@ -2,7 +2,7 @@
 //   - Citizens & workers: pin-drop map (drag to relocate) + sign-out
 //   - Admins: identity card + sign-out only (no map; admins have no position)
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LeafletPicker } from '@/components/LeafletPicker';
@@ -12,7 +12,7 @@ import { useTheme } from '@/theme';
 import { Text, Card, Button, IconBadge, Badge, Icon, SectionHeader, IconName } from '@/components/ui';
 import { PlaceLabel } from '@/lib/geocode';
 import { ProfileModal } from '@/components/ProfileModal';
-import { profileRoleKind } from '@/lib/profile';
+import { profileRoleKind, loadProfileOrSeed, AnyProfile } from '@/lib/profile';
 
 const MANHATTAN = { lat: 40.758, lng: -73.9855 };
 
@@ -21,6 +21,8 @@ function isStaleSession(e: unknown): boolean {
   return /\bAPI 404\b/.test(msg) && /\/api\/(citizens|workers)\//.test(msg);
 }
 
+type WorkerStatus = 'available' | 'dispatched' | 'on_scene' | 'off_duty';
+
 export default function SettingsScreen() {
   const t = useTheme();
   const { session, signOut } = useAuth();
@@ -28,9 +30,27 @@ export default function SettingsScreen() {
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  // Worker-only: current duty status. Reflects the backend value; we let the
+  // user flip between 'available' (online) and 'off_duty' (away) here. The
+  // other two values — 'dispatched' / 'on_scene' — are set automatically by
+  // the call lifecycle and shown as a read-only state with a hint.
+  const [dutyStatus, setDutyStatus] = useState<WorkerStatus | null>(null);
+  const [dutySaving, setDutySaving] = useState(false);
+  // Saved profile — its fullName is the identity name shown on this screen
+  // (the editable one), so an edit reflects here immediately.
+  const [profile, setProfile] = useState<AnyProfile | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = (msg: string) => {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2600);
+  };
+  useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current); }, []);
 
   const role = session?.role;
   const isField = role === 'citizen' || role === 'worker';
+  const isWorker = role === 'worker';
   const profileKind = profileRoleKind(session); // 'civilian' | 'responder' | 'none'
 
   const accent =
@@ -64,6 +84,7 @@ export default function SettingsScreen() {
           session.role === 'citizen' ? await api.getCitizen(session.userId) : await api.getWorker(session.userId);
         if (cancelled) return;
         setPin({ lat: me.lat, lng: me.lng });
+        if (session.role === 'worker') setDutyStatus((me as any).status as WorkerStatus);
       } catch (e) {
         if (cancelled) return;
         if (isStaleSession(e)) {
@@ -77,6 +98,55 @@ export default function SettingsScreen() {
       cancelled = true;
     };
   }, [session, isField, signOut]);
+
+  // Poll worker status so the duty card stays in sync with auto-transitions
+  // (acknowledge → dispatched, close → available) made from other screens.
+  useEffect(() => {
+    if (!session || !isWorker) return;
+    let cancelled = false;
+    const handle = setInterval(async () => {
+      try {
+        const w = await api.getWorker(session.userId);
+        if (!cancelled) setDutyStatus(w.status as WorkerStatus);
+      } catch {
+        /* ignore */
+      }
+    }, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [session, isWorker]);
+
+  // Load the saved profile so the identity card shows the editable full name.
+  useEffect(() => {
+    if (!session || profileKind === 'none') {
+      setProfile(null);
+      return;
+    }
+    let cancelled = false;
+    loadProfileOrSeed(session.userId, profileKind, session.sub_role, session.name)
+      .then((p) => !cancelled && setProfile(p))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [session, profileKind]);
+
+  const setDuty = async (next: 'available' | 'off_duty') => {
+    if (!session || !isWorker || dutySaving) return;
+    setDutySaving(true);
+    try {
+      const updated = await api.updateWorker(session.userId, { status: next });
+      setDutyStatus(updated.status as WorkerStatus);
+    } catch {
+      /* surface inline later */
+    } finally {
+      setDutySaving(false);
+    }
+  };
+
+  const dutyLocked = dutyStatus === 'dispatched' || dutyStatus === 'on_scene';
 
   const pushLocation = async (loc: { lat: number; lng: number }) => {
     if (!session || !isField) return;
@@ -116,7 +186,7 @@ export default function SettingsScreen() {
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: t.spacing.md }}>
             <IconBadge name={roleIcon} color={accent} size={52} iconSize={26} />
             <View style={{ flex: 1 }}>
-              <Text variant="h2">{session.name}</Text>
+              <Text variant="h2">{profile?.fullName?.trim() ? profile.fullName : session.name}</Text>
               <Badge
                 label={(session.sub_role ?? session.role).replace(/^\w/, (c) => c.toUpperCase())}
                 color={accent}
@@ -147,6 +217,70 @@ export default function SettingsScreen() {
               <Icon name="chevronRight" size={20} color={t.color.textMuted} />
             </View>
           </Card>
+        )}
+
+        {isWorker && (
+          <>
+            <SectionHeader title="Duty status" hint="Toggle whether dispatch can route new calls to you. Locked while you're handling a call." />
+            <Card style={{ marginBottom: t.spacing.lg }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: t.spacing.md }}>
+                <IconBadge
+                  name={dutyStatus === 'available' ? 'shield-check' : dutyStatus === 'off_duty' ? 'offline' : 'radio'}
+                  color={
+                    dutyStatus === 'available'
+                      ? t.color.success
+                      : dutyStatus === 'off_duty'
+                        ? t.color.textMuted
+                        : t.color.warning
+                  }
+                  size={44}
+                />
+                <View style={{ flex: 1 }}>
+                  <Text variant="h3">
+                    {dutyStatus === 'available'
+                      ? 'On duty'
+                      : dutyStatus === 'off_duty'
+                        ? 'Off duty'
+                        : dutyStatus === 'dispatched'
+                          ? 'Dispatched'
+                          : dutyStatus === 'on_scene'
+                            ? 'On scene'
+                            : 'Loading…'}
+                  </Text>
+                  <Text variant="caption" tone="secondary" style={{ marginTop: 2 }}>
+                    {dutyLocked
+                      ? 'Set automatically while a call is active — finish or close the call to change.'
+                      : dutyStatus === 'available'
+                        ? 'Dispatch can route new 911 calls to you.'
+                        : 'Dispatch will skip you for new calls.'}
+                  </Text>
+                </View>
+              </View>
+
+              <View style={{ flexDirection: 'row', gap: t.spacing.sm, marginTop: t.spacing.md }}>
+                <View style={{ flex: 1 }}>
+                  <Button
+                    label="On duty"
+                    icon="shield-check"
+                    variant={dutyStatus === 'available' ? 'primary' : 'secondary'}
+                    onPress={() => setDuty('available')}
+                    disabled={dutyLocked || dutySaving || dutyStatus === 'available'}
+                    loading={dutySaving && dutyStatus !== 'available'}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Button
+                    label="Off duty"
+                    icon="offline"
+                    variant={dutyStatus === 'off_duty' ? 'primary' : 'secondary'}
+                    onPress={() => setDuty('off_duty')}
+                    disabled={dutyLocked || dutySaving || dutyStatus === 'off_duty'}
+                    loading={dutySaving && dutyStatus !== 'off_duty'}
+                  />
+                </View>
+              </View>
+            </Card>
+          </>
         )}
 
         {isField && (
@@ -211,12 +345,25 @@ export default function SettingsScreen() {
         <ProfileModal
           visible={profileOpen}
           onClose={() => setProfileOpen(false)}
+          onSaved={(p) => {
+            setProfile(p);
+            showToast('Profile updated');
+          }}
           userId={session.userId}
           kind={profileKind}
           subRole={session.sub_role}
           name={session.name}
           accent={accent}
         />
+      )}
+
+      {toast && (
+        <View style={styles.toastWrap} pointerEvents="none">
+          <View style={[styles.toast, { backgroundColor: t.color.surfaceAlt, borderColor: t.color.border, borderRadius: t.radius.pill, ...t.shadow(2) }]}>
+            <Icon name="check-circle" size={16} color={t.color.success} />
+            <Text variant="label">{toast}</Text>
+          </View>
+        </View>
       )}
     </SafeAreaView>
   );
@@ -226,4 +373,6 @@ const styles = StyleSheet.create({
   safe: { flex: 1 },
   coordsRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
   appearanceRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 12 },
+  toastWrap: { position: 'absolute', left: 0, right: 0, bottom: 90, alignItems: 'center' },
+  toast: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 16, paddingVertical: 10, borderWidth: 1 },
 });

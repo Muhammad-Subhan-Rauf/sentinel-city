@@ -2,11 +2,12 @@
 // tap a hazard polygon to inspect the linked disaster event.
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { DisasterMap } from '@/components/DisasterMap';
 import { DisasterDetailModal } from '@/components/DisasterDetailModal';
 import { DestinationSearch } from '@/components/DestinationSearch';
+import { NavBanner } from '@/components/NavBanner';
 import { api, fetchRoute, Cordon, Disaster, MobileWorker, Notification, Route, WorkerSubRole } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
@@ -15,20 +16,6 @@ import { disasterRing, ringForValhallaAvoid } from '@/lib/geo';
 import { useDispatchTarget, setDispatchTarget, scopeKeyFor } from '@/lib/dispatchTarget';
 
 type LatLng = { lat: number; lng: number };
-
-const NEXT_STATUS: Record<MobileWorker['status'], MobileWorker['status']> = {
-  available: 'dispatched',
-  dispatched: 'on_scene',
-  on_scene: 'available',
-  off_duty: 'available',
-};
-
-const STATUS_ACTION: Record<MobileWorker['status'], string> = {
-  available: 'Mark dispatched',
-  dispatched: 'Mark on scene',
-  on_scene: 'Mark available',
-  off_duty: 'Go on duty',
-};
 
 const STATUS_TONE: Record<MobileWorker['status'], BadgeTone> = {
   available: 'success',
@@ -74,6 +61,7 @@ export default function WorkerMapScreen() {
   const [route, setRoute] = useState<Route | null>(null);
   const [routing, setRouting] = useState(false);
   const [routeError, setRouteError] = useState<string | null>(null);
+  const [navigating, setNavigating] = useState(false);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [modalLoading, setModalLoading] = useState(false);
@@ -96,27 +84,23 @@ export default function WorkerMapScreen() {
       }
     };
     tick();
-    const handle = setInterval(tick, 4000);
+    const handle = setInterval(tick, 6000);
     return () => {
       cancelled = true;
       clearInterval(handle);
     };
   }, [session]);
 
-  const cycleStatus = async () => {
-    if (!session || !me) return;
-    const next = NEXT_STATUS[me.status];
-    try {
-      const updated = await api.updateWorker(session.userId, { status: next });
-      setMe(updated);
-    } catch {
-      /* surface inline later */
-    }
-  };
-
   const lastAvoidSig = useRef<string>('');
 
+  // Monotonic token guarding against stale async route results. clearRoute (and
+  // every new compute) bumps it, so a fetch that resolves AFTER the worker
+  // cleared — whether from a tap, the dispatch auto-route, or the 6s re-route
+  // poll — is discarded instead of repainting a route that should be gone.
+  const routeToken = useRef(0);
+
   const computeRoute = useCallback(async (from: LatLng, to: LatLng) => {
+    const myToken = ++routeToken.current;
     setRouting(true);
     setRouteError(null);
     try {
@@ -129,12 +113,14 @@ export default function WorkerMapScreen() {
       const avoid = [...notifsToAvoidPolygons([...notifs, ...cordons]), ...disastersToAvoidPolygons(disasters)];
       lastAvoidSig.current = JSON.stringify(avoid);
       const r = await fetchRoute(from, to, avoid, 'auto');
+      if (routeToken.current !== myToken) return; // superseded by a newer request or cleared
       setRoute(r);
     } catch (err) {
+      if (routeToken.current !== myToken) return;
       setRoute(null);
       setRouteError(err instanceof Error ? err.message : 'Could not compute a route right now.');
     } finally {
-      setRouting(false);
+      if (routeToken.current === myToken) setRouting(false);
     }
   }, []);
 
@@ -180,7 +166,7 @@ export default function WorkerMapScreen() {
         /* ignore — next tick will retry */
       }
     };
-    const handle = setInterval(tick, 4000);
+    const handle = setInterval(tick, 6000);
     return () => {
       cancelled = true;
       clearInterval(handle);
@@ -209,10 +195,16 @@ export default function WorkerMapScreen() {
   };
 
   const clearRoute = () => {
+    // Invalidate any in-flight / scheduled route compute so a late-resolving
+    // fetchRoute (tap, dispatch auto-route, or re-route poll) can't repaint the
+    // route after it's cleared.
+    routeToken.current++;
     setDispatchTarget(dispatchScope, null);
     setDestination(null);
     setRoute(null);
     setRouteError(null);
+    setRouting(false);
+    setNavigating(false);
   };
 
   if (!session) return null;
@@ -233,16 +225,20 @@ export default function WorkerMapScreen() {
         route={route}
         onMapPress={onMapPress}
         onPolygonPress={onPolygonPress}
-        legendBottom={88}
+        legendBottom={destination ? 150 : 84}
+        navMode={navigating}
       />
 
       {/* Destination search — type/choose a place to route to, just like citizens.
-          Higher z-index so the autocomplete dropdown overlays everything. */}
-      <View style={[styles.searchWrap, { top: insets.top + 8, zIndex: 30 }]}>
-        <DestinationSearch focus={myLoc} destination={destination} onSelect={onSearchSelect} onClear={clearRoute} />
-      </View>
+          Higher z-index so the autocomplete dropdown overlays everything.
+          Hidden during turn-by-turn so the nav banner owns the screen. */}
+      {!navigating && (
+        <View style={[styles.searchWrap, { top: insets.top + 8, zIndex: 30 }]}>
+          <DestinationSearch focus={myLoc} destination={destination} onSelect={onSearchSelect} onClear={clearRoute} />
+        </View>
+      )}
 
-      {dispatchTarget && (
+      {!navigating && dispatchTarget && (
         <View style={[styles.dispatchBanner, { top: insets.top + 72, backgroundColor: t.color.danger, borderRadius: t.radius.lg, ...t.shadow(2) }]} accessibilityRole="alert">
           <Icon name="route" size={20} color={t.color.onDanger} />
           <View style={{ flex: 1, marginLeft: t.spacing.md }}>
@@ -256,19 +252,20 @@ export default function WorkerMapScreen() {
         </View>
       )}
 
-      <Card style={styles.banner} elevation={2}>
+      {!navigating && (
+      <Card padded={false} style={[styles.banner, styles.bannerPadding]} elevation={2}>
         {/* Identity row */}
         <View style={styles.bannerTop}>
           <IconBadge
             name={me?.role === 'firefighter' ? 'firefighter' : me?.role === 'police' ? 'police' : 'ambulance'}
             color={accent}
-            size={44}
+            size={34}
           />
-          <View style={{ flex: 1, marginLeft: t.spacing.md, minWidth: 0 }}>
+          <View style={{ flex: 1, marginLeft: t.spacing.sm, minWidth: 0 }}>
             <Text variant="bodyStrong" numberOfLines={1}>
               {me?.name ?? 'Loading…'}
             </Text>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 2 }}>
               <Text variant="caption" tone="secondary" numberOfLines={1} style={{ flexShrink: 1 }}>
                 {subRoleLabel}
               </Text>
@@ -296,34 +293,24 @@ export default function WorkerMapScreen() {
             {routeError}
           </Text>
         )}
-        {!destination && !routing && !routeError && me && (
-          <View style={[styles.bannerLine, { flexDirection: 'row', alignItems: 'center', gap: 6 }]}>
-            <Icon name="route" size={13} color={t.color.textMuted} />
-            <Text variant="caption" tone="secondary" numberOfLines={1} style={{ flex: 1 }}>
-              Tap the map to plot a route — it avoids active hazards
-            </Text>
+        {/* Only contextual action: clear the current route. Status is
+            controlled from Settings (on/off duty) or auto-set by the call
+            lifecycle (dispatched / available) — no manual cycling here. */}
+        {destination && (
+          <View style={{ marginTop: t.spacing.sm, flexDirection: 'row', gap: 8 }}>
+            {route && !routing ? (
+              <Button label="Start" variant="primary" icon="play" size="sm" onPress={() => setNavigating(true)} style={{ flex: 1 }} />
+            ) : null}
+            <Button label="Clear route" variant="secondary" icon="close" size="sm" onPress={clearRoute} style={{ flex: 1 }} />
           </View>
         )}
-
-        {/* Full-width action — never crammed beside the identity now */}
-        <View style={{ marginTop: t.spacing.md }}>
-          {destination ? (
-            <Button label="Clear route" variant="secondary" icon="close" onPress={clearRoute} />
-          ) : (
-            <Pressable
-              onPress={cycleStatus}
-              accessibilityRole="button"
-              accessibilityLabel={me ? STATUS_ACTION[me.status] : 'Update status'}
-              style={({ pressed }) => [styles.statusBtn, { backgroundColor: accent, borderRadius: t.radius.md, opacity: pressed ? 0.85 : 1 }]}
-            >
-              <Icon name="refresh" size={16} color={t.color.alwaysWhite} />
-              <Text variant="label" color={t.color.alwaysWhite} numberOfLines={1}>
-                {me ? STATUS_ACTION[me.status] : 'Status'}
-              </Text>
-            </Pressable>
-          )}
-        </View>
       </Card>
+      )}
+
+      {/* Turn-by-turn navigation overlay (zooms + follows via navMode above). */}
+      {navigating && route ? (
+        <NavBanner route={route} location={myLoc} onEnd={() => setNavigating(false)} />
+      ) : null}
 
       <DisasterDetailModal
         visible={modalOpen}
@@ -348,8 +335,10 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     paddingHorizontal: 14,
   },
-  banner: { position: 'absolute', bottom: 24, left: 16, right: 16 },
+  banner: { position: 'absolute', bottom: 16, left: 16, right: 16 },
+  // Tighter than the default Card padding so the worker bottom card stays
+  // compact and the legend chip can sit above it.
+  bannerPadding: { paddingVertical: 10, paddingHorizontal: 12 },
   bannerTop: { flexDirection: 'row', alignItems: 'center' },
-  bannerLine: { marginTop: 8 },
-  statusBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 16, height: 48 },
+  bannerLine: { marginTop: 6 },
 });

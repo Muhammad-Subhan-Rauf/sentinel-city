@@ -9,14 +9,16 @@ import { createBottomTabNavigator, BottomTabNavigationOptions } from '@react-nav
 import { View } from 'react-native';
 import { useAuth } from '@/lib/auth';
 import { useGeofenceWatcher } from '@/lib/geofence';
+import { useTabBadges, badgeValue } from '@/lib/badges';
 import { useTheme } from '@/theme';
 import { Icon, IconName } from '@/components/ui';
 import { InAppBanner } from '@/components/InAppBanner';
 import { CitizenTabBar } from '@/navigation/CitizenTabBar';
+import { Sos911Launcher } from '@/components/Sos911Launcher';
+import { navigationRef } from '@/navigation/navigationRef';
 
 import LoginScreen from '@/screens/LoginScreen';
 import CitizenMapScreen from '@/screens/citizen/CitizenMapScreen';
-import CitizenSosScreen from '@/screens/citizen/CitizenSosScreen';
 import CitizenHistoryScreen from '@/screens/citizen/CitizenHistoryScreen';
 import NotificationsScreen from '@/screens/citizen/NotificationsScreen';
 import SettingsScreen from '@/screens/SettingsScreen';
@@ -51,6 +53,7 @@ function useTabScreenOptions(activeColor: string): BottomTabNavigationOptions {
     },
     tabBarLabelStyle: { fontFamily: t.fonts.bold, fontSize: 11, letterSpacing: 0.2 },
     tabBarItemStyle: { paddingTop: 2 },
+    tabBarBadgeStyle: { backgroundColor: t.color.danger, color: t.color.onDanger, fontFamily: t.fonts.bold, fontSize: 10 },
     headerStyle: { backgroundColor: t.color.bg, borderBottomColor: t.color.border, borderBottomWidth: 1, shadowColor: 'transparent' },
     headerTitleStyle: { fontFamily: t.fonts.bold, fontSize: 18, color: t.color.textPrimary },
     headerTintColor: t.color.textPrimary,
@@ -60,18 +63,20 @@ function useTabScreenOptions(activeColor: string): BottomTabNavigationOptions {
 
 function CitizenTabs() {
   const t = useTheme();
-  // Custom bar renders a raised red "911" call-for-help button in the centre.
-  // The SOS screen is registered here but hidden from the default item list —
-  // the centre button is its entry point.
+  const { session } = useAuth();
+  const badges = useTabBadges(session);
+  // Custom bar renders a raised red "911" button in the centre. It no longer
+  // routes to a page — it fires the global open911() signal, and the
+  // <Sos911Launcher/> mounted at the root pops the call menu over the current
+  // screen (see RootNavigator's return).
   return (
     <Tab.Navigator
       screenOptions={useTabScreenOptions(t.color.citizen)}
       tabBar={(props) => <CitizenTabBar {...props} />}
     >
       <Tab.Screen name="Map" component={CitizenMapScreen} options={{ tabBarIcon: tabIcon('map'), headerShown: false }} />
-      <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts') }} />
-      <Tab.Screen name="SOS" component={CitizenSosScreen} options={{ title: 'Get help', headerShown: false }} />
-      <Tab.Screen name="History" component={CitizenHistoryScreen} options={{ tabBarIcon: tabIcon('history') }} />
+      <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts'), tabBarBadge: badgeValue(badges.alerts) }} />
+      <Tab.Screen name="History" component={CitizenHistoryScreen} options={{ tabBarIcon: tabIcon('history'), tabBarBadge: badgeValue(badges.history) }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: tabIcon('settings') }} />
     </Tab.Navigator>
   );
@@ -79,11 +84,13 @@ function CitizenTabs() {
 
 function WorkerTabs() {
   const t = useTheme();
+  const { session } = useAuth();
+  const badges = useTabBadges(session);
   return (
     <Tab.Navigator screenOptions={useTabScreenOptions(t.color.worker)}>
       <Tab.Screen name="Map" component={WorkerMapScreen} options={{ tabBarIcon: tabIcon('map'), headerShown: false }} />
-      <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts') }} />
-      <Tab.Screen name="Calls" component={WorkerCallLogsScreen} options={{ tabBarIcon: tabIcon('calls') }} />
+      <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts'), tabBarBadge: badgeValue(badges.alerts) }} />
+      <Tab.Screen name="Calls" component={WorkerCallLogsScreen} options={{ tabBarIcon: tabIcon('calls'), tabBarBadge: badgeValue(badges.calls) }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: tabIcon('settings') }} />
     </Tab.Navigator>
   );
@@ -91,6 +98,8 @@ function WorkerTabs() {
 
 function AdminTabs() {
   const t = useTheme();
+  const { session } = useAuth();
+  const badges = useTabBadges(session);
   // Six destinations (incl. Settings, which holds sign-out) is one above the
   // ideal bottom-nav max, so admin tabs go icon-only to keep them comfortably
   // tappable. Admins are power users who learn the glyphs quickly.
@@ -100,7 +109,7 @@ function AdminTabs() {
       <Tab.Screen name="Calls" component={AdminCallsScreen} options={{ tabBarIcon: tabIcon('calls') }} />
       <Tab.Screen name="Agents" component={AdminAgentsScreen} options={{ tabBarIcon: tabIcon('agents') }} />
       <Tab.Screen name="Impact" component={AdminSavingsScreen} options={{ tabBarIcon: tabIcon('impact') }} />
-      <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts') }} />
+      <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts'), tabBarBadge: badgeValue(badges.alerts) }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: tabIcon('settings') }} />
     </Tab.Navigator>
   );
@@ -128,7 +137,7 @@ export default function RootNavigator() {
 
   return (
     <View style={{ flex: 1, backgroundColor: t.color.bg }}>
-      <NavigationContainer theme={navTheme}>
+      <NavigationContainer theme={navTheme} ref={navigationRef}>
         {!session ? (
           <LoginScreen />
         ) : session.role === 'citizen' ? (
@@ -140,6 +149,9 @@ export default function RootNavigator() {
         )}
       </NavigationContainer>
       <InAppBanner toasts={toasts} onDismiss={dismiss} />
+      {/* Global 911 call menu — pops over any citizen screen when the tab-bar
+          911 button fires open911(). */}
+      {session?.role === 'citizen' && <Sos911Launcher />}
     </View>
   );
 }

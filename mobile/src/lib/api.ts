@@ -8,7 +8,15 @@
 //   4. http://localhost:8000 (simulator / web)
 
 import Constants from 'expo-constants';
-import { haversineMeters } from '@/lib/geo';
+import {
+  haversineMeters,
+  routeCorridorBbox,
+  ringBbox,
+  bboxesIntersect,
+  ringCentroid,
+  ringPerimeterMeters,
+  circleRing,
+} from '@/lib/geo';
 
 // Expo exposes the dev-machine host (e.g. "192.168.1.42:8081") via a few
 // different fields depending on SDK version + whether the bundle is dev or
@@ -74,6 +82,51 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   return res.json() as Promise<T>;
 }
+
+// ── In-memory GET cache + in-flight de-duplication ─────────────────────────
+// The map and alert pollers hit the same list endpoints every few seconds, from
+// several screens at once. This memoizes those reads for a short TTL and shares
+// a single in-flight request across concurrent callers — so the heavy payloads
+// (notably the ~118 KB citizen-reports feed and the slow /api/disasters and
+// /api/warnings/nearby calls) aren't re-fetched and re-parsed repeatedly.
+// READS ONLY: writes never go through this and invalidate the affected keys so
+// a change the user just made shows immediately rather than waiting out the TTL.
+type CacheEntry = { at: number; value: unknown };
+const _cache = new Map<string, CacheEntry>();
+const _inflight = new Map<string, Promise<unknown>>();
+
+function cachedGet<T>(key: string, ttlMs: number, fetcher: () => Promise<T>): Promise<T> {
+  const hit = _cache.get(key);
+  if (hit && Date.now() - hit.at < ttlMs) return Promise.resolve(hit.value as T);
+  const existing = _inflight.get(key);
+  if (existing) return existing as Promise<T>;
+  const p = fetcher()
+    .then((value) => {
+      _cache.set(key, { at: Date.now(), value });
+      _inflight.delete(key);
+      return value;
+    })
+    .catch((e) => {
+      _inflight.delete(key);
+      throw e;
+    });
+  _inflight.set(key, p);
+  return p as Promise<T>;
+}
+
+// Drop cached entries whose key starts with any given prefix (after a write).
+function invalidate(...prefixes: string[]) {
+  for (const key of [..._cache.keys()]) {
+    if (prefixes.some((pfx) => key.startsWith(pfx))) _cache.delete(key);
+  }
+}
+
+// TTLs (ms). Live data refreshes within a poll cycle; static infrastructure
+// (stations) barely changes, so it's cached much longer.
+const TTL_LIVE = 3000;
+const TTL_WARNINGS = 4000;
+const TTL_ADMIN = 4000;
+const TTL_STATIONS = 60000;
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -175,8 +228,17 @@ export type EmergencyCall = {
   disaster_lat: number | null;
   disaster_lng: number | null;
   transcript: string;
+  // Concise AI-operator dispatch brief for responders (the headline). Present
+  // when the call was placed via the live operator; the full caller↔operator
+  // exchange is in `transcript`. null for a plain category-tap call.
+  summary?: string | null;
   requested_services: EmergencyService[];
+  // Top-level lifecycle summary (derived). For per-responder UI use service_status.
   status: 'new' | 'acknowledged' | 'closed';
+  // Per-service lifecycle — each requested service accepts/resolves on its own
+  // lane, independently of the others. A worker should read/act on their own
+  // service's lane, not the summary `status`.
+  service_status?: Partial<Record<EmergencyService, 'new' | 'acknowledged' | 'closed'>>;
   acknowledged_by: string | null;
   acknowledged_at: string | null;
   closed_at: string | null;
@@ -190,7 +252,15 @@ export type EmergencyCall = {
   has_photo?: boolean;
   // AI authenticity verdict (see AiAssessment). Starts as { status: 'analyzing' }.
   ai_assessment?: AiAssessment;
+  // The caller's saved profile (vitals/medical/contact), attached at call time so
+  // the operator + responders can identify and brief without it being spoken in
+  // the transcript. Loose record (mirrors lib/profile's CivilianProfile shape).
+  caller_profile?: CallerProfile | null;
 };
+
+// Structural shape of the attached caller profile (kept loose here to avoid an
+// api ↔ profile ↔ auth import cycle; lib/profile.CivilianProfile is the source).
+export type CallerProfile = Record<string, string | boolean | null | undefined>;
 
 // AI authenticity verdict for a 911 call. Filled in by the backend's vision
 // model (pipeline.prank_check) a moment after the call is placed: it weighs the
@@ -208,6 +278,41 @@ export type AiAssessment =
       had_photo?: boolean;
       model?: string;
     };
+
+// ── AI 911 operator — live conversational dispatch ──────────────────────────
+// The citizen talks (voice → transcribed, or typed) back-and-forth with a
+// guardrailed LLM operator that decides which responders to send. The exchange
+// is persisted server-side for audit; on hang-up a concise summary is dispatched.
+export type OperatorRole = 'caller' | 'operator';
+
+export type OperatorStartResponse = { session_id: string; greeting: string };
+
+export type OperatorMessageResponse = {
+  // The caller's words (echoed back — already transcribed if they spoke).
+  user_text: string;
+  // What the operator says next.
+  reply: string;
+  // The operator's running dispatch plan (refined every turn).
+  services: EmergencyService[];
+  severity: number;
+  category: string;
+  // True once the operator believes it has enough to send the right help.
+  ready_to_dispatch: boolean;
+  // True when the caller's last message was off-topic (guardrail signal).
+  off_topic: boolean;
+  // True when a spoken clip couldn't be transcribed (caller should type/retry).
+  transcription_failed: boolean;
+};
+
+export type OperatorEndResponse = {
+  call: EmergencyCall;
+  summary: string | null;
+  key_facts: string[];
+};
+
+// Human-readable label for a 911 service identifier.
+export const serviceLabel = (s: EmergencyService): string =>
+  s === 'ambulance' ? 'Ambulance' : s === 'police' ? 'Police' : 'Firefighter';
 
 // Maps a worker's sub_role to the matching 911 service identifier.
 export const SUBROLE_TO_SERVICE: Record<'paramedic' | 'police' | 'firefighter', EmergencyService> = {
@@ -285,20 +390,27 @@ export const api = {
 
   // Mobile users
   listCitizens: () =>
-    request<{ citizens: MobileCitizen[] }>('/api/citizens').then((r) => r.citizens),
+    cachedGet('citizens', TTL_LIVE, () => request<{ citizens: MobileCitizen[] }>('/api/citizens').then((r) => r.citizens)),
   listWorkers: () =>
-    request<{ workers: MobileWorker[] }>('/api/workers').then((r) => r.workers),
+    cachedGet('workers', TTL_LIVE, () => request<{ workers: MobileWorker[] }>('/api/workers').then((r) => r.workers)),
+  // Point reads stay uncached so a user's own position is always fresh.
   getCitizen: (id: string) => request<MobileCitizen>(`/api/citizens/${id}`),
   getWorker: (id: string) => request<MobileWorker>(`/api/workers/${id}`),
   updateCitizen: (id: string, body: Partial<{ lat: number; lng: number; status: string }>) =>
     request<MobileCitizen>(`/api/citizens/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
+    }).then((r) => {
+      invalidate('citizens'); // roster changed → next list read reflects it
+      return r;
     }),
   updateWorker: (id: string, body: Partial<{ lat: number; lng: number; status: string }>) =>
     request<MobileWorker>(`/api/workers/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
+    }).then((r) => {
+      invalidate('workers');
+      return r;
     }),
 
   // Hazards & alerts
@@ -310,25 +422,28 @@ export const api = {
   // listNearbyWarnings instead, which is server-filtered to source='ai' and
   // proximity-trimmed.
   listNotifications: () =>
-    request<{ notifications: Notification[] }>('/api/notifications?status_filter=active').then(
-      (r) => r.notifications
+    cachedGet('notifications', TTL_LIVE, () =>
+      request<{ notifications: Notification[] }>('/api/notifications?status_filter=active').then((r) => r.notifications),
     ),
   listCordons: () =>
-    request<{ cordons: Cordon[] }>('/api/cordons?status_filter=active').then((r) => r.cordons),
+    cachedGet('cordons', TTL_LIVE, () =>
+      request<{ cordons: Cordon[] }>('/api/cordons?status_filter=active').then((r) => r.cordons),
+    ),
   // lat / lng can be null to request the citywide (admin) feed — the backend
   // returns every active AI warning unfiltered when position is absent.
   listNearbyWarnings: (lat: number | null, lng: number | null, radiusM: number) => {
     const q: string[] = [`radius_m=${Math.round(radiusM)}`];
     if (lat !== null && Number.isFinite(lat)) q.push(`lat=${lat}`);
     if (lng !== null && Number.isFinite(lng)) q.push(`lng=${lng}`);
-    return request<{ warnings: NearbyWarning[] }>(`/api/warnings/nearby?${q.join('&')}`).then(
-      (r) => r.warnings,
+    const qs = q.join('&');
+    return cachedGet(`warnings:${qs}`, TTL_WARNINGS, () =>
+      request<{ warnings: NearbyWarning[] }>(`/api/warnings/nearby?${qs}`).then((r) => r.warnings),
     );
   },
 
   // Disasters
   listDisasters: () =>
-    request<{ disasters: Disaster[] }>('/api/disasters').then((r) => r.disasters),
+    cachedGet('disasters', TTL_LIVE, () => request<{ disasters: Disaster[] }>('/api/disasters').then((r) => r.disasters)),
   getDisaster: (id: string) => request<Disaster>(`/api/disasters/${id}`),
 
   // Disasters a citizen has actually reported. A disaster surfaces on mobile —
@@ -337,19 +452,33 @@ export const api = {
   // regardless of whether it was placed by the operator or the AI. This is the
   // single source of truth for "which disasters are live on mobile"; use it
   // everywhere instead of listDisasters() + a source filter.
+  // Just the distinct event ids that have a citizen report — a tiny payload that
+  // replaces pulling the full ~118 KB reports feed on every poll (see backend
+  // /api/reported-event-ids).
+  listReportedEventIds: () =>
+    cachedGet('reported-ids', TTL_LIVE, () =>
+      request<{ event_ids: string[] }>('/api/reported-event-ids').then((r) => r.event_ids),
+    ),
   listReportedDisasters: async (): Promise<Disaster[]> => {
-    const [disasters, reports] = await Promise.all([
-      api.listDisasters(),
-      api.listCitizenReports(500),
-    ]);
-    const reported = new Set(reports.map((r) => r.event_id).filter((id): id is string => !!id));
+    const disasters = await api.listDisasters();
+    let reported: Set<string>;
+    try {
+      reported = new Set(await api.listReportedEventIds());
+    } catch {
+      // Backend without /api/reported-event-ids yet → fall back to the (heavier)
+      // reports feed so nothing breaks before the server is redeployed.
+      const reports = await api.listCitizenReports(500).catch(() => []);
+      reported = new Set(reports.map((r) => r.event_id).filter((id): id is string => !!id));
+    }
     return disasters.filter((d) => reported.has(d.id));
   },
 
-  // Citizen reports (admin Calls screen)
+  // Citizen reports (admin Calls screen + the reported-disaster gate). This is
+  // the heaviest payload (~118 KB at limit 500) and is pulled by several pollers
+  // — caching it is the single biggest perf win.
   listCitizenReports: (limit = 100) =>
-    request<{ reports: CitizenReport[] }>(`/api/citizen-reports?limit=${limit}`).then(
-      (r) => r.reports
+    cachedGet(`reports:${limit}`, TTL_LIVE, () =>
+      request<{ reports: CitizenReport[] }>(`/api/citizen-reports?limit=${limit}`).then((r) => r.reports),
     ),
 
   // 911 calls (citizen creates, workers consume — filtered by their service)
@@ -366,6 +495,12 @@ export const api = {
     // Optional base64 data URL ("data:image/jpeg;base64,…") of a proof photo the
     // caller captured. The backend runs an AI authenticity check against it.
     photo_data_url?: string | null;
+    // Per-attempt key so a retry (flaky network / double-tap) returns the same
+    // call instead of dispatching responders twice.
+    idempotency_key?: string;
+    // Caller's saved profile, shown to the operator / responders as structured
+    // data (not spoken in the transcript).
+    caller_profile?: CallerProfile | null;
   }) =>
     request<EmergencyCall>('/api/911/call', {
       method: 'POST',
@@ -399,27 +534,77 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  // ── AI 911 operator: live conversational call ──
+  // Open a call session. Returns the operator's opening line.
+  operatorStart: (body: {
+    citizen_id: string;
+    caller_lat: number;
+    caller_lng: number;
+    // Reverse-geocoded place name → powers the "my location" shortcut so the
+    // caller never has to read out coordinates.
+    location_name?: string | null;
+    category?: string | null;
+    disaster_id?: string | null;
+    caller_profile?: CallerProfile | null;
+  }) =>
+    request<OperatorStartResponse>('/api/911/operator/start', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  // Transcribe a spoken clip to text WITHOUT sending it — the caller reviews/edits
+  // the words in the input box, then sends via operatorMessage.
+  operatorTranscribe: (body: { audio_base64: string; mime?: string; session_id?: string }) =>
+    request<{ text: string; transcription_failed: boolean }>('/api/911/operator/transcribe', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  // One caller turn — typed `text` OR a spoken `audio_base64` clip to transcribe.
+  operatorMessage: (body: { session_id: string; text?: string; audio_base64?: string; mime?: string }) =>
+    request<OperatorMessageResponse>('/api/911/operator/message', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  // Hang up: finalize the concise brief + dispatch the responders.
+  operatorEnd: (body: { session_id: string; idempotency_key?: string; photo_data_url?: string | null }) =>
+    request<OperatorEndResponse>('/api/911/operator/end', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
   // Admin
-  listAgents: () => request<{ agents: Agent[] }>('/api/agents').then((r) => r.agents),
-  savingsSummary: () => request<SavingsSummary>('/api/savings-summary'),
+  listAgents: () => cachedGet('agents', TTL_ADMIN, () => request<{ agents: Agent[] }>('/api/agents').then((r) => r.agents)),
+  savingsSummary: () => cachedGet('savings', TTL_ADMIN, () => request<SavingsSummary>('/api/savings-summary')),
+  // Insight is fetched on explicit tap (per metric) — not cached.
   savingsInsight: (metric: 'lives' | 'infrastructure' | 'money') =>
     request<SavingsInsight>(`/api/savings-summary/insight?metric=${metric}`),
   statsInjured: () =>
-    request<{ injured_estimate: number; contributing_events: number }>('/api/stats/injured'),
+    cachedGet('injured', TTL_ADMIN, () =>
+      request<{ injured_estimate: number; contributing_events: number }>('/api/stats/injured'),
+    ),
 
   // Dispatch — reuses the same endpoints as the web operator console so the
   // mobile map shows the exact same infrastructure (fire / hospital / police).
+  // Stations barely change → cached for a minute so they stop being re-fetched
+  // on every 3-second map tick.
   listFireStations: () =>
-    request<{ stations: FireStation[] }>('/api/fire-stations').then((r) => r.stations),
+    cachedGet('fireStations', TTL_STATIONS, () => request<{ stations: FireStation[] }>('/api/fire-stations').then((r) => r.stations)),
   listHospitals: () =>
-    request<{ hospitals: StationPoint[] }>('/api/hospitals').then((r) => r.hospitals),
+    cachedGet('hospitals', TTL_STATIONS, () => request<{ hospitals: StationPoint[] }>('/api/hospitals').then((r) => r.hospitals)),
   listPoliceStations: () =>
-    request<{ stations: StationPoint[] }>('/api/police-stations').then((r) => r.stations),
+    cachedGet('policeStations', TTL_STATIONS, () => request<{ stations: StationPoint[] }>('/api/police-stations').then((r) => r.stations)),
 };
 
 // ─── External: Valhalla routing ──────────────────────────────────────
 
-type ValhallaLeg = { shape: string };
+type ValhallaManeuver = {
+  instruction?: string;
+  verbal_pre_transition_instruction?: string;
+  length?: number; // km (units=kilometers)
+  time?: number; // seconds
+  type?: number; // Valhalla maneuver type
+  begin_shape_index?: number;
+};
+type ValhallaLeg = { shape: string; maneuvers?: ValhallaManeuver[] };
 type ValhallaResponse = {
   trip: {
     summary: { length: number; time: number };
@@ -459,10 +644,23 @@ function decodePolyline(str: string, precision = 6): Array<[number, number]> {
   return coords;
 }
 
+// One turn-by-turn step from Valhalla, used for in-app navigation.
+export type RouteManeuver = {
+  instruction: string; // "Turn right onto Main Street."
+  verbal: string; // best phrasing for text-to-speech
+  distanceKm: number; // length of this step
+  type: number; // Valhalla maneuver type (direction)
+  lat: number;
+  lng: number; // where this step begins
+  shapeIndex: number; // index into Route.coordinates where this step begins
+};
+
 export type Route = {
   coordinates: Array<{ latitude: number; longitude: number }>;
   distanceKm: number;
   durationMin: number;
+  // Turn-by-turn steps. Empty if the provider returned none.
+  maneuvers: RouteManeuver[];
 };
 
 // Ray-cast point-in-polygon on a [lng,lat] closed ring. Duplicated here to
@@ -496,9 +694,63 @@ export async function fetchRoute(
   // inside a forbidden zone — which is exactly what happens to a citizen
   // already inside a danger zone. Excluding those polygons means the route
   // will start by leaving the zone, which is the desired behavior anyway.
-  const safeAvoid = avoidPolygons.filter(
-    (ring) => !isInsideRing(start, ring) && !isInsideRing(end, ring),
+  const endpointSafe = avoidPolygons.filter(
+    (ring) => Array.isArray(ring) && ring.length >= 3 && !isInsideRing(start, ring) && !isInsideRing(end, ring),
   );
+
+  // Scope avoid_polygons to the route corridor. Valhalla caps both per-polygon
+  // perimeter (10 km → error 167) AND total polygon count (default 50). At
+  // hundreds-of-disasters scale, dumping everything on the request trips one or
+  // the other even when the route itself is short and clear. Only polygons whose
+  // bbox overlaps a buffered bbox around [start,end] can possibly intersect any
+  // reasonable route, so the rest are noise — drop them.
+  const straightLineM = haversineMeters(start, end);
+  // Buffer scales with route length so detours have room: 2 km min, ~50% of the
+  // straight-line distance otherwise, capped at 20 km so a long inter-city
+  // route doesn't pull in the entire map's worth of hazards.
+  const corridorMarginM = Math.min(20_000, Math.max(2_000, straightLineM * 0.5));
+  const corridor = routeCorridorBbox(start, end, corridorMarginM);
+  let safeAvoid = endpointSafe.filter((ring) => bboxesIntersect(ringBbox(ring as Array<[number, number]>), corridor));
+
+  // Stadia's Valhalla enforces max_exclude_polygons_length on the SUM of all
+  // polygon perimeters (default 10 km). One full-size polygon (≈ 9.4 km) eats
+  // the whole budget; many smaller ones still bust it. So budget the total:
+  // sort polygons by proximity to the route midpoint, then greedily add until
+  // the budget runs out. If the next polygon doesn't fit, replace it with a
+  // small circle centred on its centroid sized to fit the remaining budget —
+  // we'd rather avoid a 200 m bubble of the hazard than skip it entirely.
+  const mid: { lat: number; lng: number } = { lat: (start.lat + end.lat) / 2, lng: (start.lng + end.lng) / 2 };
+  const ranked = safeAvoid
+    .map((ring) => {
+      const r = ring as Array<[number, number]>;
+      return { ring: r, dist: haversineMeters(mid, ringCentroid(r)), perim: ringPerimeterMeters(r) };
+    })
+    .sort((a, b) => a.dist - b.dist);
+
+  const TOTAL_PERIMETER_BUDGET_M = 9_500; // 500 m slack under the 10 km cap
+  const MIN_FALLBACK_CIRCLE_PERIMETER_M = 1_200; // ≈ 190 m radius — small but still useful
+  const MAX_AVOID = 50;
+  const budgeted: number[][][] = [];
+  let remaining = TOTAL_PERIMETER_BUDGET_M;
+  for (const item of ranked) {
+    if (budgeted.length >= MAX_AVOID) break;
+    if (item.perim <= remaining) {
+      budgeted.push(item.ring);
+      remaining -= item.perim;
+      continue;
+    }
+    if (remaining >= MIN_FALLBACK_CIRCLE_PERIMETER_M) {
+      // Shrink to a circle whose perimeter consumes the rest of the budget.
+      const radius = Math.max(100, remaining / (2 * Math.PI));
+      const centre = ringCentroid(item.ring);
+      const ring = circleRing(centre, radius) as unknown as number[][];
+      budgeted.push(ring);
+      remaining = 0;
+      break;
+    }
+    break;
+  }
+  safeAvoid = budgeted;
 
   // Valhalla rejects any route whose path exceeds 250 km (error 154). The
   // straight-line distance is a lower bound on the road distance, so if it's
@@ -507,7 +759,6 @@ export async function fetchRoute(
   // when the straight line is just under it — that case is caught on the
   // response below.)
   const MAX_ROUTE_M = 250_000;
-  const straightLineM = haversineMeters(start, end);
   if (straightLineM > MAX_ROUTE_M) {
     throw new Error(
       `That destination is too far to route to — about ${Math.round(straightLineM / 1000)} km away. Choose a destination within 250 km.`,
@@ -558,19 +809,43 @@ export async function fetchRoute(
     if (errorCode === 442 || /no path could be found/i.test(detail)) {
       throw new Error('No safe route to that destination could be found. Try a nearby point.');
     }
+    // 167 = "exceeded maximum circumference for exclude polygon". Should be
+    // prevented by ringForValhallaAvoid's perimeter cap, but if a polygon
+    // still slips through we surface a clear message instead of the raw code.
+    if (errorCode === 167 || /exclude polygon/i.test(detail)) {
+      throw new Error('A hazard zone is too large to route around. Try a nearby point or wait a moment.');
+    }
     throw new Error(`Valhalla ${res.status} — ${detail}`);
   }
   const data = (await res.json()) as ValhallaResponse;
   const points: Array<{ latitude: number; longitude: number }> = [];
+  const maneuvers: RouteManeuver[] = [];
+  let offset = 0; // running index into `points` across legs
   for (const leg of data.trip.legs) {
-    for (const [lat, lng] of decodePolyline(leg.shape)) {
-      points.push({ latitude: lat, longitude: lng });
+    const legPts = decodePolyline(leg.shape);
+    for (const [lat, lng] of legPts) points.push({ latitude: lat, longitude: lng });
+    for (const m of leg.maneuvers ?? []) {
+      const instruction = (m.instruction ?? '').trim();
+      if (!instruction) continue;
+      const bi = Math.max(0, Math.min(legPts.length - 1, m.begin_shape_index ?? 0));
+      const pt = legPts[bi] ?? legPts[0] ?? [start.lat, start.lng];
+      maneuvers.push({
+        instruction,
+        verbal: (m.verbal_pre_transition_instruction ?? instruction).trim(),
+        distanceKm: m.length ?? 0,
+        type: m.type ?? 0,
+        lat: pt[0],
+        lng: pt[1],
+        shapeIndex: offset + bi,
+      });
     }
+    offset += legPts.length;
   }
   return {
     coordinates: points,
     distanceKm: data.trip.summary.length,
     durationMin: data.trip.summary.time / 60,
+    maneuvers,
   };
 }
 

@@ -12,6 +12,7 @@ import { useAuth } from '@/lib/auth';
 import { useTheme } from '@/theme';
 import { Text, Card, IconBadge, Badge, Icon, EmptyState, SkeletonCard, warningKindIcon } from '@/components/ui';
 import { describeWarningForRole, ruleFor } from '@/lib/geofence';
+import { refreshBadges } from '@/lib/badges';
 
 const DISMISSED_KEY_PREFIX = 'sentinel.alerts.dismissed.v2:';
 
@@ -71,10 +72,14 @@ export default function NotificationsScreen() {
       .catch(() => setDismissed(new Set()));
   }, [storageKey]);
 
+  // Persist the dismissed set, then refresh the tab badge so its count drops
+  // instantly (rather than waiting for the badge poller's next cycle).
   const persistDismissed = useCallback(
     (next: Set<string>) => {
       if (!storageKey) return;
-      AsyncStorage.setItem(storageKey, JSON.stringify([...next])).catch(() => {});
+      AsyncStorage.setItem(storageKey, JSON.stringify([...next]))
+        .catch(() => {})
+        .finally(() => refreshBadges());
     },
     [storageKey],
   );
@@ -94,9 +99,30 @@ export default function NotificationsScreen() {
     [persistDismissed],
   );
 
+  // Dismiss every alert currently showing. Reversible via "Show N dismissed".
+  const clearAll = useCallback(() => {
+    if (alerts.length === 0) return;
+    setDismissed((prev) => {
+      const next = new Set(prev);
+      for (const a of alerts) next.add(a.id);
+      persistDismissed(next);
+      return next;
+    });
+    setAlerts([]);
+    for (const ref of swipeRefs.current.values()) {
+      try {
+        ref.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    swipeRefs.current.clear();
+    openSwipeRef.current = null;
+  }, [alerts, persistDismissed]);
+
   const restoreAll = useCallback(() => {
     setDismissed(new Set());
-    if (storageKey) AsyncStorage.removeItem(storageKey).catch(() => {});
+    if (storageKey) AsyncStorage.removeItem(storageKey).catch(() => {}).finally(() => refreshBadges());
   }, [storageKey]);
 
   const load = async () => {
@@ -142,7 +168,7 @@ export default function NotificationsScreen() {
 
   useEffect(() => {
     load();
-    const handle = setInterval(load, 5000);
+    const handle = setInterval(load, 8000);
     return () => clearInterval(handle);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.userId, rule, dismissed]);
@@ -155,10 +181,7 @@ export default function NotificationsScreen() {
 
   const RemovePane = () => (
     <Animated.View style={[styles.removeAction, { backgroundColor: t.color.danger, borderRadius: t.radius.lg }]}>
-      <Icon name="trash" size={20} color={t.color.onDanger} />
-      <Text variant="label" color={t.color.onDanger} style={{ marginTop: 2 }}>
-        Remove
-      </Text>
+      <Icon name="trash" size={24} color={t.color.onDanger} />
     </Animated.View>
   );
   // Swipe left → action pane on the right; swipe right → pane on the left.
@@ -167,7 +190,28 @@ export default function NotificationsScreen() {
   const renderLeftActions = () => <RemovePane />;
 
   return (
-    <Screen title="Alerts" subtitle={radiusLabel} scroll={false} padded={false}>
+    <Screen
+      title="Alerts"
+      subtitle={radiusLabel}
+      scroll={false}
+      padded={false}
+      right={
+        alerts.length > 0 ? (
+          <Pressable
+            onPress={clearAll}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={`Clear all ${alerts.length} alerts`}
+            style={styles.clearAllBtn}
+          >
+            <Icon name="trash" size={14} color={t.color.danger} />
+            <Text variant="label" tone="danger">
+              Clear all
+            </Text>
+          </Pressable>
+        ) : undefined
+      }
+    >
       {firstLoad && alerts.length === 0 ? (
         <View style={{ paddingHorizontal: t.spacing.lg, paddingTop: t.spacing.sm }}>
           <SkeletonCard />
@@ -270,6 +314,7 @@ const styles = StyleSheet.create({
   distancePill: { flexDirection: 'row', alignItems: 'center', gap: 3, marginLeft: 8 },
   cardFooter: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 12 },
   timeRow: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  removeAction: { justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20, marginBottom: 12, width: 96 },
+  removeAction: { justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20, marginBottom: 12, width: 80 },
   restoreFooter: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, paddingVertical: 16 },
+  clearAllBtn: { flexDirection: 'row', alignItems: 'center', gap: 4 },
 });

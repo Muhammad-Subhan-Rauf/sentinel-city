@@ -34,6 +34,8 @@ type Props = {
   /** Extra px to lift the bottom-right legend above this screen's own bottom
    *  panel (route / dispatch card) so the chip never collides with it. */
   legendBottom?: number;
+  /** Turn-by-turn mode: keep the map zoomed in and locked on the user. */
+  navMode?: boolean;
 };
 
 type PolygonItem = {
@@ -104,6 +106,7 @@ function buildLeafletHtml(p: MapPalette): string {
   var routeLayer = L.layerGroup().addTo(map);
   var meLayer = L.layerGroup().addTo(map);
   var centeredOnMe = false;
+  var lastRouteSig = '';
 
   // Station markers mirror the web operator console exactly: an emoji DivIcon
   // (🚒 fire · 🏥 hospital · 🚓 police) with the station name as a tooltip.
@@ -156,13 +159,31 @@ function buildLeafletHtml(p: MapPalette): string {
       if (state.destination) { L.marker([state.destination.lat, state.destination.lng], { icon: makePinIcon('${p.destColor}') }).bindPopup('Destination').addTo(destinationLayer); }
 
       routeLayer.clearLayers();
-      if (state.route && state.route.length > 1) { L.polyline(state.route, { color: '${p.routeColor}', weight: 5, opacity: 0.9 }).addTo(routeLayer); }
+      if (state.route && state.route.length > 1) {
+        var poly = L.polyline(state.route, { color: '${p.routeColor}', weight: 5, opacity: 0.9 }).addTo(routeLayer);
+        // Auto-fit ONCE per distinct route — the operator workflow needs to see the
+        // whole leg the moment a dispatch arrives, otherwise the route can draw
+        // off-screen and look like "nothing happened". Signature = first+last
+        // coordinate (cheap and unique enough for a single route at a time). After
+        // the initial fit we leave the viewport alone so the user can pan freely.
+        var first = state.route[0]; var last = state.route[state.route.length - 1];
+        var sig = first[0] + ',' + first[1] + '|' + last[0] + ',' + last[1] + '|' + state.route.length;
+        if (sig !== lastRouteSig) {
+          try { map.fitBounds(poly.getBounds(), { padding: [60, 60], maxZoom: 16, animate: true }); } catch (e) {}
+          lastRouteSig = sig;
+        }
+      } else {
+        lastRouteSig = '';
+      }
 
       meLayer.clearLayers();
       if (state.me) {
         L.circle([state.me.lat, state.me.lng], { radius: 80, color: state.me.color, fillColor: state.me.color, fillOpacity: 0.15, weight: 3 }).addTo(meLayer);
         L.marker([state.me.lat, state.me.lng], { icon: makeMeIcon(state.me.color) }).bindPopup(state.me.title).addTo(meLayer);
-        if (!centeredOnMe) { map.setView([state.me.lat, state.me.lng], 14); centeredOnMe = true; }
+        // Navigation mode: keep the map zoomed in and locked on the user as they
+        // move. Otherwise just centre once on first fix.
+        if (state.follow) { map.setView([state.me.lat, state.me.lng], 17, { animate: true }); }
+        else if (!centeredOnMe && !state.route) { map.setView([state.me.lat, state.me.lng], 14); centeredOnMe = true; }
       }
     } catch (err) { post({ type: 'error', message: String(err && err.message || err) }); }
   };
@@ -188,6 +209,7 @@ export function DisasterMap({
   pins,
   onDisastersChange,
   legendBottom,
+  navMode,
 }: Props) {
   const t = useTheme();
   const webviewRef = useRef<WebViewType | null>(null);
@@ -253,7 +275,7 @@ export function DisasterMap({
       }
     };
     tick();
-    const handle = setInterval(tick, 3000);
+    const handle = setInterval(tick, 5000);
     return () => {
       cancelled = true;
       clearInterval(handle);
@@ -325,9 +347,10 @@ export function DisasterMap({
       destination: destination ?? null,
       route: route?.coordinates.map((c) => [c.latitude, c.longitude]) ?? null,
       me: myLocation ? { lat: myLocation.lat, lng: myLocation.lng, color: meColor, title: meTitle } : null,
+      follow: !!navMode,
     };
     webviewRef.current?.injectJavaScript(`window.__applyState && window.__applyState(${JSON.stringify(state)}); true;`);
-  }, [ready, polygons, pins, showOtherUsers, citizens, fireStations, hospitals, policeStations, myLocation, myRole, mySubRole, myUserId, destination, route, t.color]);
+  }, [ready, polygons, pins, showOtherUsers, citizens, fireStations, hospitals, policeStations, myLocation, myRole, mySubRole, myUserId, destination, route, navMode, t.color]);
 
   const handleMessage = (event: { nativeEvent: { data: string } }) => {
     try {
