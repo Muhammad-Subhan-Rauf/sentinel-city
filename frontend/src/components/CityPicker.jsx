@@ -129,14 +129,14 @@ export default function CityPicker({ value, onSelect, onClear }) {
 
   if (value) {
     return (
-      <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-md border border-zinc-700 bg-zinc-900">
+      <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-md border border-white/[0.08] bg-white/[0.02]">
         <div className="flex items-center gap-2 min-w-0">
           <span className="w-1.5 h-1.5 rounded-full bg-sky-500 shrink-0" />
-          <span className="text-zinc-100 text-[13px] truncate">{value.shortName}</span>
+          <span className="text-sentinel-text text-[13px] truncate">{value.shortName}</span>
         </div>
         <button
           onClick={onClear}
-          className="text-zinc-500 hover:text-zinc-200 text-[11px] shrink-0 transition-colors"
+          className="text-sentinel-textMuted hover:text-sentinel-text text-[11px] shrink-0 transition-colors"
         >
           Clear
         </button>
@@ -154,18 +154,18 @@ export default function CityPicker({ value, onSelect, onClear }) {
         onChange={(e) => setQuery(e.target.value)}
         onFocus={() => setOpen(true)}
         placeholder="Search city (e.g. Berlin)"
-        className="w-full bg-zinc-900 border border-zinc-800 rounded-md px-3 py-2 text-[13px] text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:border-zinc-600 transition-colors"
+        className="w-full bg-white/[0.02] border border-white/[0.05] rounded-md px-3 py-2 text-[13px] text-sentinel-text placeholder:text-sentinel-textMuted focus:outline-none focus:border-white/[0.12] transition-colors"
       />
       {showDropdown && (
-        <div className="absolute z-20 left-0 right-0 mt-1 max-h-60 overflow-y-auto bg-zinc-900 border border-zinc-800 rounded-md shadow-lg shadow-black/50">
+        <div className="absolute z-20 left-0 right-0 mt-1 max-h-60 overflow-y-auto bg-white/[0.02] border border-white/[0.05] rounded-md shadow-lg shadow-black/50">
           {loading && (
-            <div className="px-3 py-2 text-[12px] text-zinc-500">Searching…</div>
+            <div className="px-3 py-2 text-[12px] text-sentinel-textMuted">Searching…</div>
           )}
           {!loading && error && (
             <div className="px-3 py-2 text-[12px] text-red-400">{error}</div>
           )}
           {!loading && !error && results.length === 0 && query.trim().length >= 2 && (
-            <div className="px-3 py-2 text-[12px] text-zinc-500">No cities found</div>
+            <div className="px-3 py-2 text-[12px] text-sentinel-textMuted">No cities found</div>
           )}
           {!loading && !error &&
             results.map((r) => (
@@ -177,7 +177,7 @@ export default function CityPicker({ value, onSelect, onClear }) {
                   setResults([])
                   setOpen(false)
                 }}
-                className="w-full text-left px-3 py-2 text-[12px] text-zinc-200 hover:bg-zinc-800 transition-colors truncate"
+                className="w-full text-left px-3 py-2 text-[12px] text-sentinel-text hover:bg-white/[0.06] transition-colors truncate"
                 title={r.name}
               >
                 {r.name}

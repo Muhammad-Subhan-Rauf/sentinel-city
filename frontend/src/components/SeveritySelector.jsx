@@ -17,13 +17,13 @@ export default function SeveritySelector({ type, value, onChange }) {
   return (
     <section>
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-[12px] font-medium text-zinc-300">Severity</h2>
+        <h2 className="text-[12px] font-medium text-sentinel-text">Severity</h2>
         <div className="flex items-center gap-2">
           <span className="text-[13px] font-medium tabular-nums" style={{ color }}>
             {safeValue}
           </span>
           {activeLabel && (
-            <span className="text-[11px] text-zinc-500">{activeLabel}</span>
+            <span className="text-[11px] text-sentinel-textMuted">{activeLabel}</span>
           )}
         </div>
       </div>
@@ -38,7 +38,7 @@ export default function SeveritySelector({ type, value, onChange }) {
         style={{ '--range-pct': `${pct}%`, '--range-color': color }}
       />
 
-      <div className="flex justify-between mt-1.5 text-[10px] text-zinc-600 tabular-nums">
+      <div className="flex justify-between mt-1.5 text-[10px] text-sentinel-textMuted tabular-nums">
         <span>{min}</span>
         <span>{max}</span>
       </div>

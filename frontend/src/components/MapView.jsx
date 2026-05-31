@@ -897,6 +897,18 @@ function GeomanControls({ zones, onZoneAdd, onZoneUpdate, onZoneRemove, drawingM
     })
   }, [map, drawingMode])
 
+  // Visually highlight the Geoman toolbar when a draw tool is available AND
+  // the operator hasn't placed any zone yet — guides their next action without
+  // text. The CSS animation lives in index.css under `.pm-highlight`.
+  useEffect(() => {
+    const container = map?.getContainer?.()
+    if (!container) return
+    const hasDrawTool = drawingMode === 'area' || drawingMode === 'point'
+    const shouldHighlight = hasDrawTool && zones.length === 0
+    container.classList.toggle('pm-highlight', shouldHighlight)
+    return () => container.classList.remove('pm-highlight')
+  }, [map, drawingMode, zones.length])
+
   // pm:create / pm:remove wiring, independent of which tool is enabled.
   useEffect(() => {
     if (!map.pm) return

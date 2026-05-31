@@ -38,8 +38,8 @@ function Row({ label, value, suffix = '' }) {
   if (value === null || value === undefined) return null
   return (
     <div className="flex items-baseline justify-between gap-2 text-[11px]">
-      <span className="text-zinc-500">{label}</span>
-      <span className="text-zinc-200 tabular-nums">{value}{suffix}</span>
+      <span className="text-sentinel-textMuted">{label}</span>
+      <span className="text-sentinel-text tabular-nums">{value}{suffix}</span>
     </div>
   )
 }
@@ -53,7 +53,7 @@ function ZoneCard({ region }) {
   return (
     <div
       className={[
-        'border-b border-zinc-800 last:border-b-0 px-3 py-3 transition-opacity',
+        'border-b border-white/[0.05] last:border-b-0 px-3 py-3 transition-opacity',
         cleared ? 'opacity-55' : 'opacity-100',
       ].join(' ')}
     >
@@ -69,11 +69,11 @@ function ZoneCard({ region }) {
           {num}
         </span>
         <div className="flex-1 min-w-0">
-          <div className="text-[12px] text-zinc-100 font-medium truncate">
+          <div className="text-[12px] text-sentinel-text font-medium truncate">
             {region.disaster_type} · sev {region.severity}
             {cleared && <span className="ml-1 text-amber-400 text-[10px]">(clearing)</span>}
           </div>
-          <div className="text-[10px] text-zinc-500 leading-snug truncate" title={w.detail}>
+          <div className="text-[10px] text-sentinel-textMuted leading-snug truncate" title={w.detail}>
             {w.label}
           </div>
         </div>
@@ -95,8 +95,8 @@ function ZoneCard({ region }) {
       </div>
 
       {alerts.length > 0 && (
-        <div className="mt-2 pt-2 border-t border-zinc-800 space-y-1">
-          <div className="text-[9px] uppercase tracking-wide text-zinc-500">Active alerts</div>
+        <div className="mt-2 pt-2 border-t border-white/[0.05] space-y-1">
+          <div className="text-[9px] uppercase tracking-wide text-sentinel-textMuted">Active alerts</div>
           {alerts.map((a) => (
             <div
               key={a.id}
@@ -129,13 +129,13 @@ export default function WeatherRegionsPanel({ regions = [], onClearAll }) {
   })
 
   return (
-    <div className="w-72 max-h-[60vh] overflow-y-auto bg-zinc-900/95 backdrop-blur border border-zinc-800 rounded-md shadow-xl">
-      <div className="sticky top-0 z-10 flex items-center justify-between gap-2 px-3 py-2 bg-zinc-900/95 backdrop-blur border-b border-zinc-800">
+    <div className="w-72 max-h-[60vh] overflow-y-auto glass-strong backdrop-blur border border-white/[0.05] rounded-md shadow-xl">
+      <div className="sticky top-0 z-10 flex items-center justify-between gap-2 px-3 py-2 glass-strong backdrop-blur border-b border-white/[0.05]">
         <div className="flex items-center gap-2">
-          <span className="text-[10px] uppercase tracking-wider text-zinc-400 font-semibold">
+          <span className="text-[10px] uppercase tracking-wider text-sentinel-textDim font-semibold">
             Weather Zones
           </span>
-          <span className="text-[10px] text-zinc-500 tabular-nums">{sorted.length}</span>
+          <span className="text-[10px] text-sentinel-textMuted tabular-nums">{sorted.length}</span>
         </div>
         {onClearAll && (
           <button
