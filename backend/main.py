@@ -5,6 +5,7 @@ Sentinel-City — FastAPI Backend (no-auth mode)
 import asyncio
 import logging
 import os
+import time
 import uuid
 import json
 import math
@@ -54,6 +55,79 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Observability (#8) ──────────────────────────────────────────────────────
+# Error tracking is opt-in via SENTRY_DSN — a no-op when the env var is unset or
+# the SDK isn't installed, so it never blocks local dev.
+_http_log = logging.getLogger("sentinel.http")
+_SENTRY_DSN = os.environ.get("SENTRY_DSN")
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk  # type: ignore
+
+        sentry_sdk.init(dsn=_SENTRY_DSN, traces_sample_rate=float(os.environ.get("SENTRY_TRACES", "0.1")))
+        _http_log.info("Sentry error tracking enabled")
+    except Exception as exc:  # pragma: no cover - sentry is optional
+        _http_log.warning("SENTRY_DSN set but Sentry could not initialise: %s", exc)
+
+
+@app.middleware("http")
+async def _timing_middleware(request, call_next):
+    """Time every request, surface it as X-Response-Time-ms, and log the slow
+    ones so the chronically-slow endpoints (/api/warnings/nearby etc.) are easy
+    to spot in production logs."""
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    response.headers["X-Response-Time-ms"] = f"{elapsed_ms:.0f}"
+    if elapsed_ms > 1000.0:
+        _http_log.warning("slow request %s %s %.0fms -> %s", request.method, request.url.path, elapsed_ms, response.status_code)
+    return response
+
+
+# ── Rate limiting (#7) ──────────────────────────────────────────────────────
+# Lightweight in-process fixed-window limiter. Keyed per (scope, client) so one
+# abuser can't spam a path. Intentionally generous — a real 911 caller must
+# never be blocked; this only stops obvious flooding. (At multi-instance scale
+# this moves to Redis; see the scaling notes.)
+_rate_buckets: Dict[str, List[float]] = {}
+
+
+def _rate_limit(key: str, max_events: int, window_s: float) -> None:
+    now = time.monotonic()
+    cutoff = now - window_s
+    bucket = _rate_buckets.setdefault(key, [])
+    # Drop timestamps outside the window.
+    i = 0
+    while i < len(bucket) and bucket[i] < cutoff:
+        i += 1
+    if i:
+        del bucket[:i]
+    if len(bucket) >= max_events:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests — please wait a moment and try again.",
+        )
+    bucket.append(now)
+
+
+# ── Idempotency (#6) ────────────────────────────────────────────────────────
+# Maps a client-supplied idempotency key → the call id it created, so a retried
+# 911 submission (flaky network, double-tap) returns the SAME call instead of
+# dispatching a duplicate. Bounded so it can't grow without limit.
+_IDEMPOTENCY: Dict[str, str] = {}
+_IDEMPOTENCY_ORDER: List[str] = []
+
+
+def _remember_idempotency(key: str, call_id: str) -> None:
+    if key in _IDEMPOTENCY:
+        return
+    _IDEMPOTENCY[key] = call_id
+    _IDEMPOTENCY_ORDER.append(key)
+    if len(_IDEMPOTENCY_ORDER) > 1000:
+        old = _IDEMPOTENCY_ORDER.pop(0)
+        _IDEMPOTENCY.pop(old, None)
+
 
 DATABASE_URL: str = os.environ["DATABASE_URL"]
 
@@ -357,8 +431,80 @@ def _bootstrap_schema() -> None:
                     ALTER TABLE disaster_events
                     ADD COLUMN IF NOT EXISTS location_estimate JSONB;
                 """)
+                # 911 calls — persisted so the live call log + per-service lanes
+                # survive restarts and can be shared across instances (see db/010).
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS emergency_calls (
+                        id                 UUID PRIMARY KEY,
+                        created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        citizen_id         TEXT NOT NULL,
+                        citizen_name       TEXT,
+                        caller_lat         DOUBLE PRECISION,
+                        caller_lng         DOUBLE PRECISION,
+                        disaster_id        TEXT,
+                        disaster_type      TEXT,
+                        severity           INTEGER,
+                        cause              TEXT,
+                        disaster_lat       DOUBLE PRECISION,
+                        disaster_lng       DOUBLE PRECISION,
+                        is_direct          BOOLEAN NOT NULL DEFAULT FALSE,
+                        category           TEXT,
+                        transcript         TEXT,
+                        requested_services JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        service_status     JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        status             TEXT NOT NULL DEFAULT 'new',
+                        acknowledged_by    TEXT,
+                        acknowledged_at    TIMESTAMPTZ,
+                        closed_at          TIMESTAMPTZ,
+                        responders         JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        photo_data_url     TEXT,
+                        ai_assessment      JSONB,
+                        idempotency_key    TEXT,
+                        caller_profile     JSONB,
+                        -- Concise AI-operator dispatch brief shown to responders
+                        -- (the full conversation lives in operator_call_logs).
+                        summary            TEXT
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_emergency_calls_created
+                        ON emergency_calls (created_at DESC);
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_emergency_calls_idem
+                        ON emergency_calls (idempotency_key) WHERE idempotency_key IS NOT NULL;
+                """)
+                # Back-fill columns on tables created before they existed.
+                cur.execute("ALTER TABLE emergency_calls ADD COLUMN IF NOT EXISTS caller_profile JSONB;")
+                cur.execute("ALTER TABLE emergency_calls ADD COLUMN IF NOT EXISTS summary TEXT;")
+                # Audit log of AI-operator conversations (caller chat + operator
+                # replies + the final summary). One row per call session, upserted
+                # as the call progresses so even abandoned calls are captured.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS operator_call_logs (
+                        session_id    TEXT PRIMARY KEY,
+                        call_id       UUID,
+                        citizen_id    TEXT,
+                        citizen_name  TEXT,
+                        started_at    TIMESTAMPTZ,
+                        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        caller_lat    DOUBLE PRECISION,
+                        caller_lng    DOUBLE PRECISION,
+                        location_name TEXT,
+                        conversation  JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        summary       TEXT,
+                        services      JSONB,
+                        severity      INTEGER,
+                        category      TEXT,
+                        ended         BOOLEAN NOT NULL DEFAULT FALSE
+                    );
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_operator_logs_updated
+                        ON operator_call_logs (updated_at DESC);
+                """)
         conn.close()
-        print("[schema] citizen_reports + responder_reports ready.")
+        print("[schema] citizen_reports + responder_reports + emergency_calls ready.")
     except Exception as exc:
         print(f"[schema] bootstrap warning: {exc}")
 
@@ -1128,6 +1274,27 @@ def get_citizen_reports(
             for r in rows
         ]
     }
+
+
+@app.get("/api/reported-event-ids", tags=["Citizen Reports"])
+def get_reported_event_ids():
+    """Just the distinct disaster/event ids that have at least one citizen report.
+    The mobile app uses this to decide which disasters to surface (a zone only
+    appears once citizens report it) WITHOUT downloading the full ~118 KB reports
+    feed every few seconds. Tiny payload, index-backed (idx_citizen_reports_event)."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT event_id FROM citizen_reports WHERE event_id IS NOT NULL;")
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Reported-event-id read failed: {exc}",
+        )
+    return {"event_ids": [str(r[0]) for r in rows]}
 
 
 # ─── Responder field reports (casualty + fire_sighted) ──────────────────
@@ -3213,6 +3380,8 @@ def auth_login(payload: LoginPayload):
     device_id = (payload.device_id or "").strip()
     if not device_id:
         raise HTTPException(status_code=400, detail="device_id is required.")
+    # Throttle credential attempts per device (brute-force / spam guard).
+    _rate_limit(f"login:{device_id}", max_events=20, window_s=60.0)
     if len(pin) != 4 or not pin.isdigit():
         raise HTTPException(status_code=401, detail="Invalid PIN")
     if pin[0] != pin[3] or pin[0] not in _PIN_ROLE_MAP:
@@ -3370,10 +3539,130 @@ def delete_worker(worker_id: str):
 # Citizen taps "Call 911" while inside an active disaster zone. The mobile
 # app pre-fills the call with disaster context (type, severity, footprint,
 # the citizen's own coords + name) so dispatch knows what they're walking
-# into before they even pick up. Calls stay in memory — fine for hackathon
-# scope; survives a single backend session.
+# into before they even pick up.
+#
+# Persisted in Postgres (table emergency_calls) so the live call log and the
+# per-service accept/resolve lanes survive backend restarts and can be served
+# by more than one instance. The photo blob lives in its own column and is
+# never selected into the list feed (fetched on demand via the photo endpoint).
 
-EMERGENCY_CALLS: List[Dict[str, Any]] = []
+# Columns written on insert (full record, incl. the photo blob).
+_CALL_INSERT_COLS = [
+    "id", "created_at", "citizen_id", "citizen_name", "caller_lat", "caller_lng",
+    "disaster_id", "disaster_type", "severity", "cause", "disaster_lat", "disaster_lng",
+    "is_direct", "category", "transcript", "requested_services", "service_status",
+    "status", "acknowledged_by", "acknowledged_at", "closed_at", "responders",
+    "photo_data_url", "ai_assessment", "idempotency_key", "caller_profile", "summary",
+]
+# Columns returned to clients — everything except the heavy photo blob.
+_CALL_READ_COLS = [c for c in _CALL_INSERT_COLS if c != "photo_data_url"]
+_CALL_JSON_COLS = {"requested_services", "service_status", "responders", "ai_assessment", "caller_profile"}
+_CALL_TS_COLS = {"created_at", "acknowledged_at", "closed_at"}
+
+
+def _call_insert_values(call: Dict[str, Any]) -> list:
+    out = []
+    for col in _CALL_INSERT_COLS:
+        v = call.get(col)
+        if col in _CALL_JSON_COLS and v is not None:
+            v = psycopg2.extras.Json(v)
+        out.append(v)
+    return out
+
+
+def _row_to_public_call(row) -> Dict[str, Any]:
+    """Map a SELECT of (_CALL_READ_COLS..., has_photo) → the public call dict."""
+    d: Dict[str, Any] = {}
+    for col, v in zip(_CALL_READ_COLS, row):
+        if col in _CALL_TS_COLS and v is not None and hasattr(v, "isoformat"):
+            v = v.isoformat()
+        d[col] = v
+    d["has_photo"] = bool(row[len(_CALL_READ_COLS)])
+    if not d.get("service_status"):
+        d["service_status"] = {s: d.get("status", "new") for s in (d.get("requested_services") or [])}
+    return d
+
+
+_READ_SELECT = ", ".join(_CALL_READ_COLS) + ", (photo_data_url IS NOT NULL)"
+
+
+def _db_insert_call(call: Dict[str, Any]) -> None:
+    cols = ", ".join(_CALL_INSERT_COLS)
+    ph = ", ".join(["%s"] * len(_CALL_INSERT_COLS))
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"INSERT INTO emergency_calls ({cols}) VALUES ({ph});", _call_insert_values(call))
+    finally:
+        conn.close()
+
+
+def _db_list_calls() -> List[Dict[str, Any]]:
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {_READ_SELECT} FROM emergency_calls ORDER BY created_at DESC LIMIT 500;")
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [_row_to_public_call(r) for r in rows]
+
+
+def _db_get_call(call_id: str) -> Optional[Dict[str, Any]]:
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {_READ_SELECT} FROM emergency_calls WHERE id = %s;", (call_id,))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    return _row_to_public_call(row) if row else None
+
+
+def _db_get_call_photo(call_id: str) -> Optional[str]:
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT photo_data_url FROM emergency_calls WHERE id = %s;", (call_id,))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+def _db_call_id_by_idempotency(key: str) -> Optional[str]:
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM emergency_calls WHERE idempotency_key = %s LIMIT 1;", (key,))
+                row = cur.fetchone()
+    finally:
+        conn.close()
+    return str(row[0]) if row else None
+
+
+def _db_update_call(call_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+    sets, vals = [], []
+    for col, v in fields.items():
+        if col in _CALL_JSON_COLS and v is not None:
+            v = psycopg2.extras.Json(v)
+        sets.append(f"{col} = %s")
+        vals.append(v)
+    vals.append(call_id)
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE emergency_calls SET {', '.join(sets)} WHERE id = %s;", vals)
+    finally:
+        conn.close()
 
 
 EMERGENCY_SERVICES = ("ambulance", "police", "firefighter")
@@ -3425,6 +3714,20 @@ class EmergencyCallPayload(BaseModel):
     photo_data_url: Optional[str] = Field(
         None, description="Base64 data URL of the proof photo, if the citizen attached one."
     )
+    # Client-generated key (one per call attempt). A retry of the SAME attempt
+    # reuses the key so we return the original call instead of dispatching twice.
+    idempotency_key: Optional[str] = Field(
+        None, description="Idempotency key — retries with the same key return the same call."
+    )
+    # Caller's saved profile (vitals/medical/contact). Stored with the call and
+    # shown to the operator / responders — NOT spoken in the transcript.
+    caller_profile: Optional[Dict[str, Any]] = Field(
+        None, description="Caller's saved profile, attached so dispatch can identify/brief without it being in the transcript."
+    )
+    # Optional concise dispatch brief (set when the call came from the AI operator).
+    summary: Optional[str] = Field(
+        None, description="Concise responder-facing dispatch brief; None for a plain tap call."
+    )
 
 
 def _public_call(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -3433,13 +3736,19 @@ def _public_call(call: Dict[str, Any]) -> Dict[str, Any]:
     Exposes `has_photo` so clients know whether to offer the photo view."""
     public = {k: v for k, v in call.items() if k != "photo_data_url"}
     public["has_photo"] = bool(call.get("photo_data_url"))
+    # Back-fill per-service lanes for any record created before service_status
+    # existed, so every client always gets one.
+    if "service_status" not in public:
+        public["service_status"] = {
+            s: call.get("status", "new") for s in call.get("requested_services", [])
+        }
     return public
 
 
 def _run_call_assessment(call_id: str, transcript: str, disaster_type: Optional[str],
                          severity: Optional[int], photo_data_url: Optional[str]) -> None:
     """Background task: run the AI authenticity check and attach the verdict to the
-    in-memory call. Advisory only — failures leave the call untouched-but-flagged."""
+    persisted call. Advisory only — failures leave the call flagged-but-untouched."""
     try:
         from pipeline.prank_check import assess_call
         assessment = assess_call(transcript, disaster_type, severity, photo_data_url)
@@ -3453,19 +3762,48 @@ def _run_call_assessment(call_id: str, transcript: str, disaster_type: Optional[
             "confidence": 0.0,
             "reasoning": "AI authenticity check could not run.",
         }
-    for c in EMERGENCY_CALLS:
-        if c["id"] == call_id:
-            c["ai_assessment"] = assessment
-            break
+    try:
+        _db_update_call(call_id, ai_assessment=assessment)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("sentinel.prank_check").warning("could not persist assessment for %s: %s", call_id, exc)
 
 
-@app.post("/api/911/call", tags=["911"])
-def create_emergency_call(payload: EmergencyCallPayload, background_tasks: BackgroundTasks):
-    """Citizens-only endpoint. Builds an enriched call record by joining the
-    citizen + disaster details and pushes it onto the in-memory call log."""
+def _place_emergency_call(
+    *,
+    citizen_id: str,
+    caller_lat: float,
+    caller_lng: float,
+    requested_services: List[str],
+    transcript: str,
+    background_tasks: BackgroundTasks,
+    disaster_id: Optional[str] = None,
+    category: Optional[str] = None,
+    photo_data_url: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    caller_profile: Optional[Dict[str, Any]] = None,
+    summary: Optional[str] = None,
+    severity_override: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Shared path that builds, persists and dispatches a 911 call. Used by both
+    the citizen tap endpoint (POST /api/911/call) and the AI operator's
+    end-of-call dispatch. Joins citizen + disaster context, runs the same
+    idempotency / rate-limit / AI-authenticity flow, and returns the public call.
+    Raises HTTPException on bad input (no citizen, no valid service)."""
+    # Idempotency (#6): a retried submission with the same key returns the call
+    # already created instead of dispatching responders twice. DB-backed, so it
+    # holds across restarts and multiple instances.
+    if idempotency_key:
+        existing_id = _db_call_id_by_idempotency(idempotency_key)
+        if existing_id:
+            existing = _db_get_call(existing_id)
+            if existing:
+                return existing
+    # Spam guard (#7) — generous so a genuine caller is never blocked.
+    _rate_limit(f"call:{citizen_id}", max_events=10, window_s=60.0)
+
     # Citizen resolution — we surface the friendly name in the call log.
     with _mobile_lock:
-        citizen = MOBILE_CITIZENS.get(payload.citizen_id)
+        citizen = MOBILE_CITIZENS.get(citizen_id)
     if citizen is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -3478,7 +3816,7 @@ def create_emergency_call(payload: EmergencyCallPayload, background_tasks: Backg
     # direct SOS (no disaster_id) is always allowed. A 911 call must never fail on
     # disaster state; help comes first, triage second.
     row = None
-    if payload.disaster_id:
+    if disaster_id:
         try:
             conn = psycopg2.connect(DATABASE_URL)
             try:
@@ -3492,7 +3830,7 @@ def create_emergency_call(payload: EmergencyCallPayload, background_tasks: Backg
                             FROM disaster_events
                             WHERE id = %s;
                             """,
-                            (payload.disaster_id,),
+                            (disaster_id,),
                         )
                         row = cur.fetchone()
             finally:
@@ -3508,7 +3846,7 @@ def create_emergency_call(payload: EmergencyCallPayload, background_tasks: Backg
     if is_direct:
         # Direct SOS — no (usable) disaster context. Headline from the category.
         disaster_id_out = None
-        disaster_type = (payload.category or "Direct emergency").strip() or "Direct emergency"
+        disaster_type = (category or "Direct emergency").strip() or "Direct emergency"
         # Unverified urgency — dispatch + the AI authenticity check do the triage.
         severity = 3
         cause = None
@@ -3521,10 +3859,17 @@ def create_emergency_call(payload: EmergencyCallPayload, background_tasks: Backg
         disaster_geom = _coerce_geojson(row[5])
         disaster_centroid = _geometry_centroid(disaster_geom)
 
+    # The AI operator's judged severity (when provided) wins over the placeholder.
+    if severity_override is not None:
+        try:
+            severity = max(1, min(5, int(severity_override)))
+        except (TypeError, ValueError):
+            pass
+
     # De-dupe + canonicalise requested_services. The citizen UI sends
     # ['ambulance','police','firefighter'] for "all services"; we keep it as a
     # list rather than a flag so adding new service types later is non-breaking.
-    services = sorted({s for s in payload.requested_services if s in EMERGENCY_SERVICES})
+    services = sorted({s for s in requested_services if s in EMERGENCY_SERVICES})
     if not services:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -3535,10 +3880,10 @@ def create_emergency_call(payload: EmergencyCallPayload, background_tasks: Backg
         "id": str(uuid.uuid4()),
         "created_at": datetime.utcnow().isoformat() + "Z",
         # Citizen context
-        "citizen_id": payload.citizen_id,
+        "citizen_id": citizen_id,
         "citizen_name": citizen.get("name") or "Unknown caller",
-        "caller_lat": payload.caller_lat,
-        "caller_lng": payload.caller_lng,
+        "caller_lat": caller_lat,
+        "caller_lng": caller_lng,
         # Disaster context — frozen at call time so the log reads correctly
         # even after the operator bumps severity or clears the event. For a
         # direct SOS these are derived from the category (see above).
@@ -3550,12 +3895,20 @@ def create_emergency_call(payload: EmergencyCallPayload, background_tasks: Backg
         "disaster_lng": disaster_centroid["lng"] if disaster_centroid else None,
         # True when this is a direct SOS not tied to any declared disaster.
         "is_direct": is_direct,
-        "category": (payload.category or None),
-        # Pre-built script the citizen "spoke" on tap.
-        "transcript": payload.transcript.strip() or "(no transcript provided)",
+        "category": (category or None),
+        # Transcript: the citizen's scripted statement, or the AI-operator call
+        # transcript. The concise responder-facing brief is `summary` below.
+        "transcript": (transcript or "").strip() or "(no transcript provided)",
+        # Concise AI-operator dispatch brief for responders (None for tap calls).
+        "summary": (summary.strip() if isinstance(summary, str) and summary.strip() else None),
         # Service routing — which responder types the citizen asked for.
         "requested_services": services,
-        # Lifecycle: new → acknowledged → closed. Workers flip these.
+        # Per-service lifecycle: each requested service accepts/resolves on its
+        # OWN lane, independently. A firefighter acknowledging or resolving does
+        # not change the ambulance/police lanes. The top-level `status` below is
+        # a derived summary (for admin/back-compat); per-lane truth lives here.
+        "service_status": {s: "new" for s in services},
+        # Lifecycle summary: new → acknowledged → closed. Derived from the lanes.
         "status": "new",
         "acknowledged_by": None,
         "acknowledged_at": None,
@@ -3567,13 +3920,12 @@ def create_emergency_call(payload: EmergencyCallPayload, background_tasks: Backg
         # of list payloads (see _public_call) and fetched on demand. The
         # assessment is filled in by a background task moments after the call is
         # created, so the call itself reaches dispatch with zero added latency.
-        "photo_data_url": (payload.photo_data_url or None),
+        "photo_data_url": (photo_data_url or None),
         "ai_assessment": {"status": "analyzing"},
+        "idempotency_key": (idempotency_key or None),
+        "caller_profile": (caller_profile or None),
     }
-    EMERGENCY_CALLS.append(call)
-    # Keep the log bounded so demo sessions don't grow unbounded in memory.
-    if len(EMERGENCY_CALLS) > 500:
-        del EMERGENCY_CALLS[:-500]
+    _db_insert_call(call)
 
     # Kick off the AI authenticity check after the response is sent.
     background_tasks.add_task(
@@ -3582,6 +3934,26 @@ def create_emergency_call(payload: EmergencyCallPayload, background_tasks: Backg
         call["photo_data_url"],
     )
     return _public_call(call)
+
+
+@app.post("/api/911/call", tags=["911"])
+def create_emergency_call(payload: EmergencyCallPayload, background_tasks: BackgroundTasks):
+    """Citizens-only endpoint. Builds an enriched call record by joining the
+    citizen + disaster details and persists it to the emergency_calls table."""
+    return _place_emergency_call(
+        citizen_id=payload.citizen_id,
+        caller_lat=payload.caller_lat,
+        caller_lng=payload.caller_lng,
+        requested_services=payload.requested_services,
+        transcript=payload.transcript,
+        background_tasks=background_tasks,
+        disaster_id=payload.disaster_id,
+        category=payload.category,
+        photo_data_url=payload.photo_data_url,
+        idempotency_key=payload.idempotency_key,
+        caller_profile=payload.caller_profile,
+        summary=payload.summary,
+    )
 
 
 @app.get("/api/911/calls", tags=["911"])
@@ -3593,32 +3965,29 @@ def list_emergency_calls(
     ),
 ):
     """Newest-first dispatch feed. Workers filter by `service` to see only
-    calls relevant to their unit; admins / operators omit it for the full feed."""
-    rows = list(EMERGENCY_CALLS)
+    calls relevant to their unit; admins / operators omit it for the full feed.
+    Already newest-first and photo-stripped from the DB query."""
+    if service and service not in EMERGENCY_SERVICES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"service must be one of {EMERGENCY_SERVICES}",
+        )
+    rows = _db_list_calls()
     if status_filter and status_filter != "all":
         rows = [c for c in rows if c["status"] == status_filter]
     if service:
-        if service not in EMERGENCY_SERVICES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"service must be one of {EMERGENCY_SERVICES}",
-            )
-        rows = [c for c in rows if service in c.get("requested_services", [])]
-    rows.sort(key=lambda c: c["created_at"], reverse=True)
-    return {"calls": [_public_call(c) for c in rows]}
+        rows = [c for c in rows if service in (c.get("requested_services") or [])]
+    return {"calls": rows}
 
 
 @app.get("/api/911/calls/{call_id}/photo", tags=["911"])
 def get_emergency_call_photo(call_id: str):
     """Return the proof photo (base64 data URL) for one call, on demand. Kept out
     of the list feed so the frequently-polled dispatch queue stays lightweight."""
-    for c in EMERGENCY_CALLS:
-        if c["id"] == call_id:
-            data_url = c.get("photo_data_url")
-            if not data_url:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No photo on this call.")
-            return {"id": call_id, "photo_data_url": data_url}
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
+    data_url = _db_get_call_photo(call_id)
+    if not data_url:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No photo on this call.")
+    return {"id": call_id, "photo_data_url": data_url}
 
 
 class EmergencyCallUpdate(BaseModel):
@@ -3632,30 +4001,439 @@ class EmergencyCallUpdate(BaseModel):
 
 @app.patch("/api/911/calls/{call_id}", tags=["911"])
 def update_emergency_call(call_id: str, update: EmergencyCallUpdate):
-    """Mark a call acknowledged (responder en-route) or closed (incident
-    resolved). Acknowledgements append to the responders list rather than
-    overwriting — multiple services can take the same call."""
-    for c in EMERGENCY_CALLS:
-        if c["id"] != call_id:
+    """Accept (acknowledge) or resolve (close) a call. The transition applies to
+    the acting worker's OWN service lane only — so when a citizen requested
+    ambulance + police + firefighter, each unit accepts/resolves independently
+    and one acting never removes the call from the others. The worker's `sub_role`
+    identifies which lane to change; the top-level `status` is re-derived as a
+    summary. With no sub_role (e.g. an admin), the change applies to every lane."""
+    now = datetime.utcnow().isoformat() + "Z"
+    c = _db_get_call(call_id)
+    if c is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
+
+    lanes: Dict[str, str] = c.get("service_status") or {
+        s: c.get("status", "new") for s in (c.get("requested_services") or [])
+    }
+    service = SUBROLE_TO_SERVICE.get(update.sub_role) if update.sub_role else None
+
+    if update.status:
+        if service and service in lanes:
+            lanes[service] = update.status          # only this responder's lane moves
+        else:
+            for s in list(lanes.keys()):            # no lane context → whole call
+                lanes[s] = update.status
+
+    responders = list(c.get("responders") or [])
+    if update.worker_id and update.sub_role:
+        if not any(r.get("worker_id") == update.worker_id for r in responders):
+            responders.append({
+                "worker_id": update.worker_id,
+                "sub_role": update.sub_role,
+                "acknowledged_at": now,
+            })
+        c["acknowledged_by"] = update.worker_id  # legacy single-string field
+
+    # Re-derive the summary status from the lanes.
+    vals = list(lanes.values()) or [c.get("status", "new")]
+    if all(v == "closed" for v in vals):
+        c["status"] = "closed"
+        c["closed_at"] = c.get("closed_at") or now
+    elif any(v in ("acknowledged", "closed") for v in vals):
+        c["status"] = "acknowledged"
+        c["acknowledged_at"] = c.get("acknowledged_at") or now
+    else:
+        c["status"] = "new"
+
+    c["service_status"] = lanes
+    c["responders"] = responders
+    _db_update_call(
+        call_id,
+        service_status=lanes,
+        responders=responders,
+        status=c["status"],
+        acknowledged_by=c.get("acknowledged_by"),
+        acknowledged_at=c.get("acknowledged_at"),
+        closed_at=c.get("closed_at"),
+    )
+    return c
+
+
+# ════════════════════════════════════════════════════════════════════
+# AI 911 operator — live, guardrailed conversational dispatch
+#
+# The citizen holds a real back-and-forth call (voice transcribed to text, or
+# typed) with an LLM operator (see pipeline.operator). The operator gathers what
+# happened + where, decides which responders to send, and on end-of-call emits a
+# concise dispatch brief. The full conversation (caller chat + operator replies +
+# summary) is persisted to operator_call_logs for AUDIT, upserted per turn so an
+# abandoned call is still captured.
+#
+# Sessions live in memory for the duration of one call (short-lived); the durable
+# records are the audit log + the dispatched emergency_call. A 911 line must
+# NEVER go dead, so every model failure degrades to a safe holding reply /
+# all-services dispatch (see pipeline.operator's never-raise contract).
+# ════════════════════════════════════════════════════════════════════
+
+_operator_lock = _MobileLock()
+# session_id -> session dict. Short-lived (one live call). Pruned on access.
+OPERATOR_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_OPERATOR_SESSION_TTL_S = 60 * 60  # 1h — a single call won't outlive this.
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _prune_operator_sessions() -> None:
+    cutoff = time.monotonic() - _OPERATOR_SESSION_TTL_S
+    for sid in [s for s, v in OPERATOR_SESSIONS.items() if v.get("_touched", 0) < cutoff]:
+        OPERATOR_SESSIONS.pop(sid, None)
+
+
+def _operator_ctx(session: Dict[str, Any]) -> Dict[str, Any]:
+    """The context pipeline.operator needs: caller location (for the 'my location'
+    shortcut) + any seeded category / disaster context + profile-on-file flag."""
+    return {
+        "caller_lat": session.get("caller_lat"),
+        "caller_lng": session.get("caller_lng"),
+        "location_name": session.get("location_name"),
+        "category": session.get("category"),
+        "disaster_type": session.get("disaster_type"),
+        "disaster_severity": session.get("disaster_severity"),
+        "has_profile": bool(session.get("caller_profile")),
+    }
+
+
+def _render_call_transcript(history: List[Dict[str, Any]]) -> str:
+    """Readable Caller/Operator transcript of the whole call, stored on the call
+    record so responders can read the full exchange behind the concise summary."""
+    lines = []
+    for turn in history:
+        text = (turn.get("text") or "").strip()
+        if not text:
             continue
-        if update.status:
-            c["status"] = update.status
-            if update.status == "acknowledged" and not c.get("acknowledged_at"):
-                c["acknowledged_at"] = datetime.utcnow().isoformat() + "Z"
-            if update.status == "closed" and not c.get("closed_at"):
-                c["closed_at"] = datetime.utcnow().isoformat() + "Z"
-        if update.worker_id and update.sub_role:
-            already = any(r.get("worker_id") == update.worker_id for r in c.get("responders", []))
-            if not already:
-                c.setdefault("responders", []).append({
-                    "worker_id": update.worker_id,
-                    "sub_role": update.sub_role,
-                    "acknowledged_at": datetime.utcnow().isoformat() + "Z",
-                })
-            # Keep the legacy single-string field populated for backward compat.
-            c["acknowledged_by"] = update.worker_id
-        return _public_call(c)
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call not found.")
+        who = "Operator" if turn.get("role") == "operator" else "Caller"
+        lines.append(f"{who}: {text}")
+    return "\n".join(lines)
+
+
+def _db_upsert_operator_log(session: Dict[str, Any]) -> None:
+    """Persist/refresh the audit row for one operator call session. Best-effort —
+    audit logging must NEVER break a live 911 call."""
+    try:
+        plan = session.get("plan", {})
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO operator_call_logs
+                            (session_id, call_id, citizen_id, citizen_name, started_at,
+                             updated_at, caller_lat, caller_lng, location_name,
+                             conversation, summary, services, severity, category, ended)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (session_id) DO UPDATE SET
+                            call_id = EXCLUDED.call_id,
+                            updated_at = EXCLUDED.updated_at,
+                            conversation = EXCLUDED.conversation,
+                            summary = EXCLUDED.summary,
+                            services = EXCLUDED.services,
+                            severity = EXCLUDED.severity,
+                            category = EXCLUDED.category,
+                            ended = EXCLUDED.ended;
+                        """,
+                        (
+                            session["id"],
+                            session.get("call_id"),
+                            session.get("citizen_id"),
+                            session.get("citizen_name"),
+                            session.get("started_at"),
+                            datetime.utcnow(),
+                            session.get("caller_lat"),
+                            session.get("caller_lng"),
+                            session.get("location_name"),
+                            psycopg2.extras.Json(session.get("history") or []),
+                            session.get("summary"),
+                            psycopg2.extras.Json(plan.get("services") or []),
+                            plan.get("severity"),
+                            plan.get("category"),
+                            bool(session.get("ended")),
+                        ),
+                    )
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - audit must not break the call
+        logging.getLogger("sentinel.operator").warning("audit log upsert failed: %s", exc)
+
+
+def _lookup_disaster_brief(disaster_id: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
+    """Best-effort (type, severity) for an optional disaster context. Never raises."""
+    if not disaster_id:
+        return None, None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT disaster_type, severity FROM disaster_events WHERE id = %s;",
+                        (disaster_id,),
+                    )
+                    row = cur.fetchone()
+        finally:
+            conn.close()
+        if row:
+            return row[0], row[1]
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+class OperatorStartPayload(BaseModel):
+    """Open a live AI-operator call session."""
+    citizen_id: str
+    caller_lat: float
+    caller_lng: float
+    # Reverse-geocoded place name for the caller's location (powers the
+    # "my location / current location / my area" shortcut, so the caller never
+    # has to read out coordinates).
+    location_name: Optional[str] = None
+    category: Optional[str] = None
+    disaster_id: Optional[str] = None
+    caller_profile: Optional[Dict[str, Any]] = None
+
+
+class OperatorMessagePayload(BaseModel):
+    """One caller turn — typed text OR a spoken-audio clip to transcribe."""
+    session_id: str
+    text: Optional[str] = None
+    audio_base64: Optional[str] = None
+    mime: Optional[str] = None
+
+
+class OperatorEndPayload(BaseModel):
+    """End the call: finalize a concise brief and dispatch the responders."""
+    session_id: str
+    idempotency_key: Optional[str] = None
+    photo_data_url: Optional[str] = None
+
+
+class OperatorTranscribePayload(BaseModel):
+    """Transcribe a spoken clip to text WITHOUT sending it to the operator, so the
+    caller can review/edit the words before they send the message."""
+    audio_base64: str
+    mime: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+@app.post("/api/911/operator/start", tags=["911"])
+def operator_start(payload: OperatorStartPayload):
+    """Begin a conversational 911 call. Returns the session id + the operator's
+    opening line. The caller then exchanges messages via /operator/message and
+    hangs up via /operator/end."""
+    _rate_limit(f"operator:{payload.citizen_id}", max_events=20, window_s=60.0)
+    with _mobile_lock:
+        citizen = MOBILE_CITIZENS.get(payload.citizen_id)
+    if citizen is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Citizen not found — sign in again.")
+
+    from pipeline.operator import GREETING
+    disaster_type, disaster_severity = _lookup_disaster_brief(payload.disaster_id)
+    sid = str(uuid.uuid4())
+    session = {
+        "id": sid,
+        "citizen_id": payload.citizen_id,
+        "citizen_name": citizen.get("name") or "Unknown caller",
+        "caller_lat": payload.caller_lat,
+        "caller_lng": payload.caller_lng,
+        "location_name": (payload.location_name or None),
+        "category": (payload.category or None),
+        "disaster_id": (payload.disaster_id or None),
+        "disaster_type": disaster_type,
+        "disaster_severity": disaster_severity,
+        "caller_profile": (payload.caller_profile or None),
+        "history": [{"role": "operator", "text": GREETING, "ts": _now_iso()}],
+        "plan": {"services": [], "severity": 3, "category": (payload.category or "Other")},
+        "started_at": datetime.utcnow(),
+        "ended": False,
+        "call_id": None,
+        "summary": None,
+        "_touched": time.monotonic(),
+    }
+    with _operator_lock:
+        _prune_operator_sessions()
+        OPERATOR_SESSIONS[sid] = session
+    _db_upsert_operator_log(session)
+    return {"session_id": sid, "greeting": GREETING}
+
+
+@app.post("/api/911/operator/message", tags=["911"])
+def operator_message(payload: OperatorMessagePayload):
+    """One conversational turn. Accepts typed text or a spoken-audio clip (which
+    is transcribed server-side). Returns the operator's reply + its current
+    dispatch plan (services/severity/category). The exchange is appended to the
+    audit log every turn."""
+    with _operator_lock:
+        session = OPERATOR_SESSIONS.get(payload.session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call session not found or expired — start a new call.")
+    if session.get("ended"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This call has already ended.")
+    _rate_limit(f"operator:{session['citizen_id']}", max_events=40, window_s=60.0)
+
+    from pipeline import operator as op
+
+    plan = session["plan"]
+    # 1. Resolve the caller's words — transcribe audio when there's no text.
+    user_text = (payload.text or "").strip()
+    transcription_failed = False
+    if not user_text and payload.audio_base64:
+        res = op.transcribe_audio(payload.audio_base64, payload.mime)
+        user_text = (res.get("text") or "").strip()
+        transcription_failed = not user_text
+    if not user_text:
+        # Nothing intelligible — a calm reprompt, no model call, no history churn.
+        return {
+            "user_text": "",
+            "reply": "I didn't catch that — could you say it again, or type what's happening?",
+            "services": plan["services"], "severity": plan["severity"], "category": plan["category"],
+            "ready_to_dispatch": False, "off_topic": False, "transcription_failed": transcription_failed,
+        }
+
+    # 2. Append the caller turn, ask the operator for its reply + plan.
+    session["history"].append({"role": "caller", "text": user_text, "ts": _now_iso()})
+    turn = op.operator_turn(session["history"], _operator_ctx(session))
+
+    # 3. Merge the plan — only adopt a non-empty service set so we never regress
+    #    to "no responders" mid-call once we've learned what's needed.
+    if turn.get("services"):
+        plan["services"] = turn["services"]
+    plan["severity"] = turn.get("severity", plan["severity"])
+    plan["category"] = turn.get("category", plan["category"])
+
+    # 4. Append the operator reply + persist the audit log for this turn.
+    session["history"].append({"role": "operator", "text": turn["reply"], "ts": _now_iso()})
+    session["_touched"] = time.monotonic()
+    _db_upsert_operator_log(session)
+    return {
+        "user_text": user_text,
+        "reply": turn["reply"],
+        "services": plan["services"],
+        "severity": plan["severity"],
+        "category": plan["category"],
+        "ready_to_dispatch": turn.get("ready_to_dispatch", False),
+        "off_topic": turn.get("off_topic", False),
+        "transcription_failed": False,
+    }
+
+
+@app.post("/api/911/operator/transcribe", tags=["911"])
+def operator_transcribe(payload: OperatorTranscribePayload):
+    """Speech-to-text for ONE spoken clip — returns the text so the caller can
+    review it in the input box before sending. Does not touch the conversation."""
+    cid = "anon"
+    if payload.session_id:
+        with _operator_lock:
+            sess = OPERATOR_SESSIONS.get(payload.session_id)
+        if sess:
+            cid = sess.get("citizen_id") or "anon"
+    _rate_limit(f"operator-stt:{cid}", max_events=60, window_s=60.0)
+    from pipeline import operator as op
+    res = op.transcribe_audio(payload.audio_base64, payload.mime)
+    text = res.get("text", "")
+    return {"text": text, "transcription_failed": not text}
+
+
+@app.post("/api/911/operator/end", tags=["911"])
+def operator_end(payload: OperatorEndPayload, background_tasks: BackgroundTasks):
+    """Hang up: generate the concise dispatch brief, dispatch the responders, and
+    finalize the audit log. Idempotent — re-ending returns the same dispatched
+    call instead of double-dispatching."""
+    with _operator_lock:
+        session = OPERATOR_SESSIONS.get(payload.session_id)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Call session not found or expired.")
+    # Idempotent: already dispatched → return the same call.
+    if session.get("ended") and session.get("call_id"):
+        existing = _db_get_call(session["call_id"])
+        if existing:
+            return {"call": existing, "summary": session.get("summary"), "key_facts": session.get("key_facts", [])}
+
+    from pipeline import operator as op
+
+    final = op.finalize_call(session["history"], _operator_ctx(session))
+    services = final.get("services") or session["plan"].get("services") or list(op.SERVICES)
+    summary = final.get("summary")
+    transcript = _render_call_transcript(session["history"])
+    idem = payload.idempotency_key or f"operator:{session['id']}"
+
+    call = _place_emergency_call(
+        citizen_id=session["citizen_id"],
+        caller_lat=session["caller_lat"],
+        caller_lng=session["caller_lng"],
+        requested_services=services,
+        transcript=transcript,
+        background_tasks=background_tasks,
+        disaster_id=session.get("disaster_id"),
+        category=final.get("category") or session.get("category"),
+        photo_data_url=payload.photo_data_url,
+        idempotency_key=idem,
+        caller_profile=session.get("caller_profile"),
+        summary=summary,
+        severity_override=final.get("severity"),
+    )
+
+    # Finalize the session + audit row.
+    session["ended"] = True
+    session["call_id"] = call.get("id")
+    session["summary"] = summary
+    session["key_facts"] = final.get("key_facts", [])
+    session["plan"]["services"] = services
+    session["plan"]["severity"] = final.get("severity", session["plan"]["severity"])
+    session["plan"]["category"] = final.get("category", session["plan"]["category"])
+    session["_touched"] = time.monotonic()
+    _db_upsert_operator_log(session)
+    return {"call": call, "summary": summary, "key_facts": final.get("key_facts", [])}
+
+
+@app.get("/api/911/operator/logs", tags=["911"])
+def list_operator_logs(limit: int = Query(100, ge=1, le=500)):
+    """Audit feed of AI-operator call conversations (caller chat + operator
+    replies + the final summary), newest first. For admin / compliance review."""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT session_id, call_id, citizen_id, citizen_name, started_at,
+                           updated_at, caller_lat, caller_lng, location_name,
+                           conversation, summary, services, severity, category, ended
+                    FROM operator_call_logs ORDER BY updated_at DESC LIMIT %s;
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+    finally:
+        conn.close()
+    cols = [
+        "session_id", "call_id", "citizen_id", "citizen_name", "started_at", "updated_at",
+        "caller_lat", "caller_lng", "location_name", "conversation", "summary", "services",
+        "severity", "category", "ended",
+    ]
+    out = []
+    for r in rows:
+        d: Dict[str, Any] = {}
+        for c, v in zip(cols, r):
+            if c in ("started_at", "updated_at") and v is not None and hasattr(v, "isoformat"):
+                v = v.isoformat()
+            if c == "call_id" and v is not None:
+                v = str(v)
+            d[c] = v
+        out.append(d)
+    return {"logs": out}
 
 
 # ════════════════════════════════════════════════════════════════════
