@@ -40,7 +40,7 @@ export default function AdminDispatchScreen() {
 
   useEffect(() => {
     load();
-    const h = setInterval(load, 5000);
+    const h = setInterval(load, 8000);
     return () => clearInterval(h);
   }, []);
 

@@ -99,6 +99,7 @@ const RESPONDER_SECTIONS: SectionDef[] = [
 export function ProfileModal({
   visible,
   onClose,
+  onSaved,
   userId,
   kind,
   subRole,
@@ -107,6 +108,8 @@ export function ProfileModal({
 }: {
   visible: boolean;
   onClose: () => void;
+  /** Called after a successful save with the saved profile, before closing. */
+  onSaved?: (profile: AnyProfile) => void;
   userId: string;
   kind: Kind;
   subRole?: string;
@@ -129,6 +132,7 @@ export function ProfileModal({
     setSaving(true);
     await saveProfile(userId, profile);
     setSaving(false);
+    onSaved?.(profile);
     onClose();
   };
 

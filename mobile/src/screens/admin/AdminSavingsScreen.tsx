@@ -45,7 +45,7 @@ export default function AdminSavingsScreen() {
 
   useEffect(() => {
     load();
-    const h = setInterval(load, 4000);
+    const h = setInterval(load, 8000);
     return () => clearInterval(h);
   }, []);
 

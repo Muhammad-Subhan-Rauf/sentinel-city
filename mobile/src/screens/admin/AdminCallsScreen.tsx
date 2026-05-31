@@ -9,7 +9,7 @@ import { api, type CitizenReport } from '@/lib/api';
 import { useTheme } from '@/theme';
 import { Text, Badge, Icon } from '@/components/ui';
 
-const POLL_MS = 5000;
+const POLL_MS = 8000;
 
 function relativeTime(iso: string): string {
   const then = new Date(iso).getTime();
