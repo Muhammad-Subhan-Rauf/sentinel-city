@@ -125,14 +125,33 @@ export async function requestRoute({ start, end, zones = [], signal }) {
     directions_options: { units: 'kilometers' },
   }
   const avoid = zonesToAvoidPolygons(zones)
-  if (avoid.length > 0) body.exclude_polygons = avoid
 
-  const res = await fetch(`${VALHALLA_URL}/route/v1?api_key=${STADIA_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal,
-  })
+  const postRoute = (exclude) => {
+    const payload = { ...body }
+    if (exclude.length > 0) payload.exclude_polygons = exclude
+    else delete payload.exclude_polygons
+    return fetch(`${VALHALLA_URL}/route/v1?api_key=${STADIA_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal,
+    })
+  }
+
+  let res = await postRoute(avoid)
+
+  // Stadia caps the total exclude-polygon perimeter/area; once enough disasters
+  // are active, dumping every hazard zone trips that limit and the whole route
+  // fails. If the ONLY problem is the polygon limit, retry once WITHOUT the
+  // hazards — a route that ignores a zone beats failing the dispatch entirely.
+  if (!res.ok && avoid.length > 0) {
+    let peek = ''
+    try { peek = await res.clone().text() } catch { /* ignore */ }
+    if (/\b167\b|exclude polygon|avoid polygon|polygon/i.test(peek)) {
+      res = await postRoute([])
+    }
+  }
+
   if (!res.ok) {
     let detail = `HTTP ${res.status}`
     try {

@@ -830,26 +830,42 @@ export async function fetchRoute(
     );
   }
 
-  const body = {
-    locations: [
-      { lat: start.lat, lon: start.lng },
-      { lat: end.lat, lon: end.lng },
-    ],
-    costing,
-    units: 'kilometers',
-    ...(safeAvoid.length > 0 ? { exclude_polygons: safeAvoid } : {}),
+  const postRoute = async (exclude: number[][][]): Promise<Response> => {
+    const body = {
+      locations: [
+        { lat: start.lat, lon: start.lng },
+        { lat: end.lat, lon: end.lng },
+      ],
+      costing,
+      units: 'kilometers',
+      ...(exclude.length > 0 ? { exclude_polygons: exclude } : {}),
+    };
+    try {
+      return await fetch(`${VALHALLA_URL}/route/v1?api_key=${STADIA_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (e: any) {
+      throw new Error(
+        `Cannot reach routing service at ${VALHALLA_URL}. Verify the Stadia API key is set and your network is reachable. (${e?.message ?? 'network error'})`,
+      );
+    }
   };
-  let res: Response;
-  try {
-    res = await fetch(`${VALHALLA_URL}/route/v1?api_key=${STADIA_API_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-  } catch (e: any) {
-    throw new Error(
-      `Cannot reach routing service at ${VALHALLA_URL}. Verify EXPO_PUBLIC_STADIA_API_KEY is set and your network is reachable. (${e?.message ?? 'network error'})`,
-    );
+
+  let res = await postRoute(safeAvoid);
+
+  // Last-resort fallback: if the request fails ONLY because of the avoid-polygon
+  // limit (Stadia caps total exclude-polygon perimeter/area/count), retry once
+  // WITHOUT the hazards. A route that ignores a danger zone beats no route. We
+  // already budget polygons above, so this is rare — but it guarantees a
+  // polygon-limit error never breaks navigation.
+  if (!res.ok && safeAvoid.length > 0) {
+    let peek = '';
+    try { peek = await res.clone().text(); } catch { /* clone unsupported — skip */ }
+    if (/\b167\b|exclude polygon|avoid polygon|polygon/i.test(peek)) {
+      res = await postRoute([]);
+    }
   }
   if (!res.ok) {
     // Surface Valhalla's actual error string (e.g. "No path could be found",
