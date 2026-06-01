@@ -3,6 +3,7 @@ Sentinel-City — FastAPI Backend (no-auth mode)
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -4698,6 +4699,85 @@ def _nearest_summary(lat: float, lng: float) -> Dict[str, Any]:
     return out
 
 
+def _load_all_stations() -> Dict[str, List[Tuple[str, float, float]]]:
+    """Every hospital / fire / police station in a SINGLE connection, as
+    {kind: [(name, lat, lng), ...]}. Replaces the per-cluster, per-kind
+    _nearest_resources fan-out (which opened ~24 remote connections per insight
+    build — the dominant cold-start latency). Never raises — empty on error."""
+    out: Dict[str, List[Tuple[str, float, float]]] = {
+        "hospital": [], "fire_station": [], "police_station": [],
+    }
+    tables = {"hospital": "hospitals", "fire_station": "fire_stations", "police_station": "police_stations"}
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                for kind, table in tables.items():
+                    cur.execute(f"SELECT name, lat, lng FROM {table};")
+                    out[kind] = [(r[0], float(r[1]), float(r[2])) for r in cur.fetchall()]
+        conn.close()
+    except Exception as exc:
+        _heat_log.warning("insight station load failed: %s", exc)
+    return out
+
+
+def _nearest_summary_from(
+    stations: Dict[str, List[Tuple[str, float, float]]], lat: float, lng: float
+) -> Dict[str, Any]:
+    """Nearest hospital / fire / police {name, distance_m} for a hotspot, computed
+    in Python from preloaded stations (no DB hit)."""
+    out: Dict[str, Any] = {}
+    for kind in ("hospital", "fire_station", "police_station"):
+        best_name, best_d = None, None
+        for name, slat, slng in stations.get(kind, []):
+            d = _distance_haversine(lat, lng, slat, slng)
+            if best_d is None or d < best_d:
+                best_name, best_d = name, d
+        out[kind] = {"name": best_name, "distance_m": round(best_d, 1)} if best_name is not None else None
+    return out
+
+
+# Neighbourhood centroids for turning a hotspot lat/lng into a human-readable
+# area name ("Washington Heights") instead of raw coordinates in the AI insight.
+# Offline + deterministic (no geocoding API). Manhattan-dense (the demo's focus)
+# with a few outer-borough anchors so a stray point still resolves to something
+# sensible. A hotspot farther than _NEIGHBORHOOD_MAX_M from all of these falls
+# back to coordinates.
+_NEIGHBORHOODS: List[Tuple[str, float, float]] = [
+    ("Financial District", 40.7075, -74.0113), ("Battery Park City", 40.7115, -74.0156),
+    ("Tribeca", 40.7163, -74.0086), ("SoHo", 40.7233, -74.0030),
+    ("Chinatown", 40.7158, -73.9970), ("Lower East Side", 40.7150, -73.9843),
+    ("East Village", 40.7265, -73.9815), ("Greenwich Village", 40.7336, -74.0027),
+    ("West Village", 40.7358, -74.0036), ("Chelsea", 40.7465, -74.0014),
+    ("Flatiron", 40.7401, -73.9903), ("Gramercy", 40.7368, -73.9845),
+    ("Murray Hill", 40.7479, -73.9756), ("Midtown", 40.7549, -73.9840),
+    ("Midtown East", 40.7549, -73.9719), ("Hell's Kitchen", 40.7638, -73.9918),
+    ("Times Square", 40.7580, -73.9855), ("Central Park", 40.7829, -73.9654),
+    ("Upper East Side", 40.7736, -73.9566), ("Upper West Side", 40.7870, -73.9754),
+    ("Lincoln Square", 40.7741, -73.9846), ("Roosevelt Island", 40.7610, -73.9505),
+    ("Morningside Heights", 40.8089, -73.9626), ("East Harlem", 40.7957, -73.9389),
+    ("Harlem", 40.8116, -73.9465), ("Hamilton Heights", 40.8252, -73.9493),
+    ("Washington Heights", 40.8417, -73.9393), ("Inwood", 40.8677, -73.9212),
+    # Outer-borough anchors (fallback only).
+    ("Long Island City", 40.7447, -73.9485), ("Astoria", 40.7644, -73.9235),
+    ("Williamsburg", 40.7081, -73.9571), ("DUMBO", 40.7033, -73.9881),
+    ("Downtown Brooklyn", 40.6920, -73.9890), ("South Bronx", 40.8200, -73.9100),
+    ("St. George, Staten Island", 40.6440, -74.0760),
+]
+_NEIGHBORHOOD_MAX_M = 3000.0
+
+
+def _nearest_neighborhood(lat: float, lng: float) -> Optional[str]:
+    """Human-readable area name for a hotspot, or None if nothing is close
+    enough (caller falls back to coordinates)."""
+    best_name, best_d = None, _NEIGHBORHOOD_MAX_M
+    for name, nlat, nlng in _NEIGHBORHOODS:
+        d = _distance_haversine(lat, lng, nlat, nlng)
+        if d < best_d:
+            best_name, best_d = name, d
+    return best_name
+
+
 def _build_insight_stats() -> Dict[str, Any]:
     """Precompute the grounded spatial summary the insight model reasons over."""
     cas_points, by_kind = _casualty_heat_points()
@@ -4705,8 +4785,11 @@ def _build_insight_stats() -> Dict[str, Any]:
     # ~0.005° ≈ 500 m at NYC latitude.
     cas_clusters = _cluster_points(cas_points, cell_deg=0.005, top_n=5)
     dmg_clusters = _cluster_points(dmg_points, cell_deg=0.005, top_n=3)
+    stations = _load_all_stations()  # one connection, reused for every cluster
     for c in cas_clusters + dmg_clusters:
-        c["nearest"] = _nearest_summary(c["lat"], c["lng"])
+        c["nearest"] = _nearest_summary_from(stations, c["lat"], c["lng"])
+        # Human-readable label the AI should cite instead of coordinates.
+        c["area"] = _nearest_neighborhood(c["lat"], c["lng"]) or f"({c['lat']:.4f}, {c['lng']:.4f})"
     return {
         "totals": {
             "casualty_reports": len(cas_points),
@@ -4717,115 +4800,351 @@ def _build_insight_stats() -> Dict[str, Any]:
         "top_casualty_clusters": cas_clusters,
         "worst_damage_zones": dmg_clusters,
         "note": (
-            "distance_m values are metres to the nearest existing service. Casualty "
-            "'weight' blends report count with severity (critical weighted highest). "
-            "The city keeps no explicit fatality records; critical casualties are the "
-            "proxy for the most severe outcomes."
+            "Each cluster has an 'area' field — a human-readable neighbourhood name. "
+            "ALWAYS refer to hotspots by their 'area' name (e.g. 'Washington Heights'), "
+            "never by raw lat/lng coordinates. distance_m values are metres to the "
+            "nearest existing service. Casualty 'weight' blends report count with "
+            "severity (critical weighted highest). The city keeps no explicit fatality "
+            "records; critical casualties are the proxy for the most severe outcomes."
         ),
     }
+
+
+# ── Durable insight store ────────────────────────────────────────────
+# Generated insights are persisted to Postgres so they survive a backend
+# restart AND so a transient Vertex failure can fall back to the last good
+# insight instead of an empty "unavailable" card. Keyed by a hash of the
+# heatmap stats, so an unchanged city state reuses the stored row.
+_city_insight_log = logging.getLogger("sentinel.city_insight_store")
+_CITY_INSIGHT_TABLE_READY = False
+# How long a stored/cached insight is considered fresh enough to serve without
+# regenerating. The underlying heatmap only changes as incidents land, and the
+# cache key is a hash of the heat points — so a genuine change regenerates
+# regardless. A generous window keeps re-opens instant and rare cold rebuilds.
+_CITY_INSIGHT_TTL_S = float(os.environ.get("SENTINEL_CITY_INSIGHT_CACHE_TTL", "600.0"))
+# Process-local hot cache: {signature -> (payload, monotonic_at)}. Lets a repeat
+# request skip even the cheap DB round-trip.
+_CITY_INSIGHT_MEM: Dict[str, Any] = {"key": None, "at": 0.0, "value": None}
+
+
+def _heatmap_signature(cas_points: List[List[float]], dmg_points: List[List[float]]) -> str:
+    """Cheap, order-stable hash of the raw heat points. Identical points => same
+    signature => reuse the stored insight without rebuilding stats or calling the
+    model. Computed from the two cheap point queries, NOT the ~24 nearest-service
+    queries that _build_insight_stats fires."""
+    try:
+        raw = json.dumps(
+            [sorted(list(p) for p in cas_points), sorted(list(p) for p in dmg_points)],
+            default=str,
+        )
+    except Exception:  # noqa: BLE001
+        raw = repr((len(cas_points), len(dmg_points)))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _ensure_city_insight_table(cur) -> None:
+    global _CITY_INSIGHT_TABLE_READY
+    if _CITY_INSIGHT_TABLE_READY:
+        return
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS city_insights (
+            stats_key  TEXT PRIMARY KEY,
+            payload    JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """
+    )
+    _CITY_INSIGHT_TABLE_READY = True
+
+
+def _store_city_insight(stats_key: Optional[str], payload: Dict[str, Any]) -> None:
+    """Persist the latest good insight for a heatmap state. Best-effort; never raises."""
+    if not stats_key:
+        return
+    clean = {k: v for k, v in payload.items() if k != "cached"}
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                _ensure_city_insight_table(cur)
+                cur.execute(
+                    """
+                    INSERT INTO city_insights (stats_key, payload, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (stats_key)
+                    DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW();
+                    """,
+                    (stats_key, json.dumps(clean)),
+                )
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+        _city_insight_log.warning("store failed: %s", exc)
+
+
+def _load_city_insight(stats_key: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+    """Best stored insight as (payload, age_seconds): an exact stats_key match if
+    present, else the most-recently-updated of any. (None, None) if nothing/err."""
+    payload: Optional[Dict[str, Any]] = None
+    age: Optional[float] = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                _ensure_city_insight_table(cur)
+                if stats_key:
+                    cur.execute(
+                        "SELECT payload, EXTRACT(EPOCH FROM (NOW() - updated_at)) "
+                        "FROM city_insights WHERE stats_key = %s;",
+                        (stats_key,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        payload, age = row[0], float(row[1])
+                if payload is None:
+                    cur.execute(
+                        "SELECT payload, EXTRACT(EPOCH FROM (NOW() - updated_at)) "
+                        "FROM city_insights ORDER BY updated_at DESC LIMIT 1;"
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        payload, age = row[0], float(row[1])
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - fallback read is best-effort
+        _city_insight_log.warning("load failed: %s", exc)
+    return payload, age
 
 
 @app.get("/api/city-insight", tags=["Admin"])
 def city_insight():
     """Admin-only: a real, Gemini-generated city-resilience insight grounded in the
     /api/city-heatmap aggregate (top casualty clusters, worst damage zones, and the
-    distance from each to the nearest hospital/fire/police station). Never 500s —
-    on any AI failure it returns a structured 'unavailable' payload so the client
-    still shows the raw heatmap. Unlike /api/savings-summary/insight (canned text),
-    this is generated live."""
+    distance from each to the nearest hospital/fire/police station). Never 500s.
+
+    Persisted to Postgres: a freshly generated insight is stored, and if live
+    generation is unavailable we serve the last good stored insight (flagged
+    `stale`) so the admin still sees real recommendations rather than an empty
+    card. Unlike /api/savings-summary/insight, the narrative is generated live."""
     from pipeline.city_insight import generate_insight
 
-    return generate_insight(_build_insight_stats())
+    # Cheap first: just the two heat-point queries (no nearest-service fan-out).
+    cas_points, _by_kind = _casualty_heat_points()
+    dmg_points, _total_est, _dmg_count = _damage_heat_points()
+    sig = _heatmap_signature(cas_points, dmg_points)
+    now = time.monotonic()
+
+    # 1) Process-local hot cache — instant.
+    mem = _CITY_INSIGHT_MEM
+    if mem.get("key") == sig and mem.get("value") and (now - mem["at"]) < _CITY_INSIGHT_TTL_S:
+        return mem["value"]
+
+    # 2) Durable store — fresh row for this exact heatmap state (survives restart).
+    payload, age = _load_city_insight(sig)
+    if payload and age is not None and age < _CITY_INSIGHT_TTL_S:
+        _CITY_INSIGHT_MEM.update({"key": sig, "at": now, "value": payload})
+        return payload
+
+    # 3) Miss → build the full grounded stats (the expensive part) and generate.
+    result = generate_insight(_build_insight_stats())
+    if result.get("status") == "done":
+        result.pop("cached", None)
+        _store_city_insight(sig, result)
+        _CITY_INSIGHT_MEM.update({"key": sig, "at": now, "value": result})
+        return result
+
+    # 4) Generation unavailable → serve the last good stored insight (any), stale-flagged.
+    if result.get("status") == "unavailable" and payload:
+        stale = dict(payload)
+        stale["stale"] = True
+        stale["stale_age_seconds"] = int(age) if age is not None else None
+        return stale
+
+    return result
 
 
-# Live-evolving savings counters. Numbers nudge up slightly on each read
-# so the admin dashboard feels active during a demo. Production replaces
-# this with values aggregated from the prediction / dispatch agents.
-_SAVINGS_STATE: Dict[str, float] = {
-    "lives_saved": 1284,
-    "infrastructure_value_usd": 48_320_000,
-    "money_saved_usd": 12_750_000,
-    "last_tick": 0,
-}
+# ── Admin savings tiles — derived from real event history ─────────────
+# The three headline numbers are computed from live DB tables (resolved
+# casualties, handled-disaster severity, dispatched units), not a hardcoded
+# ticker. The per-unit USD figures below are domain-assumption ESTIMATION
+# FACTORS (like _CASUALTY_KIND_WEIGHT) — they convert raw real counts into a
+# dashboard headline; they are not measured dollars.
+_STRUCTURE_VALUE_PER_SEVERITY_USD = 750_000  # structure value exposed per severity point of a handled disaster
+_OPS_SAVINGS_PER_UNIT_USD = 4_200            # operational $ saved per unit by pre-positioning vs reactive dispatch
+
+_savings_log = logging.getLogger("sentinel.savings")
 
 
-def _tick_savings() -> Dict[str, Any]:
-    with _mobile_lock:
-        _SAVINGS_STATE["lives_saved"] += 0.05
-        _SAVINGS_STATE["infrastructure_value_usd"] += 1200
-        _SAVINGS_STATE["money_saved_usd"] += 320
-        _SAVINGS_STATE["last_tick"] += 1
+def _compute_savings() -> Dict[str, Any]:
+    """Real, DB-derived figures for the admin savings tiles. Never raises —
+    returns zeros on any DB error (advisory dashboard, must never 500)."""
+    lives = infra_usd = money_usd = 0
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                # lives_saved: casualties a responder unit was actually dispatched
+                # to (the report is marked 'resolved' on auto-dispatch).
+                cur.execute(
+                    "SELECT COUNT(*) FROM responder_reports "
+                    "WHERE report_kind LIKE 'casualty_%' AND status = 'resolved';"
+                )
+                lives = int(cur.fetchone()[0] or 0)
+                # infrastructure_value_usd: structure value tied up in disasters the
+                # platform is handling (active + cleared), scaled by total severity.
+                cur.execute(
+                    "SELECT COALESCE(SUM(severity), 0) FROM disaster_events "
+                    "WHERE status IN ('active', 'cleared');"
+                )
+                infra_usd = int(cur.fetchone()[0] or 0) * _STRUCTURE_VALUE_PER_SEVERITY_USD
+                # money_saved_usd: operational savings across every dispatched
+                # unit. Two real sources of dispatched units: AI/operator HTTP
+                # dispatches (active_dispatches rows) and the casualty auto-
+                # dispatch path (one ambulance per resolved casualty report,
+                # which is exactly `lives`).
+                cur.execute(
+                    "SELECT COALESCE(SUM(unit_count), 0) FROM active_dispatches "
+                    "WHERE status IN ('active', 'completed');"
+                )
+                dispatched_units = int(cur.fetchone()[0] or 0) + lives
+                money_usd = dispatched_units * _OPS_SAVINGS_PER_UNIT_USD
+        conn.close()
+    except Exception as exc:
+        _savings_log.warning("savings compute failed: %s", exc)
+    return {
+        "lives_saved": lives,
+        "infrastructure_value_usd": infra_usd,
+        "money_saved_usd": money_usd,
+        "as_of": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+def _savings_breakdown() -> Dict[str, int]:
+    """Raw real counts the savings narratives are grounded in. Never raises —
+    returns zeros for anything it can't read."""
+    out = {
+        "casualties_total": 0, "casualties_resolved": 0, "casualties_pending": 0,
+        "disasters_active": 0, "disasters_cleared": 0, "severity_sum": 0,
+        "dispatch_units": 0, "dispatches_completed": 0, "auto_ambulances": 0,
+        "ambulance_capacity": 0, "truck_capacity": 0,
+    }
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status, COUNT(*) FROM responder_reports "
+                    "WHERE report_kind LIKE 'casualty_%' GROUP BY status;"
+                )
+                for st, n in cur.fetchall():
+                    out["casualties_total"] += int(n)
+                    if st == "resolved":
+                        out["casualties_resolved"] = int(n)
+                    elif st == "pending":
+                        out["casualties_pending"] = int(n)
+                cur.execute(
+                    "SELECT status, COUNT(*), COALESCE(SUM(severity), 0) "
+                    "FROM disaster_events WHERE status IN ('active', 'cleared') GROUP BY status;"
+                )
+                for st, n, sev in cur.fetchall():
+                    out["severity_sum"] += int(sev)
+                    if st == "active":
+                        out["disasters_active"] = int(n)
+                    elif st == "cleared":
+                        out["disasters_cleared"] = int(n)
+                cur.execute(
+                    "SELECT COALESCE(SUM(unit_count), 0), "
+                    "COUNT(*) FILTER (WHERE status = 'completed') "
+                    "FROM active_dispatches WHERE status IN ('active', 'completed');"
+                )
+                units, completed = cur.fetchone()
+                out["dispatches_completed"] = int(completed or 0)
+                # One ambulance is auto-dispatched per resolved casualty; count
+                # those toward total dispatched units alongside HTTP dispatches.
+                out["auto_ambulances"] = out["casualties_resolved"]
+                out["dispatch_units"] = int(units or 0) + out["casualties_resolved"]
+                cur.execute("SELECT COALESCE(SUM(ambulance_count), 0) FROM hospitals;")
+                out["ambulance_capacity"] = int(cur.fetchone()[0] or 0)
+                cur.execute("SELECT COALESCE(SUM(truck_count), 0) FROM fire_stations;")
+                out["truck_capacity"] = int(cur.fetchone()[0] or 0)
+        conn.close()
+    except Exception as exc:
+        _savings_log.warning("savings breakdown failed: %s", exc)
+    return out
+
+
+def _savings_insight(metric: str) -> Optional[Dict[str, Any]]:
+    """Build a savings-tile narrative grounded in live event-history counts.
+    Returns None for an unknown metric. Deterministic — no LLM call."""
+    s = _compute_savings()
+    b = _savings_breakdown()
+    if metric == "lives":
+        reached = b["casualties_resolved"]
+        tail = (
+            f"{b['casualties_pending']:,} report(s) are still pending a unit."
+            if b["casualties_pending"]
+            else "Every recorded casualty has been reached."
+        )
         return {
-            "lives_saved": int(_SAVINGS_STATE["lives_saved"]),
-            "infrastructure_value_usd": int(_SAVINGS_STATE["infrastructure_value_usd"]),
-            "money_saved_usd": int(_SAVINGS_STATE["money_saved_usd"]),
-            "as_of": datetime.utcnow().isoformat() + "Z",
+            "title": f"{s['lives_saved']:,} casualties reached by a dispatched responder",
+            "summary": (
+                f"Responders filed {b['casualties_total']:,} casualty report(s) in the field; "
+                f"{reached:,} were resolved by an ambulance auto-dispatched from the nearest "
+                f"hospital with capacity. {tail}"
+            ),
+            "highlights": [
+                f"Casualty reports filed: {b['casualties_total']:,}",
+                f"Reached by a dispatched unit: {reached:,}",
+                f"Still pending: {b['casualties_pending']:,}",
+                f"Ambulance capacity on the map: {b['ambulance_capacity']:,}",
+            ],
         }
+    if metric == "infrastructure":
+        return {
+            "title": f"${s['infrastructure_value_usd'] / 1e6:.1f}M in infrastructure under active protection",
+            "summary": (
+                f"{b['disasters_active']:,} active and {b['disasters_cleared']:,} cleared disaster(s) "
+                f"carry a combined severity of {b['severity_sum']:,}. At an estimated "
+                f"${_STRUCTURE_VALUE_PER_SEVERITY_USD:,} of structure value per severity point, that is "
+                f"the infrastructure exposure Sentinel-City is actively triaging."
+            ),
+            "highlights": [
+                f"Active disasters: {b['disasters_active']:,}",
+                f"Cleared disasters: {b['disasters_cleared']:,}",
+                f"Combined severity handled: {b['severity_sum']:,}",
+                f"Estimated infrastructure value: ${s['infrastructure_value_usd']:,}",
+            ],
+        }
+    if metric == "money":
+        return {
+            "title": f"${s['money_saved_usd'] / 1e6:.2f}M in operational savings from pre-positioning",
+            "summary": (
+                f"{b['dispatch_units']:,} unit(s) have been dispatched -- {b['auto_ambulances']:,} "
+                f"ambulance(s) auto-routed to casualties plus operator/AI dispatches "
+                f"({b['dispatches_completed']:,} run(s) already completed). At an estimated "
+                f"${_OPS_SAVINGS_PER_UNIT_USD:,} saved per unit by routing from the nearest station "
+                f"instead of reacting late, that is ${s['money_saved_usd']:,} in avoided operational cost."
+            ),
+            "highlights": [
+                f"Units dispatched: {b['dispatch_units']:,}",
+                f"Ambulances auto-routed to casualties: {b['auto_ambulances']:,}",
+                f"Dispatch runs completed: {b['dispatches_completed']:,}",
+                f"Total operational savings: ${s['money_saved_usd']:,}",
+            ],
+        }
+    return None
 
 
 @app.get("/api/savings-summary", tags=["Admin"])
 def savings_summary():
-    return _tick_savings()
-
-
-# Pre-written "AI insight" narratives. The real prediction agent will
-# replace these with generated text grounded in event history.
-_SAVINGS_INSIGHTS: Dict[str, Dict[str, Any]] = {
-    "lives": {
-        "title": "How Sentinel-City saved 1,284 lives this quarter",
-        "summary": (
-            "The Spread Forecaster identified high-risk evacuation corridors "
-            "an average of 14 minutes before flood crests, giving the Triage "
-            "Agent enough lead time to escalate 1,843 citizen reports for "
-            "early dispatch. Of those escalations, 1,284 ended in a citizen "
-            "being routed to safety before a wave reached their location."
-        ),
-        "highlights": [
-            "Median early-warning lead time: 14 min",
-            "Citizens auto-rerouted around active hazards: 12,402",
-            "Dispatches escalated by Triage Agent: 1,843",
-            "Lives confirmed safe via app handshake: 1,284",
-        ],
-    },
-    "infrastructure": {
-        "title": "$48.3M in infrastructure preserved by predictive dispatch",
-        "summary": (
-            "Dispatch Optimizer pre-positioned fire trucks an average of "
-            "4.2 minutes before ignition forecasts hit threshold, cutting "
-            "structure-loss radius by ~38% on contained wildfires. "
-            "Bridges and substations flagged by the Forecaster were "
-            "barricaded by Routing Sentinel cordons before water arrived."
-        ),
-        "highlights": [
-            "Structures protected from wildfire spread: 1,107",
-            "Substations cordoned before storm impact: 14",
-            "Avg. response time reduction: 3.8 min",
-            "Estimated avoided rebuild cost: $48.3M",
-        ],
-    },
-    "money": {
-        "title": "$12.75M in operational savings",
-        "summary": (
-            "By rebalancing trucks to where the Spread Forecaster predicted "
-            "they'd be needed, fleet utilization rose from 51% to 73%, "
-            "removing the need for two contingency units. Citizen "
-            "auto-rerouting also cut emergency overtime by 22%."
-        ),
-        "highlights": [
-            "Fleet utilization: 51% → 73%",
-            "Overtime spend reduced: 22%",
-            "Mutual-aid callouts avoided: 47",
-            "Total operational savings: $12.75M",
-        ],
-    },
-}
+    """Headline admin savings numbers, derived live from real event history."""
+    return _compute_savings()
 
 
 @app.get("/api/savings-summary/insight", tags=["Admin"])
 def savings_insight(metric: Literal["lives", "infrastructure", "money"] = Query(...)):
-    """Return an AI-style narrative for a savings tile.
-    Will be swapped to live-generated text once the prediction agent ships."""
-    insight = _SAVINGS_INSIGHTS.get(metric)
+    """Return a narrative for a savings tile, grounded in live event-history
+    counts (resolved casualties, handled-disaster severity, dispatched units)."""
+    insight = _savings_insight(metric)
     if insight is None:
         raise HTTPException(status_code=404, detail="Unknown metric.")
     return insight

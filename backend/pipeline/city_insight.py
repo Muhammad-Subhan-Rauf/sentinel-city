@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,14 @@ logger = logging.getLogger("sentinel.pipeline.city_insight")
 _MODEL = os.environ.get("SENTINEL_CITY_INSIGHT_MODEL", "gemini-2.5-flash")
 _TIMEOUT_S = float(os.environ.get("SENTINEL_CITY_INSIGHT_TIMEOUT", "20.0"))
 
+# A single live insight call is ~20-25s of Gemini latency. The underlying stats
+# only change when new disasters/casualties land, so we cache the last generated
+# insight keyed by a hash of the stats: repeated taps (and concurrent clients)
+# get an instant, identical result instead of re-paying the latency + token cost.
+# Only successful ('done') results are cached — failures must be retryable.
+_CACHE_TTL_S = float(os.environ.get("SENTINEL_CITY_INSIGHT_CACHE_TTL", "120.0"))
+_INSIGHT_CACHE: Dict[str, Any] = {"key": None, "at": 0.0, "value": None}
+
 _SYSTEM_PROMPT = (
     "You are the City Resilience Analyst for an emergency-management platform. "
     "You are given an aggregated, anonymised summary of where casualties and "
@@ -43,10 +52,12 @@ _SYSTEM_PROMPT = (
     "time, resource placement, evacuation). Ground EVERY recommendation in the "
     "numbers provided — name the affected area and cite the cluster size or the "
     "service distance that motivates it. Prefer a few decisive actions over a "
-    "long list. Be specific (e.g. 'add an ambulance post near the densest "
-    "casualty cluster — nearest hospital is 4.2 km away') rather than generic "
-    "('improve safety'). Never invent data that isn't in the summary; if the "
-    "data is thin, say so plainly and keep the recommendations modest."
+    "long list. Be specific (e.g. 'add an ambulance post in Washington Heights "
+    "— nearest hospital is 4.2 km away') rather than generic ('improve safety'). "
+    "Always name the affected area using the 'area' field provided for each "
+    "cluster (a human-readable neighbourhood); NEVER cite raw lat/lng "
+    "coordinates in your output. Never invent data that isn't in the summary; if "
+    "the data is thin, say so plainly and keep the recommendations modest."
 )
 
 
@@ -106,6 +117,16 @@ def _build_model():
     return _MODEL_INSTANCE
 
 
+def _stats_key(stats: Dict[str, Any]) -> str | None:
+    """Stable hash of the stats payload, so an unchanged heatmap reuses the cache."""
+    try:
+        return hashlib.sha1(
+            json.dumps(stats, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+    except Exception:  # noqa: BLE001 - hashing is best-effort; cache miss is fine
+        return None
+
+
 def _unavailable(summary: str) -> Dict[str, Any]:
     """Fallback payload whenever the model can't be consulted. Advisory only —
     the screen still renders the raw heatmap."""
@@ -147,6 +168,15 @@ def generate_insight(stats: Dict[str, Any]) -> Dict[str, Any]:
             "model": _MODEL,
         }
 
+    # Serve a recent, identical result without re-calling Gemini.
+    key = _stats_key(stats)
+    now = time.time()
+    cached = _INSIGHT_CACHE
+    if key and cached.get("key") == key and cached.get("value") and (now - cached["at"]) < _CACHE_TTL_S:
+        inc("city_insight.cache_hit")
+        # `cached: True` lets the caller skip re-persisting an unchanged result.
+        return {**cached["value"], "cached": True}
+
     human = (
         "Aggregated city incident summary (JSON):\n```json\n"
         + json.dumps(stats, ensure_ascii=False, indent=2)
@@ -160,13 +190,17 @@ def generate_insight(stats: Dict[str, Any]) -> Dict[str, Any]:
         result: CityInsight = model.invoke(msgs, config={"timeout": _TIMEOUT_S})
         observe("city_insight.latency_seconds", time.time() - started)
         inc("city_insight.success")
-        return {
+        payload = {
             "status": "done",
             "title": result.title,
             "summary": result.summary,
             "recommendations": [r.model_dump() for r in result.recommendations],
             "model": _MODEL,
         }
+        if key:
+            _INSIGHT_CACHE.update({"key": key, "at": now, "value": payload})
+        # Freshly generated — caller should persist this one.
+        return {**payload, "cached": False}
     except Exception as exc:  # noqa: BLE001 - advisory path must never raise
         observe("city_insight.latency_seconds", time.time() - started)
         inc(f"city_insight.error.{type(exc).__name__}")
