@@ -133,6 +133,63 @@ def _remember_idempotency(key: str, call_id: str) -> None:
 DATABASE_URL: str = os.environ["DATABASE_URL"]
 
 
+# ── Postgres connection pool ──────────────────────────────────────────────
+# Every DB call used to open a brand-new psycopg2 connection — a full TLS
+# handshake to the (remote, ap-south-1) Supabase pooler on EVERY request, ~1s
+# each even for a tiny query. That's why the in-memory endpoints were ~2ms while
+# every DB-backed one (disasters, stations, notifications…) was ~1s, making the
+# map legend crawl in after login. A process-wide ThreadedConnectionPool reuses
+# warm connections so a query costs ~one round-trip. Falls back to a direct
+# connect if the pool can't be built, so behaviour degrades safely.
+import threading as _threading
+from psycopg2.pool import ThreadedConnectionPool
+
+_DB_POOL = None
+_DB_POOL_LOCK = _threading.Lock()
+_DB_POOL_MAX = int(os.environ.get("SENTINEL_DB_POOL_MAX", "10"))
+
+
+def _ensure_db_pool():
+    global _DB_POOL
+    if _DB_POOL is not None:
+        return _DB_POOL
+    with _DB_POOL_LOCK:
+        if _DB_POOL is None:
+            try:
+                _DB_POOL = ThreadedConnectionPool(1, _DB_POOL_MAX, dsn=DATABASE_URL)
+                print(f"[db] connection pool ready (max {_DB_POOL_MAX}).")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[db] pool init failed; using per-request connect: {exc}")
+                _DB_POOL = None
+    return _DB_POOL
+
+
+def _get_db_conn():
+    """A pooled psycopg2 connection (or a fresh one if the pool is unavailable)."""
+    pool = _ensure_db_pool()
+    if pool is not None:
+        try:
+            return pool.getconn()
+        except Exception:  # noqa: BLE001 - pool exhausted/broken → direct connect
+            pass
+    return psycopg2.connect(DATABASE_URL)
+
+
+def _put_db_conn(conn) -> None:
+    """Return a connection to the pool, or close it if it isn't pooled / is broken."""
+    pool = _DB_POOL
+    try:
+        if pool is not None:
+            pool.putconn(conn, close=bool(getattr(conn, "closed", 0)))
+        else:
+            conn.close()
+    except Exception:  # noqa: BLE001 - e.g. an unkeyed (direct) conn → just close it
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 # Self-bootstrap the citizen_reports table on startup so deployments don't
 # require manually running migration files. Idempotent.
 CITIZEN_REPORTS_DDL = """
@@ -156,7 +213,7 @@ CREATE INDEX IF NOT EXISTS idx_citizen_reports_recent
 def _bootstrap_schema() -> None:
     """Ensure required tables exist. Called once at module import."""
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(CITIZEN_REPORTS_DDL)
@@ -504,8 +561,26 @@ def _bootstrap_schema() -> None:
                     CREATE INDEX IF NOT EXISTS idx_operator_logs_updated
                         ON operator_call_logs (updated_at DESC);
                 """)
-        conn.close()
-        print("[schema] citizen_reports + responder_reports + emergency_calls ready.")
+                # Mobile roster (citizens / workers / admins + their location &
+                # status), so a backend restart picks up the same users instead of
+                # forgetting everyone. id = device_id (citizen/admin) or
+                # device_id:sub_role (worker). See db/012.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS mobile_users (
+                        id          TEXT PRIMARY KEY,
+                        device_id   TEXT NOT NULL,
+                        role        TEXT NOT NULL,
+                        sub_role    TEXT,
+                        name        TEXT,
+                        lat         DOUBLE PRECISION,
+                        lng         DOUBLE PRECISION,
+                        status      TEXT,
+                        last_seen   TIMESTAMPTZ,
+                        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+        _put_db_conn(conn)
+        print("[schema] citizen_reports + responder_reports + emergency_calls + mobile_users ready.")
     except Exception as exc:
         print(f"[schema] bootstrap warning: {exc}")
 
@@ -1076,7 +1151,7 @@ def trigger_disaster(payload: DisasterPayload):
     event_id = payload.id or str(uuid.uuid4())
 
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1107,7 +1182,7 @@ def trigger_disaster(payload: DisasterPayload):
                     ),
                 )
                 returned_id = cur.fetchone()[0]
-        conn.close()
+        _put_db_conn(conn)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1178,7 +1253,7 @@ async def post_citizen_reports(
     inserted_ids: list[str] = []
     if rows:
         try:
-            conn = psycopg2.connect(DATABASE_URL)
+            conn = _get_db_conn()
             with conn:
                 with conn.cursor() as cur:
                     inserted_ids = [
@@ -1196,7 +1271,7 @@ async def post_citizen_reports(
                         )
                     ]
                     inserted = len(inserted_ids)
-            conn.close()
+            _put_db_conn(conn)
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1239,7 +1314,7 @@ def get_citizen_reports(
     params.append(limit)
 
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1253,7 +1328,7 @@ def get_citizen_reports(
                     tuple(params),
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1284,12 +1359,12 @@ def get_reported_event_ids():
     appears once citizens report it) WITHOUT downloading the full ~118 KB reports
     feed every few seconds. Tiny payload, index-backed (idx_citizen_reports_event)."""
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT DISTINCT event_id FROM citizen_reports WHERE event_id IS NOT NULL;")
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1349,14 +1424,14 @@ def _nearest_resource(
     table, cap_col, dispatched_col = table_meta
 
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT id, name, lat, lng, {cap_col}, {dispatched_col} FROM {table};"
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         logging.getLogger("sentinel.nearest").warning(
             f"_nearest_resource read failed for {kind}: {exc}"
@@ -1402,14 +1477,14 @@ def _nearest_resources(
         return []
     table, cap_col, dispatched_col = table_meta
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT id, name, lat, lng, {cap_col}, {dispatched_col} FROM {table};"
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception:
         return []
     out = []
@@ -1491,7 +1566,7 @@ async def post_responder_reports(batch: ResponderReportBatch):
         return {"inserted": 0, "skipped": skipped}
 
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(
@@ -1525,7 +1600,7 @@ async def post_responder_reports(batch: ResponderReportBatch):
                       AND status = 'pending';
                     """
                 )
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1539,7 +1614,7 @@ async def post_responder_reports(batch: ResponderReportBatch):
     # nearest hospital with capacity. No AI judgment needed. Fire-and-forget.
     auto_dispatched = 0
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 for r in batch.reports:
@@ -1590,7 +1665,7 @@ async def post_responder_reports(batch: ResponderReportBatch):
                         ),
                     )
                     auto_dispatched += 1
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         logging.getLogger("sentinel.auto_dispatch").warning(
             f"casualty auto-dispatch best-effort path failed: {exc}"
@@ -1627,7 +1702,7 @@ def get_responder_reports(
     params.append(limit)
 
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1643,7 +1718,7 @@ def get_responder_reports(
                     tuple(params),
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1702,7 +1777,7 @@ def resolve_responder_reports_near(
     Uses haversine; not perfectly indexable but the pending working set is small.
     """
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 # Pull pending rows of the requested kind. The set is tiny in
@@ -1733,7 +1808,7 @@ def resolve_responder_reports_near(
                         """,
                         (to_resolve,),
                     )
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1772,7 +1847,7 @@ def _geometry_select_expr(cur) -> str:
 def _fetch_weather_driving_events():
     """Returns rows (id, disaster_type, severity, cause, area_geometry, geometry_kind)
     for events that influence weather, severity-desc then recency."""
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = _get_db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -1788,7 +1863,7 @@ def _fetch_weather_driving_events():
                 )
                 return cur.fetchall()
     finally:
-        conn.close()
+        _put_db_conn(conn)
 
 
 @app.get("/api/weather", tags=["Weather"])
@@ -1845,7 +1920,7 @@ def get_traffic():
     - Baseline: normal Manhattan flow
     """
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 # Get active disasters with geometry
@@ -1867,7 +1942,7 @@ def get_traffic():
                     """
                 )
                 active_cordons = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2068,7 +2143,7 @@ def update_disaster(event_id: str, update: Dict[str, Any]):
     cols = ", ".join(f"{k} = %s" for k in sets)
     values = list(sets.values()) + [event_id]
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2080,7 +2155,7 @@ def update_disaster(event_id: str, update: Dict[str, Any]):
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail="Disaster not found.",
                     )
-        conn.close()
+        _put_db_conn(conn)
     except HTTPException:
         raise
     except Exception as exc:
@@ -2096,12 +2171,12 @@ def delete_all_disasters():
     """Wipe every row in disaster_events. Used by the "Clear all zones"
     operator action to reset simulator state."""
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM disaster_events;")
                 deleted = cur.rowcount
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2119,7 +2194,7 @@ def delete_disaster(event_id: str):
     hits zero and the engine signals resolution).
     """
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 # 1. Close any cordons raised for this incident so they
@@ -2141,7 +2216,7 @@ def delete_disaster(event_id: str):
                 )
                 # 3. Remove the disaster.
                 cur.execute("DELETE FROM disaster_events WHERE id = %s;", (event_id,))
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2185,7 +2260,7 @@ def list_disasters(status_filter: Optional[str] = Query(None, description="activ
         where = "WHERE status = %s"
         params.append(status_filter)
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 geom_expr = _geometry_select_expr(cur)
@@ -2201,7 +2276,7 @@ def list_disasters(status_filter: Optional[str] = Query(None, description="activ
                     tuple(params),
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2213,7 +2288,7 @@ def list_disasters(status_filter: Optional[str] = Query(None, description="activ
 @app.get("/api/disasters/{event_id}", tags=["Disasters"])
 def get_disaster(event_id: str):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 geom_expr = _geometry_select_expr(cur)
@@ -2228,7 +2303,7 @@ def get_disaster(event_id: str):
                     (event_id,),
                 )
                 row = cur.fetchone()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2325,7 +2400,7 @@ def warnings_nearby(
     out: List[Dict[str, Any]] = []
 
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 # 1. AI notifications (citizen alerts)
@@ -2471,7 +2546,7 @@ def warnings_nearby(
                         "source": "ai",
                         "created_at": r[7].isoformat(),
                     })
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2540,7 +2615,7 @@ def stats_injured():
     """Sum people_inside * (1 - safe_exit_pct/100) across active events
     where both fields are present. Returns injured_estimate + contributing_events."""
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -2551,7 +2626,7 @@ def stats_injured():
                       AND safe_exit_pct IS NOT NULL;
                 """)
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2574,7 +2649,7 @@ def stats_injured():
 @app.get("/api/fire-stations", tags=["Emergency Services"])
 def list_fire_stations():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -2583,7 +2658,7 @@ def list_fire_stations():
                     ORDER BY created_at ASC;
                 """)
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2610,7 +2685,7 @@ def create_fire_station(payload: FireStationPayload):
     station_id = payload.id or str(uuid.uuid4())
     truck_count = payload.truck_count if payload.truck_count is not None else 4
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2622,7 +2697,7 @@ def create_fire_station(payload: FireStationPayload):
                     (station_id, payload.name, payload.lat, payload.lng, truck_count),
                 )
                 returned_id = cur.fetchone()[0]
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2634,11 +2709,11 @@ def create_fire_station(payload: FireStationPayload):
 @app.delete("/api/fire-stations/{station_id}", tags=["Emergency Services"])
 def delete_fire_station(station_id: str):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM fire_stations WHERE id = %s;", (station_id,))
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2659,7 +2734,7 @@ def delete_fire_station(station_id: str):
 @app.post("/api/reset-dispatched", tags=["Emergency Services"])
 def reset_dispatched_counters():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("UPDATE fire_stations SET trucks_dispatched = 0;")
@@ -2668,7 +2743,7 @@ def reset_dispatched_counters():
                 hosp = cur.rowcount
                 cur.execute("UPDATE police_stations SET police_dispatched = 0;")
                 pol = cur.rowcount
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2732,7 +2807,7 @@ def dispatch_units(payload: DispatchPayload):
     src = payload.source or "operator"
     radius_m = float(radius) if radius is not None else 1500.0
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2745,7 +2820,7 @@ def dispatch_units(payload: DispatchPayload):
                     (dispatch_id, payload.event_id, payload.kind,
                      float(lat), float(lng), radius_m, int(units), src),
                 )
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         # Don't fail the dispatch if the persistence side errors — the engine
         # still does the visible work via PENDING_DISPATCHES.
@@ -2781,7 +2856,7 @@ def _atomic_dispatch_ack(table: str, count_col: str, dispatched_col: str,
     """Increment dispatched_col atomically, refusing if it would exceed count_col.
     Returns True on success, False if capacity would be exceeded or row missing."""
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2794,7 +2869,7 @@ def _atomic_dispatch_ack(table: str, count_col: str, dispatched_col: str,
                     (units, station_id, units),
                 )
                 row = cur.fetchone()
-        conn.close()
+        _put_db_conn(conn)
         return row is not None
     except Exception as exc:
         raise HTTPException(
@@ -2806,7 +2881,7 @@ def _atomic_dispatch_ack(table: str, count_col: str, dispatched_col: str,
 def _atomic_return_ack(table: str, dispatched_col: str,
                         station_id: str, units: int) -> bool:
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2819,7 +2894,7 @@ def _atomic_return_ack(table: str, dispatched_col: str,
                     (units, station_id),
                 )
                 row = cur.fetchone()
-        conn.close()
+        _put_db_conn(conn)
         return row is not None
     except Exception as exc:
         raise HTTPException(
@@ -2846,7 +2921,7 @@ def fire_station_return_ack(station_id: str, payload: UnitAckPayload):
 @app.patch("/api/fire-stations/{station_id}", tags=["Emergency Services"])
 def patch_fire_station(station_id: str, payload: StationCountUpdate):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2854,7 +2929,7 @@ def patch_fire_station(station_id: str, payload: StationCountUpdate):
                     (payload.count, station_id),
                 )
                 row = cur.fetchone()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2874,7 +2949,7 @@ def patch_fire_station(station_id: str, payload: StationCountUpdate):
 @app.get("/api/hospitals", tags=["Emergency Services"])
 def list_hospitals():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -2883,7 +2958,7 @@ def list_hospitals():
                     ORDER BY created_at ASC;
                 """)
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2910,7 +2985,7 @@ def create_hospital(payload: HospitalPayload):
     hospital_id = payload.id or str(uuid.uuid4())
     ambulance_count = payload.ambulance_count if payload.ambulance_count is not None else 3
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2922,7 +2997,7 @@ def create_hospital(payload: HospitalPayload):
                     (hospital_id, payload.name, payload.lat, payload.lng, ambulance_count),
                 )
                 returned_id = cur.fetchone()[0]
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2934,11 +3009,11 @@ def create_hospital(payload: HospitalPayload):
 @app.delete("/api/hospitals/{hospital_id}", tags=["Emergency Services"])
 def delete_hospital(hospital_id: str):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM hospitals WHERE id = %s;", (hospital_id,))
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2950,7 +3025,7 @@ def delete_hospital(hospital_id: str):
 @app.patch("/api/hospitals/{hospital_id}", tags=["Emergency Services"])
 def patch_hospital(hospital_id: str, payload: StationCountUpdate):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2958,7 +3033,7 @@ def patch_hospital(hospital_id: str, payload: StationCountUpdate):
                     (payload.count, hospital_id),
                 )
                 row = cur.fetchone()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2994,7 +3069,7 @@ def hospital_return_ack(hospital_id: str, payload: UnitAckPayload):
 @app.get("/api/police-stations", tags=["Emergency Services"])
 def list_police_stations():
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -3003,7 +3078,7 @@ def list_police_stations():
                     ORDER BY created_at ASC;
                 """)
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3030,7 +3105,7 @@ def create_police_station(payload: PoliceStationPayload):
     station_id = payload.id or str(uuid.uuid4())
     police_count = payload.police_count if payload.police_count is not None else 10
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -3042,7 +3117,7 @@ def create_police_station(payload: PoliceStationPayload):
                     (station_id, payload.name, payload.lat, payload.lng, police_count),
                 )
                 returned_id = cur.fetchone()[0]
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3054,11 +3129,11 @@ def create_police_station(payload: PoliceStationPayload):
 @app.delete("/api/police-stations/{station_id}", tags=["Emergency Services"])
 def delete_police_station(station_id: str):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM police_stations WHERE id = %s;", (station_id,))
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3070,7 +3145,7 @@ def delete_police_station(station_id: str):
 @app.patch("/api/police-stations/{station_id}", tags=["Emergency Services"])
 def patch_police_station(station_id: str, payload: StationCountUpdate):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -3078,7 +3153,7 @@ def patch_police_station(station_id: str, payload: StationCountUpdate):
                     (payload.count, station_id),
                 )
                 row = cur.fetchone()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3118,7 +3193,7 @@ def create_notification(payload: NotificationPayload):
             detail="reason is required.",
         )
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -3131,7 +3206,7 @@ def create_notification(payload: NotificationPayload):
                      payload.event_id, payload.source or "operator"),
                 )
                 returned_id = cur.fetchone()[0]
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3148,7 +3223,7 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
         where = "WHERE status = %s"
         params.append(status_filter)
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -3161,7 +3236,7 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
                     tuple(params),
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3186,14 +3261,14 @@ def list_notifications(status_filter: Optional[str] = Query("active", descriptio
 @app.delete("/api/notifications/{notif_id}", tags=["Emergency Services"])
 def clear_notification(notif_id: str):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE notifications SET status = 'cleared' WHERE id = %s;",
                     (notif_id,),
                 )
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3213,7 +3288,7 @@ def clear_notification(notif_id: str):
 def create_cordon(payload: CordonPayload):
     cordon_id = str(uuid.uuid4())
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -3227,7 +3302,7 @@ def create_cordon(payload: CordonPayload):
                      payload.event_id, payload.source or "operator"),
                 )
                 returned_id = cur.fetchone()[0]
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3244,7 +3319,7 @@ def list_cordons(status_filter: Optional[str] = Query("active", description="act
         where = "WHERE status = %s"
         params.append(status_filter)
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -3257,7 +3332,7 @@ def list_cordons(status_filter: Optional[str] = Query("active", description="act
                     tuple(params),
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3282,14 +3357,14 @@ def list_cordons(status_filter: Optional[str] = Query("active", description="act
 @app.delete("/api/cordons/{cordon_id}", tags=["Emergency Services"])
 def clear_cordon(cordon_id: str):
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE cordons SET status = 'cleared' WHERE id = %s;",
                     (cordon_id,),
                 )
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -3301,10 +3376,10 @@ def clear_cordon(cordon_id: str):
 # ══════════════════════════════════════════════════════════════════════
 # Mobile clients (Citizens & Emergency Workers) + Admin views
 #
-# These endpoints back the Expo mobile app (/mobile). They run on in-memory
-# state seeded at startup so they require no DB migrations and reset on a
-# server restart — which is the right behavior for the demo where mock-AI
-# agents will eventually drive these numbers.
+# These endpoints back the Expo mobile app (/mobile). State is held in memory
+# for fast reads but written through to Postgres (table mobile_users) and
+# hydrated on startup, so the roster + each user's location/status survives a
+# backend restart instead of being forgotten.
 # ══════════════════════════════════════════════════════════════════════
 
 from threading import Lock as _MobileLock
@@ -3340,11 +3415,115 @@ def _seed_worker(idx: int, name: str, role: str, lat_offset: float, lng_offset: 
     }
 
 
-# Mobile-app user rosters. Populated dynamically by the PIN login endpoint.
-# Reset on backend restart — acceptable for hackathon scope.
+# Mobile-app user rosters. Populated by the PIN login endpoint and kept as the
+# fast in-memory read path — but every mutation is written through to the
+# `mobile_users` table and the dicts are hydrated from it on startup, so a
+# restart picks up the same users + their location/status (see persistence
+# helpers below) instead of forgetting everyone.
 MOBILE_CITIZENS: Dict[str, Dict[str, Any]] = {}
 MOBILE_WORKERS: Dict[str, Dict[str, Any]] = {}
 MOBILE_ADMINS: Dict[str, Dict[str, Any]] = {}
+
+
+# ── Postgres persistence for the mobile roster ────────────────────────────
+# Write-through cache: the dicts above serve reads; these helpers keep the DB in
+# sync and rebuild the dicts on boot. Every DB call is best-effort — if the DB is
+# unreachable the app still works fully in-memory (a 911 line must never break).
+
+def _persist_mobile_user(role: str, record: Dict[str, Any]) -> None:
+    """Upsert one roster record into mobile_users. role: citizen|worker|admin."""
+    try:
+        uid = record["id"]
+        if role == "worker":
+            sub_role = record.get("sub_role")
+            device_id = uid.rsplit(":", 1)[0]
+        else:
+            sub_role = None
+            device_id = uid
+        conn = _get_db_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO mobile_users
+                            (id, device_id, role, sub_role, name, lat, lng, status, last_seen)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            device_id = EXCLUDED.device_id,
+                            role      = EXCLUDED.role,
+                            sub_role  = EXCLUDED.sub_role,
+                            name      = EXCLUDED.name,
+                            lat       = EXCLUDED.lat,
+                            lng       = EXCLUDED.lng,
+                            status    = EXCLUDED.status,
+                            last_seen = EXCLUDED.last_seen;
+                        """,
+                        (
+                            uid, device_id, role, sub_role, record.get("name"),
+                            record.get("lat"), record.get("lng"), record.get("status"),
+                            record.get("last_seen"),
+                        ),
+                    )
+        finally:
+            _put_db_conn(conn)
+    except Exception as exc:  # noqa: BLE001 - persistence must never break a request
+        logging.getLogger("sentinel.mobile").warning("mobile_users upsert failed: %s", exc)
+
+
+def _delete_mobile_user(uid: str) -> None:
+    """Remove one roster record from mobile_users. Best-effort."""
+    try:
+        conn = _get_db_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM mobile_users WHERE id = %s;", (uid,))
+        finally:
+            _put_db_conn(conn)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("sentinel.mobile").warning("mobile_users delete failed: %s", exc)
+
+
+def _hydrate_mobile_roster() -> None:
+    """Load the persisted roster into the in-memory dicts on startup."""
+    try:
+        conn = _get_db_conn()
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, device_id, role, sub_role, name, lat, lng, status, last_seen FROM mobile_users;"
+                    )
+                    rows = cur.fetchall()
+        finally:
+            _put_db_conn(conn)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("sentinel.mobile").warning("mobile_users hydrate failed: %s", exc)
+        return
+    n_c = n_w = n_a = 0
+    with _mobile_lock:
+        for uid, device_id, role, sub_role, name, lat, lng, status, last_seen in rows:
+            ls = last_seen.isoformat() if (last_seen and hasattr(last_seen, "isoformat")) else last_seen
+            if role == "citizen":
+                MOBILE_CITIZENS[uid] = {
+                    "id": uid, "name": name, "role": "citizen",
+                    "lat": lat, "lng": lng, "status": status or "safe", "last_seen": ls,
+                }
+                n_c += 1
+            elif role == "worker":
+                MOBILE_WORKERS[uid] = {
+                    "id": uid, "name": name, "role": sub_role, "sub_role": sub_role,
+                    "lat": lat, "lng": lng, "status": status or "available", "last_seen": ls,
+                }
+                n_w += 1
+            elif role == "admin":
+                MOBILE_ADMINS[uid] = {"id": uid, "name": name, "role": "admin", "last_seen": ls}
+                n_a += 1
+    print(f"[mobile] hydrated roster from Postgres: {n_c} citizens, {n_w} workers, {n_a} admins.")
+
+
+_hydrate_mobile_roster()
 
 
 # Pattern PIN → role mapping. The first/last digit identifies the role; middle
@@ -3438,6 +3617,15 @@ def auth_login(payload: LoginPayload):
                 "role": "admin",
                 "last_seen": now,
             }
+    # Write-through so the roster (and the user's preserved location/status)
+    # survives a backend restart. Done outside the lock to avoid holding it
+    # during DB I/O; best-effort (never fails the login).
+    if role == "citizen":
+        _persist_mobile_user("citizen", MOBILE_CITIZENS[device_id])
+    elif role == "worker":
+        _persist_mobile_user("worker", MOBILE_WORKERS[worker_key])
+    else:
+        _persist_mobile_user("admin", MOBILE_ADMINS[device_id])
     # Workers identify by composite key — every subsequent /api/workers/<id>
     # call from the mobile uses this. Citizens/admins still use device_id.
     user_id_out = f"{device_id}:{sub_role}" if role == "worker" else device_id
@@ -3483,7 +3671,9 @@ def update_citizen(citizen_id: str, update: MobileUserUpdate):
         if update.status is not None:
             citizen["status"] = update.status
         citizen["last_seen"] = datetime.utcnow().isoformat() + "Z"
-        return citizen
+        snapshot = dict(citizen)
+    _persist_mobile_user("citizen", snapshot)  # write-through (outside the lock)
+    return snapshot
 
 
 # ────── Emergency Workers ──────
@@ -3517,7 +3707,9 @@ def update_worker(worker_id: str, update: MobileUserUpdate):
         if update.status is not None:
             worker["status"] = update.status
         worker["last_seen"] = datetime.utcnow().isoformat() + "Z"
-        return worker
+        snapshot = dict(worker)
+    _persist_mobile_user("worker", snapshot)  # write-through (outside the lock)
+    return snapshot
 
 
 @app.delete("/api/workers/{worker_id}", tags=["Mobile"])
@@ -3530,6 +3722,7 @@ def delete_worker(worker_id: str):
         worker = MOBILE_WORKERS.pop(worker_id, None)
     if worker is None:
         raise HTTPException(status_code=404, detail="Worker not found.")
+    _delete_mobile_user(worker_id)  # keep the persisted roster in sync
     return {"deleted": True, "id": worker_id, "name": worker.get("name")}
 
 
@@ -3590,60 +3783,60 @@ _READ_SELECT = ", ".join(_CALL_READ_COLS) + ", (photo_data_url IS NOT NULL)"
 def _db_insert_call(call: Dict[str, Any]) -> None:
     cols = ", ".join(_CALL_INSERT_COLS)
     ph = ", ".join(["%s"] * len(_CALL_INSERT_COLS))
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = _get_db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(f"INSERT INTO emergency_calls ({cols}) VALUES ({ph});", _call_insert_values(call))
     finally:
-        conn.close()
+        _put_db_conn(conn)
 
 
 def _db_list_calls() -> List[Dict[str, Any]]:
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = _get_db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT {_READ_SELECT} FROM emergency_calls ORDER BY created_at DESC LIMIT 500;")
                 rows = cur.fetchall()
     finally:
-        conn.close()
+        _put_db_conn(conn)
     return [_row_to_public_call(r) for r in rows]
 
 
 def _db_get_call(call_id: str) -> Optional[Dict[str, Any]]:
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = _get_db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT {_READ_SELECT} FROM emergency_calls WHERE id = %s;", (call_id,))
                 row = cur.fetchone()
     finally:
-        conn.close()
+        _put_db_conn(conn)
     return _row_to_public_call(row) if row else None
 
 
 def _db_get_call_photo(call_id: str) -> Optional[str]:
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = _get_db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT photo_data_url FROM emergency_calls WHERE id = %s;", (call_id,))
                 row = cur.fetchone()
     finally:
-        conn.close()
+        _put_db_conn(conn)
     return row[0] if row else None
 
 
 def _db_call_id_by_idempotency(key: str) -> Optional[str]:
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = _get_db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM emergency_calls WHERE idempotency_key = %s LIMIT 1;", (key,))
                 row = cur.fetchone()
     finally:
-        conn.close()
+        _put_db_conn(conn)
     return str(row[0]) if row else None
 
 
@@ -3657,13 +3850,13 @@ def _db_update_call(call_id: str, **fields: Any) -> None:
         sets.append(f"{col} = %s")
         vals.append(v)
     vals.append(call_id)
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = _get_db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(f"UPDATE emergency_calls SET {', '.join(sets)} WHERE id = %s;", vals)
     finally:
-        conn.close()
+        _put_db_conn(conn)
 
 
 EMERGENCY_SERVICES = ("ambulance", "police", "firefighter")
@@ -3819,7 +4012,7 @@ def _place_emergency_call(
     row = None
     if disaster_id:
         try:
-            conn = psycopg2.connect(DATABASE_URL)
+            conn = _get_db_conn()
             try:
                 with conn:
                     with conn.cursor() as cur:
@@ -3835,7 +4028,7 @@ def _place_emergency_call(
                         )
                         row = cur.fetchone()
             finally:
-                conn.close()
+                _put_db_conn(conn)
         except Exception as exc:
             # Log + continue as a direct call rather than failing the emergency.
             logging.getLogger("sentinel.911").warning(
@@ -4124,7 +4317,7 @@ def _db_upsert_operator_log(session: Dict[str, Any]) -> None:
     audit logging must NEVER break a live 911 call."""
     try:
         plan = session.get("plan", {})
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         try:
             with conn:
                 with conn.cursor() as cur:
@@ -4164,7 +4357,7 @@ def _db_upsert_operator_log(session: Dict[str, Any]) -> None:
                         ),
                     )
         finally:
-            conn.close()
+            _put_db_conn(conn)
     except Exception as exc:  # noqa: BLE001 - audit must not break the call
         logging.getLogger("sentinel.operator").warning("audit log upsert failed: %s", exc)
 
@@ -4174,7 +4367,7 @@ def _lookup_disaster_brief(disaster_id: Optional[str]) -> Tuple[Optional[str], O
     if not disaster_id:
         return None, None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         try:
             with conn:
                 with conn.cursor() as cur:
@@ -4184,7 +4377,7 @@ def _lookup_disaster_brief(disaster_id: Optional[str]) -> Tuple[Optional[str], O
                     )
                     row = cur.fetchone()
         finally:
-            conn.close()
+            _put_db_conn(conn)
         if row:
             return row[0], row[1]
     except Exception:  # noqa: BLE001
@@ -4403,7 +4596,7 @@ def operator_end(payload: OperatorEndPayload, background_tasks: BackgroundTasks)
 def list_operator_logs(limit: int = Query(100, ge=1, le=500)):
     """Audit feed of AI-operator call conversations (caller chat + operator
     replies + the final summary), newest first. For admin / compliance review."""
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = _get_db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -4418,7 +4611,7 @@ def list_operator_logs(limit: int = Query(100, ge=1, le=500)):
                 )
                 rows = cur.fetchall()
     finally:
-        conn.close()
+        _put_db_conn(conn)
     cols = [
         "session_id", "call_id", "citizen_id", "citizen_name", "started_at", "updated_at",
         "caller_lat", "caller_lng", "location_name", "conversation", "summary", "services",
@@ -4545,7 +4738,7 @@ def _casualty_heat_points() -> Tuple[List[List[float]], Dict[str, int]]:
     points: List[List[float]] = []
     by_kind: Dict[str, int] = {"critical": 0, "fainted": 0, "injured": 0}
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 # No status filter (the /api/responder-reports default of
@@ -4560,7 +4753,7 @@ def _casualty_heat_points() -> Tuple[List[List[float]], Dict[str, int]]:
                     """
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         _heat_log.warning("city-heatmap casualties read failed: %s", exc)
         return [], by_kind
@@ -4593,7 +4786,7 @@ def _damage_heat_points() -> Tuple[List[List[float]], int, int]:
     total_est = 0.0
     count = 0
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 geom_expr = _geometry_select_expr(cur)
@@ -4605,7 +4798,7 @@ def _damage_heat_points() -> Tuple[List[List[float]], int, int]:
                     """
                 )
                 rows = cur.fetchall()
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         _heat_log.warning("city-heatmap damage read failed: %s", exc)
         return [], 0, 0
@@ -4709,13 +4902,13 @@ def _load_all_stations() -> Dict[str, List[Tuple[str, float, float]]]:
     }
     tables = {"hospital": "hospitals", "fire_station": "fire_stations", "police_station": "police_stations"}
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 for kind, table in tables.items():
                     cur.execute(f"SELECT name, lat, lng FROM {table};")
                     out[kind] = [(r[0], float(r[1]), float(r[2])) for r in cur.fetchall()]
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         _heat_log.warning("insight station load failed: %s", exc)
     return out
@@ -4864,7 +5057,7 @@ def _store_city_insight(stats_key: Optional[str], payload: Dict[str, Any]) -> No
         return
     clean = {k: v for k, v in payload.items() if k != "cached"}
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 _ensure_city_insight_table(cur)
@@ -4877,7 +5070,7 @@ def _store_city_insight(stats_key: Optional[str], payload: Dict[str, Any]) -> No
                     """,
                     (stats_key, json.dumps(clean)),
                 )
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:  # noqa: BLE001 - persistence is best-effort
         _city_insight_log.warning("store failed: %s", exc)
 
@@ -4888,7 +5081,7 @@ def _load_city_insight(stats_key: Optional[str]) -> Tuple[Optional[Dict[str, Any
     payload: Optional[Dict[str, Any]] = None
     age: Optional[float] = None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 _ensure_city_insight_table(cur)
@@ -4909,7 +5102,7 @@ def _load_city_insight(stats_key: Optional[str]) -> Tuple[Optional[Dict[str, Any
                     row = cur.fetchone()
                     if row:
                         payload, age = row[0], float(row[1])
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:  # noqa: BLE001 - fallback read is best-effort
         _city_insight_log.warning("load failed: %s", exc)
     return payload, age
@@ -4979,7 +5172,7 @@ def _compute_savings() -> Dict[str, Any]:
     returns zeros on any DB error (advisory dashboard, must never 500)."""
     lives = infra_usd = money_usd = 0
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 # lives_saved: casualties a responder unit was actually dispatched
@@ -5007,7 +5200,7 @@ def _compute_savings() -> Dict[str, Any]:
                 )
                 dispatched_units = int(cur.fetchone()[0] or 0) + lives
                 money_usd = dispatched_units * _OPS_SAVINGS_PER_UNIT_USD
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         _savings_log.warning("savings compute failed: %s", exc)
     return {
@@ -5028,7 +5221,7 @@ def _savings_breakdown() -> Dict[str, int]:
         "ambulance_capacity": 0, "truck_capacity": 0,
     }
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = _get_db_conn()
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -5066,7 +5259,7 @@ def _savings_breakdown() -> Dict[str, int]:
                 out["ambulance_capacity"] = int(cur.fetchone()[0] or 0)
                 cur.execute("SELECT COALESCE(SUM(truck_count), 0) FROM fire_stations;")
                 out["truck_capacity"] = int(cur.fetchone()[0] or 0)
-        conn.close()
+        _put_db_conn(conn)
     except Exception as exc:
         _savings_log.warning("savings breakdown failed: %s", exc)
     return out
