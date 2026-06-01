@@ -15,7 +15,7 @@ import { DestinationSearch } from '@/components/DestinationSearch';
 import { NavBanner } from '@/components/NavBanner';
 import { DisasterDetailModal } from '@/components/DisasterDetailModal';
 import { api, fetchRoute, MobileCitizen, Notification, Cordon, Route, Disaster } from '@/lib/api';
-import { useAuth } from '@/lib/auth';
+import { useAuth, isStaleSession } from '@/lib/auth';
 import { useTheme } from '@/theme';
 import { Text, Card, Button, Icon } from '@/components/ui';
 import { disasterRing, pointInPolygon, ringForValhallaAvoid } from '@/lib/geo';
@@ -60,7 +60,7 @@ function activeDangersContaining(loc: LatLng | null, disasters: Disaster[]): Dis
 export default function CitizenMapScreen() {
   const t = useTheme();
   const insets = useSafeAreaInsets();
-  const { session } = useAuth();
+  const { session, signOut } = useAuth();
   const [me, setMe] = useState<MobileCitizen | null>(null);
   const [destination, setDestination] = useState<LatLng | null>(null);
   const [route, setRoute] = useState<Route | null>(null);
@@ -96,8 +96,14 @@ export default function CitizenMapScreen() {
       try {
         const fresh = await api.getCitizen(session.userId);
         if (!cancelled) setMe(fresh);
-      } catch {
-        /* keep last */
+      } catch (e) {
+        // Backend forgot this user (e.g. it restarted — the roster is in-memory):
+        // bounce to login instead of leaving the map stuck with no location.
+        if (isStaleSession(e)) {
+          signOut().catch(() => {});
+          return;
+        }
+        /* transient error — keep last */
       }
     };
     tick();
@@ -106,7 +112,7 @@ export default function CitizenMapScreen() {
       cancelled = true;
       clearInterval(handle);
     };
-  }, [session]);
+  }, [session, signOut]);
 
   const myLatLng: LatLng | null = me ? { lat: me.lat, lng: me.lng } : null;
   const insideDangers = useMemo(() => activeDangersContaining(myLatLng, disasters), [myLatLng, disasters]);

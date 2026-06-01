@@ -3,7 +3,9 @@
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import React, { createContext, useContext, useEffect, useState } from 'react';
-import { api, type Role, type WorkerSubRole } from './api';
+import { api, resetApiCache, type Role, type WorkerSubRole } from './api';
+import { setInDangerZone } from './dangerSignal';
+import { resetMapData } from './mapData';
 
 export type Session = {
   userId: string;
@@ -88,8 +90,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const signOut = async () => {
-    await AsyncStorage.removeItem(SESSION_KEY);
+    const current = session; // capture before we clear it
+    // Clear the in-app session FIRST so logout ALWAYS takes effect immediately,
+    // even if the storage / network steps below fail.
     setSession(null);
+    // Start the next session clean: drop cached GETs, the shared map snapshot,
+    // and any lingering "in danger zone" signal so nothing from this session
+    // bleeds into the next.
+    resetApiCache();
+    resetMapData();
+    setInDangerZone(false);
+    // A signing-out worker shouldn't linger in the (now-persisted) roster as an
+    // available responder. Best-effort, fire-and-forget — a stale session just 404s.
+    if (current?.role === 'worker') {
+      api.updateWorker(current.userId, { status: 'off_duty' }).catch(() => {});
+    }
+    try {
+      await AsyncStorage.removeItem(SESSION_KEY);
+    } catch {
+      /* storage clear is best-effort; the in-app session is already gone */
+    }
   };
 
   return (

@@ -9,7 +9,7 @@ import { DisasterDetailModal } from '@/components/DisasterDetailModal';
 import { DestinationSearch } from '@/components/DestinationSearch';
 import { NavBanner } from '@/components/NavBanner';
 import { api, fetchRoute, Cordon, Disaster, MobileWorker, Notification, Route, WorkerSubRole } from '@/lib/api';
-import { useAuth } from '@/lib/auth';
+import { useAuth, isStaleSession } from '@/lib/auth';
 import { useTheme } from '@/theme';
 import { Text, Card, Button, Badge, IconBadge, Icon, BadgeTone } from '@/components/ui';
 import { disasterRing, ringForValhallaAvoid } from '@/lib/geo';
@@ -55,7 +55,7 @@ function disastersToAvoidPolygons(disasters: Disaster[]): number[][][] {
 export default function WorkerMapScreen() {
   const t = useTheme();
   const insets = useSafeAreaInsets();
-  const { session } = useAuth();
+  const { session, signOut } = useAuth();
   const [me, setMe] = useState<MobileWorker | null>(null);
   const [destination, setDestination] = useState<LatLng | null>(null);
   const [route, setRoute] = useState<Route | null>(null);
@@ -79,8 +79,14 @@ export default function WorkerMapScreen() {
       try {
         const fresh = await api.getWorker(session.userId);
         if (!cancelled) setMe(fresh);
-      } catch {
-        /* ignore */
+      } catch (e) {
+        // Backend forgot this worker (in-memory roster lost on restart): bounce
+        // to login rather than leaving the map stuck with no location.
+        if (isStaleSession(e)) {
+          signOut().catch(() => {});
+          return;
+        }
+        /* transient — ignore */
       }
     };
     tick();
@@ -89,7 +95,7 @@ export default function WorkerMapScreen() {
       cancelled = true;
       clearInterval(handle);
     };
-  }, [session]);
+  }, [session, signOut]);
 
   const lastAvoidSig = useRef<string>('');
 

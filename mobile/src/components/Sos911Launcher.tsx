@@ -83,12 +83,15 @@ export function Sos911Launcher() {
       .catch(() => {});
   }, [session]);
 
-  // Open the menu whenever the global 911 signal fires.
-  const lastToken = useRef(0);
+  // Open the menu whenever the global 911 signal fires. Seed lastToken with the
+  // CURRENT token at mount so we only react to NEW taps — otherwise a re-login
+  // (which remounts this launcher while the module counter is already > 0) would
+  // spuriously pop the menu open on its own.
+  const lastToken = useRef(token);
   useEffect(() => {
     if (token === lastToken.current) return;
     lastToken.current = token;
-    if (token > 0 && session?.role === 'citizen') {
+    if (session?.role === 'citizen') {
       setStartMuted(false);
       loadContext();
       setConfirmOpen(true);

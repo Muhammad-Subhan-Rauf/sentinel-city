@@ -134,6 +134,14 @@ function invalidate(...prefixes: string[]) {
   }
 }
 
+// Wipe the entire GET cache + in-flight de-dupe map. Called on sign-out so the
+// next user starts from a clean slate and never reads the previous session's
+// cached data.
+export function resetApiCache(): void {
+  _cache.clear();
+  _inflight.clear();
+}
+
 // TTLs (ms). Live data refreshes within a poll cycle; static infrastructure
 // (stations) barely changes, so it's cached much longer.
 const TTL_LIVE = 3000;

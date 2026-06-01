@@ -3,10 +3,10 @@
 //   - Admins: identity card + sign-out only (no map; admins have no position)
 
 import React, { useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, ScrollView, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Alert, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { LeafletPicker } from '@/components/LeafletPicker';
-import { useAuth } from '@/lib/auth';
+import { useAuth, isStaleSession } from '@/lib/auth';
 import { api } from '@/lib/api';
 import { useTheme } from '@/theme';
 import { Text, Card, Button, IconBadge, Badge, Icon, SectionHeader, IconName } from '@/components/ui';
@@ -15,11 +15,6 @@ import { ProfileModal } from '@/components/ProfileModal';
 import { profileRoleKind, loadProfileOrSeed, AnyProfile } from '@/lib/profile';
 
 const MANHATTAN = { lat: 40.758, lng: -73.9855 };
-
-function isStaleSession(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e ?? '');
-  return /\bAPI 404\b/.test(msg) && /\/api\/(citizens|workers)\//.test(msg);
-}
 
 type WorkerStatus = 'available' | 'dispatched' | 'on_scene' | 'off_duty';
 
@@ -144,6 +139,15 @@ export default function SettingsScreen() {
     } finally {
       setDutySaving(false);
     }
+  };
+
+  // Sign-out is destructive in a safety app — confirm so an accidental tap
+  // mid-emergency can't drop the user out of the app.
+  const confirmSignOut = () => {
+    Alert.alert('Sign out?', "You'll need your PIN to sign back in.", [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Sign out', style: 'destructive', onPress: () => signOut().catch(() => {}) },
+    ]);
   };
 
   const dutyLocked = dutyStatus === 'dispatched' || dutyStatus === 'on_scene';
@@ -338,7 +342,7 @@ export default function SettingsScreen() {
           </Text>
         </View>
 
-        <Button label="Sign out" variant="danger" icon="signout" onPress={signOut} />
+        <Button label="Sign out" variant="danger" icon="signout" onPress={confirmSignOut} />
       </ScrollView>
 
       {profileKind !== 'none' && (
