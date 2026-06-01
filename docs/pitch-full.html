@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sentinel-City — Pitch &amp; Demo Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg:#070b12; --bg-2:#0a1019; --panel:#0e1623; --card:#131d2d;
+    --border:rgba(125,165,210,0.14); --border-2:rgba(125,165,210,0.30);
+    --accent:#fb7a3c; --accent-2:#ff9a5a; --info:#34d3ee; --info-2:#7ce7f7;
+    --danger:#f4544f; --warn:#f5b13a; --safe:#3ddc91; --purple:#a78bfa;
+    --text:#e7eef7; --muted:#91a6c0; --muted-2:#6b819b;
+    --mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,monospace;
+    --sans:'Inter',system-ui,-apple-system,'Segoe UI',sans-serif;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; }
+  body { background:var(--bg); color:var(--text); font-family:var(--sans); overflow:hidden; -webkit-font-smoothing:antialiased; }
+
+  .backdrop { position:fixed; inset:0; z-index:0; pointer-events:none;
+    background:
+      radial-gradient(900px 600px at 82% -8%, rgba(251,122,60,0.13), transparent 60%),
+      radial-gradient(1000px 700px at 12% 110%, rgba(52,211,238,0.12), transparent 60%),
+      linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%); }
+  .backdrop::before { content:""; position:absolute; inset:0;
+    background-image:linear-gradient(rgba(125,165,210,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(125,165,210,0.05) 1px, transparent 1px);
+    background-size:46px 46px; mask-image:radial-gradient(ellipse 80% 80% at 50% 45%, #000 35%, transparent 100%); }
+
+  .deck { position:relative; z-index:1; height:100%; }
+  .slide { position:absolute; inset:0; display:none; flex-direction:column; justify-content:center;
+    padding:clamp(30px,5vw,92px); padding-bottom:clamp(48px,7vh,104px); opacity:0; transition:opacity .5s ease; overflow:hidden; }
+  .slide.active { display:flex; opacity:1; animation:rise .5s cubic-bezier(.2,.7,.2,1) both; }
+  @keyframes rise { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:translateY(0); } }
+  @media (prefers-reduced-motion: reduce) { .slide.active { animation:none; } * { transition:none !important; } }
+
+  .kicker { font-family:var(--mono); font-size:clamp(10px,.95vw,12.5px); letter-spacing:.24em; text-transform:uppercase;
+    color:var(--info); display:inline-flex; align-items:center; gap:10px; margin-bottom:16px; }
+  .kicker::before { content:""; width:24px; height:1px; background:linear-gradient(90deg,var(--info),transparent); }
+  .kicker .dot { width:7px; height:7px; border-radius:50%; background:var(--info); box-shadow:0 0 12px var(--info); }
+  .kicker.k-accent { color:var(--accent); } .kicker.k-accent::before { background:linear-gradient(90deg,var(--accent),transparent); } .kicker.k-accent .dot { background:var(--accent); box-shadow:0 0 12px var(--accent); }
+  .kicker.k-safe { color:var(--safe); } .kicker.k-safe::before { background:linear-gradient(90deg,var(--safe),transparent); } .kicker.k-safe .dot { background:var(--safe); box-shadow:0 0 12px var(--safe); }
+
+  h1 { font-size:clamp(38px,6.6vw,96px); font-weight:900; line-height:.98; letter-spacing:-0.03em; }
+  h2 { font-size:clamp(27px,3.9vw,52px); font-weight:800; line-height:1.05; letter-spacing:-0.02em; }
+  h3 { font-size:clamp(15px,1.45vw,19px); font-weight:700; letter-spacing:-0.01em; }
+  .lead { font-size:clamp(15px,1.5vw,21px); color:var(--muted); max-width:62ch; line-height:1.5; }
+  .muted{color:var(--muted);} .accent{color:var(--accent);} .info{color:var(--info);} .safe{color:var(--safe);} .warn{color:var(--warn);} .purple{color:var(--purple);}
+  .mono{font-family:var(--mono);}
+  .grad { background:linear-gradient(100deg,var(--info) 0%,var(--info-2) 40%,var(--accent-2) 100%); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .hd { margin-bottom:clamp(18px,2.4vw,30px); }
+  em.hl { font-style:normal; color:var(--info); }
+
+  .glass { background:linear-gradient(160deg,rgba(255,255,255,0.045),rgba(255,255,255,0.012)); border:1px solid var(--border);
+    border-radius:16px; backdrop-filter:blur(14px); box-shadow:0 20px 50px -28px rgba(0,0,0,0.9), inset 0 1px 0 rgba(255,255,255,0.06); }
+  .glass-info{border-color:rgba(52,211,238,0.32); box-shadow:0 0 0 1px rgba(52,211,238,0.06),0 24px 60px -30px rgba(52,211,238,0.35),inset 0 1px 0 rgba(255,255,255,0.06);}
+  .glass-accent{border-color:rgba(251,122,60,0.34); box-shadow:0 0 0 1px rgba(251,122,60,0.06),0 24px 60px -30px rgba(251,122,60,0.4),inset 0 1px 0 rgba(255,255,255,0.06);}
+  .glass-safe{border-color:rgba(61,220,145,0.32); box-shadow:0 0 0 1px rgba(61,220,145,0.06),0 24px 60px -30px rgba(61,220,145,0.32),inset 0 1px 0 rgba(255,255,255,0.06);}
+
+  .row{display:flex; gap:24px;} .col{flex:1;} .stack>*+*{margin-top:14px;}
+  .grid-2{display:grid; grid-template-columns:1fr 1fr; gap:18px;}
+  .grid-3{display:grid; grid-template-columns:repeat(3,1fr); gap:18px;}
+  .grid-4{display:grid; grid-template-columns:repeat(4,1fr); gap:16px;}
+
+  .cell{padding:20px 22px; border-radius:14px;}
+  .cell h3{margin-bottom:7px;} .cell p{color:var(--muted); font-size:14px; line-height:1.5;}
+  .cell .ic{width:38px; height:38px; border-radius:10px; display:grid; place-items:center; margin-bottom:13px; font-size:17px; font-family:var(--mono); font-weight:700;}
+  .ic-info{background:rgba(52,211,238,0.12); color:var(--info); border:1px solid rgba(52,211,238,0.3);}
+  .ic-accent{background:rgba(251,122,60,0.12); color:var(--accent); border:1px solid rgba(251,122,60,0.3);}
+  .ic-safe{background:rgba(61,220,145,0.12); color:var(--safe); border:1px solid rgba(61,220,145,0.3);}
+  .ic-warn{background:rgba(245,177,58,0.12); color:var(--warn); border:1px solid rgba(245,177,58,0.3);}
+  .ic-purple{background:rgba(167,139,250,0.12); color:var(--purple); border:1px solid rgba(167,139,250,0.3);}
+
+  /* badges */
+  .tagb{font-family:var(--mono); font-size:10.5px; letter-spacing:.06em; padding:3px 8px; border-radius:6px; display:inline-block; text-transform:uppercase; font-weight:600;}
+  .b-llm{background:rgba(52,211,238,0.14); color:var(--info); border:1px solid rgba(52,211,238,0.3);}
+  .b-det{background:rgba(231,238,247,0.08); color:var(--text); border:1px solid var(--border-2);}
+  .b-sim{background:rgba(251,122,60,0.13); color:var(--accent); border:1px solid rgba(251,122,60,0.3);}
+  .b-mod{background:rgba(245,177,58,0.13); color:var(--warn); border:1px solid rgba(245,177,58,0.3);}
+  .b-real{background:rgba(61,220,145,0.13); color:var(--safe); border:1px solid rgba(61,220,145,0.3);}
+
+  /* problem stats */
+  .stat-line{display:flex; align-items:baseline; gap:16px; padding:14px 0; border-bottom:1px solid var(--border);}
+  .stat-line:last-child{border-bottom:0;}
+  .stat-num{font-family:var(--mono); font-weight:700; font-size:clamp(22px,2.8vw,38px); min-width:4ch; color:var(--accent);}
+  .stat-txt{color:var(--muted); font-size:14.5px; line-height:1.45;}
+
+  /* pipeline rail */
+  .rail{display:flex; align-items:stretch; gap:0; flex-wrap:wrap;}
+  .rnode{flex:1 1 0; min-width:120px; padding:14px 13px; border-radius:12px; border:1px solid var(--border); background:rgba(255,255,255,0.022); position:relative;}
+  .rnode.llm{border-color:rgba(52,211,238,0.4); background:rgba(52,211,238,0.05);}
+  .rnode.sim{border-style:dashed; border-color:rgba(251,122,60,0.45); background:rgba(251,122,60,0.04);}
+  .rnode .rt{font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--muted-2); margin-bottom:6px;}
+  .rnode .rv{font-weight:700; font-size:13.5px; line-height:1.15;}
+  .rnode small{display:block; color:var(--muted); font-size:11.5px; margin-top:5px; font-weight:400; line-height:1.35;}
+  .rarrow{align-self:center; color:var(--muted-2); padding:0 7px; font-size:16px;}
+  .legend{display:flex; gap:18px; flex-wrap:wrap; margin-top:16px; font-size:12px; color:var(--muted);}
+  .legend span{display:inline-flex; align-items:center; gap:7px;}
+  .legend i{width:13px; height:13px; border-radius:4px; display:inline-block;}
+
+  /* table */
+  .tbl{width:100%; border-collapse:collapse;}
+  .tbl td{padding:11px 14px; border-bottom:1px solid var(--border); font-size:14px; vertical-align:top;}
+  .tbl tr:last-child td{border-bottom:0;}
+  .tbl td:first-child{width:34%; font-weight:600;}
+  .tbl td .sub{color:var(--muted); font-weight:400;}
+
+  /* metrics */
+  .metric{padding:26px 24px; border-radius:16px; position:relative; overflow:hidden;}
+  .metric .lbl{font-family:var(--mono); font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:var(--muted); margin-bottom:12px;}
+  .metric .big{font-weight:900; font-size:clamp(30px,4.2vw,54px); line-height:1; letter-spacing:-0.02em;}
+  .metric .sub{color:var(--muted-2); font-size:12.5px; margin-top:10px; line-height:1.35;}
+  .metric::after{content:""; position:absolute; right:-40px; bottom:-40px; width:120px; height:120px; border-radius:50%; opacity:.14;}
+  .metric.m-safe::after{background:var(--safe);} .metric.m-info::after{background:var(--info);} .metric.m-accent::after{background:var(--accent);} .metric.m-warn::after{background:var(--warn);}
+
+  /* phone mockups */
+  .phones{display:flex; gap:34px; align-items:center; justify-content:center;}
+  .phone{width:215px; border-radius:30px; padding:9px; background:linear-gradient(160deg,#1a2433,#0b121d); border:1px solid var(--border-2);
+    box-shadow:0 40px 80px -36px rgba(0,0,0,0.95), inset 0 1px 0 rgba(255,255,255,0.08);}
+  .phone img{width:100%; border-radius:23px; display:block;}
+  .phone-cap{text-align:center; margin-top:13px; font-family:var(--mono); font-size:11.5px; letter-spacing:.06em; color:var(--muted);}
+
+  /* image placeholder frame (for capture-me screenshots) */
+  .ph{border:1.5px dashed rgba(251,122,60,0.5); border-radius:14px; background:repeating-linear-gradient(135deg, rgba(251,122,60,0.04) 0 12px, transparent 12px 24px);
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; text-align:center; padding:22px; min-height:150px;}
+  .ph .pic{font-size:22px;} .ph .pt{font-weight:700; color:var(--accent-2); font-size:13.5px;} .ph .pd{font-size:12px; color:var(--muted); max-width:30ch; line-height:1.4;}
+
+  /* spine list */
+  .spine{display:grid; grid-template-columns:repeat(2,1fr); gap:10px 22px;}
+  .step{display:flex; gap:13px; align-items:flex-start; padding:9px 0;}
+  .step .n{font-family:var(--mono); font-weight:700; color:var(--info); font-size:14px; flex:none; width:1.6em;}
+  .step .st{font-weight:700; font-size:14px;}
+  .step .sd{color:var(--muted); font-size:12.5px; line-height:1.4; margin-top:2px;}
+  .step.must .n{color:var(--accent);}
+
+  .footnote{font-family:var(--mono); font-size:11px; color:var(--muted-2); margin-top:18px; letter-spacing:.02em; line-height:1.5;}
+  .footnote.warn-note{color:var(--warn);}
+  kbd{font-family:var(--mono); background:rgba(255,255,255,0.06); border:1px solid var(--border); border-radius:5px; padding:1px 6px; color:var(--muted); font-size:11px;}
+
+  .chips{display:flex; gap:10px; flex-wrap:wrap; margin-top:20px;}
+  .chip{font-family:var(--mono); font-size:12px; padding:7px 13px; border-radius:999px; border:1px solid var(--border-2); color:var(--muted); display:inline-flex; align-items:center; gap:8px;}
+  .chip .d{width:6px; height:6px; border-radius:50%;}
+
+  .logo-row{display:flex; align-items:center; gap:14px; margin-bottom:26px;}
+  .logo-mark{width:48px; height:48px; border-radius:13px; display:grid; place-items:center;
+    background:radial-gradient(circle at 30% 25%, rgba(251,122,60,0.9), rgba(251,122,60,0.15)); border:1px solid rgba(251,122,60,0.45); box-shadow:0 0 30px -6px rgba(251,122,60,0.7);}
+  .logo-mark svg{width:26px; height:26px;}
+  .logo-word{font-family:var(--mono); font-weight:700; letter-spacing:.16em; font-size:14px; color:var(--muted); text-transform:uppercase;}
+
+  /* chrome */
+  .progress{position:fixed; top:0; left:0; height:3px; z-index:50; background:linear-gradient(90deg,var(--info),var(--accent)); box-shadow:0 0 14px rgba(52,211,238,0.6); transition:width .45s cubic-bezier(.2,.7,.2,1);}
+  .hud{position:fixed; z-index:40; font-family:var(--mono); font-size:11.5px; color:var(--muted-2); letter-spacing:.08em;}
+  .hud-brand{left:clamp(18px,3.5vw,40px); bottom:22px; display:flex; align-items:center; gap:9px;}
+  .hud-brand .live{width:7px; height:7px; border-radius:50%; background:var(--safe); box-shadow:0 0 10px var(--safe); animation:pulse 2s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.35;}}
+  .hud-count{right:clamp(18px,3.5vw,40px); bottom:22px;} .hud-count b{color:var(--text); font-size:12.5px;}
+  .hud-step{left:50%; transform:translateX(-50%); bottom:22px; color:var(--info); opacity:.85;}
+
+  .nav{position:fixed; right:clamp(16px,3vw,34px); top:50%; transform:translateY(-50%); z-index:40; display:flex; flex-direction:column; gap:8px;}
+  .nav button{width:9px; height:9px; border-radius:50%; border:0; padding:0; cursor:pointer; background:rgba(145,166,192,0.3); transition:all .25s;}
+  .nav button:hover{background:var(--muted);}
+  .nav button.on{background:var(--info); box-shadow:0 0 10px var(--info); transform:scale(1.25);}
+  .nav button.prep::after{content:""; position:absolute; width:5px; height:5px;}
+
+  .hint{position:fixed; left:50%; bottom:46px; transform:translateX(-50%); z-index:40; font-family:var(--mono); font-size:11px; color:var(--muted-2); letter-spacing:.1em; opacity:.85; transition:opacity .4s; text-align:center;}
+  .hint.gone{opacity:0;}
+
+  /* prep chip (only in presenter mode) */
+  .prep-flag{position:fixed; top:16px; left:clamp(18px,3.5vw,40px); z-index:45; display:none; font-family:var(--mono); font-size:11px; letter-spacing:.08em;
+    background:rgba(245,177,58,0.14); color:var(--warn); border:1px solid rgba(245,177,58,0.4); border-radius:999px; padding:5px 12px;}
+  body.present .prep-flag.show{display:inline-flex;}
+
+  /* presenter notes panel */
+  .notes{position:fixed; left:0; right:0; bottom:0; z-index:46; transform:translateY(102%); transition:transform .35s cubic-bezier(.2,.7,.2,1);
+    background:linear-gradient(180deg, rgba(10,16,25,0.96), rgba(7,11,18,0.99)); border-top:1px solid var(--border-2); backdrop-filter:blur(18px);
+    max-height:42vh; overflow-y:auto; padding:18px clamp(18px,4vw,48px) 22px;}
+  body.present .notes{transform:translateY(0);}
+  .notes h4{font-family:var(--mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--info); margin-bottom:10px; display:flex; align-items:center; gap:10px;}
+  .notes h4 .pmode{color:var(--warn); border:1px solid rgba(245,177,58,0.4); border-radius:5px; padding:1px 7px; font-size:10px;}
+  .notes .ncols{display:grid; grid-template-columns:1.2fr 1fr 1fr; gap:22px;}
+  .notes .nlabel{font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase; margin-bottom:6px;}
+  .notes .nsay .nlabel{color:var(--safe);} .notes .ndo .nlabel{color:var(--info);} .notes .nprep .nlabel{color:var(--warn);}
+  .notes p, .notes li{font-size:13px; line-height:1.5; color:var(--text);}
+  .notes ul{list-style:none;} .notes .nprep li{color:var(--muted); padding:3px 0; display:flex; gap:8px;}
+  .notes .nprep li::before{content:"☐"; color:var(--warn);}
+  @media (max-width:900px){ .notes .ncols{grid-template-columns:1fr;} .grid-2,.grid-3,.grid-4{grid-template-columns:1fr;} .row{flex-direction:column;} .phones{flex-direction:column;} .nav{display:none;} .spine{grid-template-columns:1fr;} }
+
+  .topbar{position:fixed; top:14px; right:clamp(18px,3.5vw,40px); z-index:45; font-family:var(--mono); font-size:10.5px; color:var(--muted-2); letter-spacing:.06em; display:flex; gap:14px; align-items:center;}
+  .topbar b{color:var(--muted);}
+</style>
+</head>
+<body>
+<div class="backdrop"></div>
+<div class="progress" id="progress"></div>
+
+<div class="topbar"><span><b>N</b> notes</span><span><b>F</b> fullscreen</span><span><b>←/→</b> move</span></div>
+<div class="prep-flag" id="prepFlag">⚠ PREP NEEDED — open notes (N)</div>
+
+<div class="deck" id="deck">
+
+  <!-- 1 · TITLE -->
+  <section class="slide" data-step="1">
+    <div style="max-width:1080px;">
+      <div class="logo-row">
+        <div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.6 8 11 4.6-2.4 8-6 8-11V5l-8-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <div class="logo-word">Sentinel-City</div>
+      </div>
+      <h1>The city that <span class="grad">responds&nbsp;to&nbsp;itself.</span></h1>
+      <p class="lead" style="margin-top:24px;">An <strong style="color:var(--text)">agentic disaster-response platform</strong>. A citizen 911 report lands &rarr; Gemini agents reason and call tools &rarr; deterministic rails declare the incident, cordon it, dispatch units, and warn the public &mdash; every action stamped <span class="mono info">source='ai'</span> and replayable.</p>
+      <div class="chips">
+        <span class="chip"><span class="d" style="background:var(--info)"></span>Operator dashboard</span>
+        <span class="chip"><span class="d" style="background:var(--accent)"></span>Gemini agents + deterministic rails</span>
+        <span class="chip"><span class="d" style="background:var(--safe)"></span>Citizen &amp; responder mobile app</span>
+      </div>
+      <p class="footnote">AISeekho Hackathon 2026 · Regional Finals &nbsp;·&nbsp; Built with Google Antigravity · FastAPI + PostgreSQL 16 · LangChain + Vertex AI Gemini · React 19 · React Native</p>
+    </div>
+  </section>
+
+  <!-- 2 · PROBLEM -->
+  <section class="slide" data-step="1">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>Problem &amp; use case · demo step 1</span>
+      <h2>In a disaster, the bottleneck is<br/><span class="accent">human coordination.</span></h2>
+    </div>
+    <div class="row">
+      <div class="col">
+        <p class="lead">When a fire or flood hits a dense block, the firefighters aren't the slow part &mdash; the <strong style="color:var(--text)">decision loop</strong> is. Dozens of panicked, contradictory 911 reports have to be fused into one incident, sized, cordoned, matched to the nearest units, and turned into a public warning &mdash; today, through overloaded humans on radios, one incident at a time.</p>
+        <p class="lead" style="margin-top:16px;">Sentinel-City puts AI <em class="hl">on that loop</em>, with humans supervising &mdash; and the citizen standing inside the hazard gets the same brain on their phone.</p>
+      </div>
+      <div class="col">
+        <div class="glass" style="padding:6px 24px;">
+          <div class="stat-line"><span class="stat-num">1000s</span><span class="stat-txt">of simultaneous reports in a mass event &mdash; far past what a dispatch room can triage by hand.</span></div>
+          <div class="stat-line"><span class="stat-num">N&times;</span><span class="stat-txt">duplicate, conflicting calls about the <em>same</em> fire must be de-duplicated, not double-dispatched.</span></div>
+          <div class="stat-line"><span class="stat-num">0</span><span class="stat-txt">situational awareness for the citizen deciding which way to walk out of the zone.</span></div>
+        </div>
+        <p class="footnote">Use case: dense-city multi-incident response · operator-supervised · AI on the loop.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3 · ARCHITECTURE (corrected, honest) -->
+  <section class="slide" data-step="2">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>System architecture · demo step 2</span>
+      <h2>One system of record. An <span class="info">event-driven AI pipeline.</span> Three surfaces.</h2>
+    </div>
+    <div class="glass" style="padding:22px 24px;">
+      <div class="rail">
+        <div class="rnode"><div class="rt">Input</div><div class="rv">Citizen 911 report</div><small>transcript + lat/lng (live)</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode llm"><div class="rt">Gemini · NLU</div><div class="rv">extract</div><small>typed type / severity / casualties</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode llm"><div class="rt">Gemini · tool-call</div><div class="rv">visual triage</div><small>chooses whether to pull CCTV</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode"><div class="rt">Deterministic</div><div class="rv">cluster + decide</div><small>density confidence · declare gate</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode llm"><div class="rt">Gemini · structured</div><div class="rv">dispatch plan</div><small>per-station trucks + rails</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode"><div class="rt">Deterministic</div><div class="rv">execute</div><small>row-locked Postgres · source='ai'</small></div>
+      </div>
+      <div class="legend">
+        <span><i style="background:rgba(52,211,238,0.5)"></i> Gemini decision point (LLM)</span>
+        <span><i style="background:rgba(231,238,247,0.25)"></i> Deterministic Python rail</span>
+        <span><i style="background:rgba(251,122,60,0.5); border:1px dashed var(--accent)"></i> Simulated input (disclosed)</span>
+      </div>
+    </div>
+    <div class="grid-3" style="margin-top:18px;">
+      <div class="cell glass"><h3 class="info">Operator dashboard</h3><p>React 19 + Leaflet cyber-noir console. Draw zones, trigger events, watch the AI logs stream.</p></div>
+      <div class="cell glass"><h3 class="info">Mobile app <span class="tagb b-real" style="margin-left:4px;">mandatory</span></h3><p>Expo / React Native. Citizen, worker &amp; admin roles read one AI-only <span class="mono">/api/warnings/nearby</span> feed.</p></div>
+      <div class="cell glass"><h3 class="purple">Google Antigravity</h3><p>Dev-time agentic IDE that <em>wrapped the build</em> &mdash; planning, scaffolding, debugging. Not a runtime node (proof next).</p></div>
+    </div>
+    <p class="footnote">Backend: FastAPI + PostgreSQL 16 (JSONB geometry, no PostGIS) · all AI writes funnel through one client stamped <span class="mono">source='ai'</span>. Simulated &amp; disclosed: CCTV frames, weather/traffic, 911 station data.</p>
+  </section>
+
+  <!-- 4 · ANTIGRAVITY — built with -->
+  <section class="slide" data-step="3">
+    <div class="hd">
+      <span class="kicker k-accent"><span class="dot"></span>Google Antigravity · demo step 3 · 25% of score</span>
+      <h2><span class="purple">Antigravity</span> drove the whole build.</h2>
+    </div>
+    <div class="grid-4">
+      <div class="cell glass"><div class="ic ic-purple">01</div><h3>Planned the pipeline</h3><p>Used Antigravity's task plans to design the extract&rarr;triage&rarr;cluster&rarr;decide&rarr;dispatch&rarr;execute flow and the LLM-vs-deterministic split before writing code.</p></div>
+      <div class="cell glass"><div class="ic ic-purple">02</div><h3>Scaffolded backend</h3><p>Prompt-to-code for FastAPI endpoints, the Pydantic tool/agent schemas (<span class="mono">tools.py</span>, <span class="mono">dispatch_agent.py</span>), and the <span class="mono">source='ai'</span> write path.</p></div>
+      <div class="cell glass"><div class="ic ic-purple">03</div><h3>Generated the UI</h3><p>Produced the React 19 + Tailwind glass dashboard and the Expo screens &mdash; command palette, AI logs drawer, role views &mdash; from design-intent prompts.</p></div>
+      <div class="cell glass"><div class="ic ic-purple">04</div><h3>Debugged the agents</h3><p>Used integrated browser + terminal and agent traces to fix Gemini function-calling: tool-arg shape, the CCTV-triage gating, hallucinated-id handling.</p></div>
+    </div>
+    <p class="footnote warn-note">⚠ Confirm which of these four Antigravity actually drove and demote any it didn't &mdash; a judge can catch an overclaim. Have one real prompt ready to read verbatim (see notes).</p>
+  </section>
+
+  <!-- 5 · ANTIGRAVITY — receipts -->
+  <section class="slide" data-step="3">
+    <div class="hd">
+      <span class="kicker k-accent"><span class="dot"></span>Live proof · Antigravity workspace · demo step 3</span>
+      <h2>The <span class="purple">receipts</span> &mdash; on screen, live.</h2>
+    </div>
+    <div class="grid-4">
+      <div class="ph"><div class="pic">🗂️</div><div class="pt">Agent Manager</div><div class="pd">Sentinel-City workspace open, task / agent history visible.</div></div>
+      <div class="ph"><div class="pic">📋</div><div class="pt">Generated task plan</div><div class="pd">One plan Antigravity authored — name the feature it planned.</div></div>
+      <div class="ph"><div class="pic">⌨️</div><div class="pt">Prompt → file</div><div class="pd">A prompt next to the exact file it produced, side by side.</div></div>
+      <div class="ph"><div class="pic">🐞</div><div class="pt">Debug trace</div><div class="pd">An agent trace where a tool-call failed and Antigravity fixed it.</div></div>
+    </div>
+    <p class="footnote warn-note">⚠ CAPTURE CHECKLIST — these four artifacts do not exist in the repo yet. Grab them BEFORE the finals and pre-load on the demo machine. No artifact = no points on the highest-weighted criterion. Live workspace &gt; screenshots if access is safe.</p>
+  </section>
+
+  <!-- 6 · AGENTIC CORE -->
+  <section class="slide" data-step="3">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>Agentic behavior &amp; reasoning · 25% of score</span>
+      <h2>The model <span class="info">proposes.</span> Deterministic code <span class="accent">disposes.</span></h2>
+    </div>
+    <div class="grid-3">
+      <div class="cell glass-info"><div class="ic ic-info">◉</div><h3>Visual triage <span class="tagb b-llm" style="margin-left:4px;">Gemini · tool</span></h3><p>Gemini reads the 911 transcript and <em class="hl">chooses</em> — via a real function-call — whether to pull a CCTV frame. Severe/ambiguous → pull; clear-minor → text-only. Genuine conditional tool use, rationale logged.</p><p class="mono" style="font-size:11px; margin-top:8px; color:var(--muted-2)">pipeline/agent.py · bind_tools([GetCCTVFeed])</p></div>
+      <div class="cell glass-info"><div class="ic ic-info">◎</div><h3>Dispatch planner <span class="tagb b-llm" style="margin-left:4px;">Gemini · structured</span></h3><p>Given live per-station capacity + the incident profile, Gemini sets per-station truck counts by <em>doctrine</em>, not a fixed table — so casualties or many reports change the response.</p><p class="mono" style="font-size:11px; margin-top:8px; color:var(--muted-2)">pipeline/dispatch_agent.py · with_structured_output</p></div>
+      <div class="cell glass-info"><div class="ic ic-info">⊙</div><h3>911 authenticity <span class="tagb b-llm" style="margin-left:4px;">Gemini · vision</span></h3><p>Weighs transcript + disaster context + attached photo → <span class="mono">genuine / uncertain / likely_prank</span>. Advisory only — it re-prioritizes, never silently drops a call.</p><p class="mono" style="font-size:11px; margin-top:8px; color:var(--muted-2)">pipeline/prank_check.py</p></div>
+    </div>
+    <div class="glass" style="margin-top:16px; padding:16px 22px;">
+      <h3 style="margin-bottom:10px;">…and the deterministic rails the model <span class="accent">cannot bypass</span></h3>
+      <p class="muted" style="font-size:13.5px; line-height:1.6;"><span class="mono info">cluster.py</span> derives confidence from report <em>density</em> (not the LLM's self-rating) · <span class="mono info">should_declare</span> gates on ≥2 corroborating reports, confidence ≥ 0.5, 800 m dedup &amp; operator cooldown · dispatch counts are <em>clamped to real capacity</em>, hallucinated stations dropped, total capped at 10 · <span class="mono info">execute.py</span> commits behind <span class="mono">SELECT … FOR UPDATE</span> as the final gate.</p>
+    </div>
+    <p class="footnote">This is the honest, repo-verifiable design: three real Gemini decision points over deterministic Python — the agent reasons freely but can't empty the fleet or declare a phantom disaster.</p>
+  </section>
+
+  <!-- 7 · ANATOMY OF ONE DECISION -->
+  <section class="slide" data-step="4">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>Anatomy of one decision</span>
+      <h2>Input → understand → <span class="info">reason</span> → tool → <span class="accent">act</span> → result.</h2>
+    </div>
+    <div class="glass" style="padding:20px 22px;">
+      <div class="rail">
+        <div class="rnode"><div class="rt">1 · Input</div><div class="rv">911 transcript</div><small>+ lat/lng, written to citizen_reports</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode llm"><div class="rt">2 · Understand</div><div class="rv">NLU + triage</div><small>extract fields; maybe pull a CCTV still</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode"><div class="rt">3 · Reason</div><div class="rv">cluster confidence</div><small>density-derived, server-side</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode llm"><div class="rt">4 · Tool use</div><div class="rv">declare + dispatch</div><small>gate crossed → plan response</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode"><div class="rt">5 · Act</div><div class="rv">DB writes</div><small>incident · cordon · dispatch · alert</small></div>
+        <div class="rarrow">→</div>
+        <div class="rnode"><div class="rt">6 · Result</div><div class="rv">visible change</div><small>zone on map · route bends · phone pings</small></div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:18px; gap:18px;">
+      <div class="col glass cell"><h3 class="info">Why this is reasoning, not a script</h3><p>The agent doesn't fire on one panicked caller and isn't fooled by hyperbole: confidence is computed from how many reports cluster in space &amp; time, and severity escalates by <em>volume</em> — 15 calm callers about one fire still escalate; one hysterical caller can't fabricate a "critical".</p></div>
+      <div class="col glass cell"><h3 class="accent">Reason → act → observe</h3><p>It crosses a threshold, <em>acts</em> with real side-effecting tool calls, and produces an observable outcome on three surfaces. That loop — not a single prompt answer — is what makes it an agent rather than a summarizer.</p></div>
+    </div>
+    <p class="footnote">Tip: narrate this slide with the <em>exact</em> incident you'll trigger live, so the judges watch the same story unfold next.</p>
+  </section>
+
+  <!-- 8 · LIVE WORKFLOW -->
+  <section class="slide" data-step="4">
+    <div class="hd">
+      <span class="kicker k-safe"><span class="dot"></span>Live agentic workflow · demo step 4 · run it fresh</span>
+      <h2>One fresh report. The pipeline <span class="safe">runs the loop</span> — live.</h2>
+    </div>
+    <div class="grid-2">
+      <div class="stack">
+        <div class="glass cell"><h3 class="safe">① Fresh input — from the mobile app</h3><p>A citizen files a report ("heavy smoke, people trapped" near a Manhattan address). Let a judge pick the wording. Geo-stamped, written to <span class="mono">citizen_reports</span>.</p></div>
+        <div class="glass cell"><h3 class="info">② Understand → reason</h3><p>Gemini extracts type/severity; triage may pull a CCTV still. It does <em>not</em> fire on one report — the deterministic gate needs ≥2 corroborating same-type reports and confidence ≥ 0.5. Trigger the second report; the cluster crosses threshold.</p></div>
+        <div class="glass cell"><h3 class="accent">③ Act</h3><p>declare incident → AI dispatch planner ranks live station capacity → dispatch trucks, cordon the block, publish the citizen alert. Real Postgres writes, stamped <span class="mono">source='ai'</span>.</p></div>
+      </div>
+      <div class="stack">
+        <div class="glass-safe cell"><h3 class="safe">④ Three visible state changes</h3>
+          <p style="margin-bottom:6px;">▸ <strong style="color:var(--text)">Dashboard</strong> — a new red zone + no-entry cordon appear, trucks animate to the scene.</p>
+          <p style="margin-bottom:6px;">▸ <strong style="color:var(--text)">Worker phone</strong> — a driving route that bends <em>around</em> the cordon (Valhalla <span class="mono">avoid_polygons</span>).</p>
+          <p>▸ <strong style="color:var(--text)">Citizen phone</strong> — a push warning + a walking route that avoids the hazard.</p>
+        </div>
+        <div class="ph" style="min-height:130px;"><div class="pic">📸</div><div class="pt">Capture: 3 synced surfaces mid-run</div><div class="pd">Dashboard + worker phone + citizen phone, same incident.</div></div>
+      </div>
+    </div>
+    <p class="footnote">pipeline: extract → triage → cluster → decide → dispatch → execute &nbsp;·&nbsp; <span class="warn">Measure the real report→declared→dispatched wall-clock on a dry run and quote that number — don't guess.</span></p>
+  </section>
+
+  <!-- 9 · AUTONOMOUS ACTION → OUTCOME -->
+  <section class="slide" data-step="4">
+    <div class="hd">
+      <span class="kicker k-accent"><span class="dot"></span>Autonomous action, simulation &amp; outcome · 15% of score</span>
+      <h2>It <span class="accent">acts.</span> It doesn't just summarize.</h2>
+    </div>
+    <div class="grid-4">
+      <div class="cell glass"><div class="ic ic-accent">◤</div><h3 class="mono" style="font-size:14px;">declare_incident</h3><p>INSERT into <span class="mono">disaster_events</span> (dedup-guarded). <span class="safe">Outcome:</span> a live red zone on the dashboard map + mobile feed.</p></div>
+      <div class="cell glass"><div class="ic ic-accent">◥</div><h3 class="mono" style="font-size:14px;">dispatch_units</h3><p>Row-locked UPDATE of station trucks + INSERT <span class="mono">active_dispatches</span>. <span class="safe">Outcome:</span> trucks en route; worker phone re-routes.</p></div>
+      <div class="cell glass"><div class="ic ic-accent">◢</div><h3 class="mono" style="font-size:14px;">create_cordon</h3><p>INSERT a no-entry cordon polygon. <span class="safe">Outcome:</span> Valhalla routes <em>around</em> it, not through it.</p></div>
+      <div class="cell glass"><div class="ic ic-accent">◣</div><h3 class="mono" style="font-size:14px;">publish_alert</h3><p>INSERT a notification (directive-verb checked). <span class="safe">Outcome:</span> a warning lands on every nearby citizen phone.</p></div>
+    </div>
+    <p class="footnote warn-note">Disclosed on this slide: dispatch runs against <strong>seeded</strong> fire/hospital/police stations — not a real CAD/911 system. The action loop &amp; DB writes are real; the upstream feeds are simulated.</p>
+  </section>
+
+  <!-- 10 · AGENT TRACE / LOGS -->
+  <section class="slide" data-step="5">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>Agent trace / logs · demo step 5</span>
+      <h2>Every decision is <span class="info">replayable</span> in the log.</h2>
+    </div>
+    <div class="row">
+      <div class="col" style="flex:1.15;">
+        <div class="glass" style="padding:6px 22px;">
+          <table class="tbl">
+            <tr><td><span class="tagb b-llm">observation</span></td><td><span class="sub">nlu_extract — type, severity, casualty flag, transcript excerpt; triage rationale (CCTV pulled or skipped)</span></td></tr>
+            <tr><td><span class="tagb b-det">decision</span></td><td><span class="sub">"cluster of N reports within Xm / Ys → declare" + the density-derived confidence</span></td></tr>
+            <tr><td><span class="tagb b-accent" style="background:rgba(251,122,60,0.13);color:var(--accent);border:1px solid rgba(251,122,60,0.3)">tool_call</span></td><td><span class="sub">declare · dispatch · cordon · alert — args in, result out (e.g. the new dispatch_id), expandable JSON</span></td></tr>
+            <tr><td><span class="tagb b-mod">recovery</span></td><td><span class="sub">logged when input is noisy / a feed is down / an agent errors — the system says how it degraded</span></td></tr>
+          </table>
+        </div>
+        <p class="footnote">Source: <span class="mono">audit.py</span> → <span class="mono">GLOBAL_LOG_BUFFER</span> (500-deep ring) → <span class="mono">GET /api/logs</span> → the dashboard's Datadog-style AI logs drawer (press <kbd>A</kbd>). Free-text + event-type + date-range filters.</p>
+      </div>
+      <div class="col stack">
+        <div class="glass cell"><h3 class="info">Open it live, right after the run</h3><p>The rows you read were just written by the Step-4 incident. Click any row to expand the full payload — this is a real agent trace, not a UI mock.</p></div>
+        <div class="ph" style="min-height:120px;"><div class="pic">📸</div><div class="pt">Capture: one incident's chain</div><div class="pd">observation → decision → tool_call, with an expanded declare/dispatch payload.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 11 · MOBILE + MEASURABLE OUTCOME -->
+  <section class="slide" data-step="4">
+    <div class="hd">
+      <span class="kicker k-safe"><span class="dot"></span>Live functionality · mobile app (mandatory) · demo step 4 result</span>
+      <h2>From a tap to a <span class="safe">coordinated response</span> — measured.</h2>
+    </div>
+    <div class="row" style="gap:40px; align-items:center;">
+      <div class="col" style="flex:0 0 auto;">
+        <div class="phones">
+          <div><div class="phone"><img src="screenshots/mobile-heatmap.png" alt="City resilience heatmap" /></div><div class="phone-cap">Citizen · resilience heatmap</div></div>
+          <div><div class="phone"><img src="screenshots/mobile-impact.png" alt="AI impact screen" /></div><div class="phone-cap">Admin · impact + AI reasoning</div></div>
+        </div>
+      </div>
+      <div class="col">
+        <div class="grid-2">
+          <div class="metric glass m-safe"><div class="lbl">Lives saved</div><div class="big safe" data-count="1284">0</div><div class="sub">modeled vs. manual baseline</div></div>
+          <div class="metric glass m-info"><div class="lbl">Infrastructure preserved</div><div class="big info" data-count="48.32" data-prefix="$" data-suffix="M" data-dec="2">$0M</div><div class="sub">cordon + early warning (modeled)</div></div>
+          <div class="metric glass m-accent"><div class="lbl">Operational savings</div><div class="big accent" data-count="12.75" data-prefix="$" data-suffix="M" data-dec="2">$0M</div><div class="sub">optimized dispatch (modeled)</div></div>
+          <div class="metric glass m-warn"><div class="lbl">Decision latency</div><div class="big warn" data-count="0" data-suffix="s" data-dec="0" data-static="MEASURE">— s</div><div class="sub">report → dispatched, live run</div></div>
+        </div>
+        <p class="footnote">Admin role, shown live. Every tile is tap-to-expand into the AI's reasoning trace — nothing is a black box. <span class="warn">Numbers are modeled estimates for a Manhattan simulation; replace the latency tile with your measured number.</span></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 12 · EDGE CASES -->
+  <section class="slide" data-step="6">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>Robustness &amp; edge cases · demo step 6 · 10% of score</span>
+      <h2>Built to <span class="info">survive</span> the messy input.</h2>
+    </div>
+    <div class="grid-2">
+      <div class="cell glass"><h3>Noisy / hyperbolic report</h3><p>"The whole city is doomed!!" is still extracted to a typed schema; severity follows a strict rubric and <em>density-derived</em> confidence — one dramatic caller can't manufacture a "critical".</p></div>
+      <div class="cell glass"><h3>Duplicate / conflicting reports</h3><p>Same-type reports within 800 m are de-duplicated; <span class="mono">execute.py</span> commits behind a row lock, so two near-simultaneous declares attach to one incident instead of spawning a twin.</p></div>
+      <div class="cell glass"><h3>Likely-prank 911 photo</h3><p>A meme/selfie attached to a call → vision check returns <span class="mono">likely_prank</span> and de-prioritizes — but <span class="safe">never silently drops</span> it. <span class="mono">assess_call</span> never raises; on error it returns "uncertain" so the call still reaches dispatch.</p></div>
+      <div class="cell glass"><h3>Tool / API failure</h3><p>Triage timeout → text-only NLU. Dispatch-agent error → <span class="mono">([], reason)</span>, dispatch nothing, log it. Over-request → clamped to real capacity; hallucinated station → dropped. The pipeline never crashes on a model error.</p></div>
+    </div>
+    <p class="footnote">cluster.py · prank_check.py (never raises) · dispatch_agent.py (capacity clamp + fail-safe) · execute.py (row lock). <span class="warn">Lock 3 judge-input variants and rehearse each end-to-end (see notes).</span></p>
+  </section>
+
+  <!-- 13 · REAL vs SIMULATED -->
+  <section class="slide" data-step="6">
+    <div class="hd">
+      <span class="kicker k-accent"><span class="dot"></span>Disclosure · implemented vs simulated · honesty = points</span>
+      <h2>A straight answer on <span class="accent">what's real.</span></h2>
+    </div>
+    <div class="glass" style="padding:6px 24px;">
+      <table class="tbl">
+        <tr><td><span class="tagb b-real">real · live</span> Agentic loop</td><td><span class="sub">Gemini triage tool-call, dispatch planning, vision prank-check; clustering; declare/cordon/dispatch/alert tool execution.</span></td></tr>
+        <tr><td><span class="tagb b-real">real · live</span> System of record</td><td><span class="sub">FastAPI + PostgreSQL 16, row-locked writes stamped <span class="mono">source='ai'</span>, audit log, <span class="mono">/api/warnings/nearby</span>.</span></td></tr>
+        <tr><td><span class="tagb b-real">real · live</span> Surfaces &amp; routing</td><td><span class="sub">Operator dashboard, 3-role mobile app, Valhalla <span class="mono">avoid_polygons</span> hazard-aware routes.</span></td></tr>
+        <tr><td><span class="tagb b-sim">simulated</span> CCTV / weather / traffic</td><td><span class="sub">Mock CCTV frames and generated weather/traffic that react to active events — not live external APIs.</span></td></tr>
+        <tr><td><span class="tagb b-sim">simulated</span> 911 dispatch target</td><td><span class="sub">Dispatch runs against <em>seeded</em> fire/hospital/police stations — not a connected real CAD system.</span></td></tr>
+        <tr><td><span class="tagb b-mod">modeled</span> Impact metrics</td><td><span class="sub">1,284 lives · $48.32M · $12.75M are estimates for the demo scenario, not measured live telemetry.</span></td></tr>
+      </table>
+    </div>
+    <p class="footnote">Antigravity is our <em>development</em> environment (planned/scaffolded/debugged the code); the running system is real. We mark every simulated feed up front — that's exactly why <span class="mono">source='ai'</span> exists.</p>
+  </section>
+
+  <!-- 14 · TECH QUALITY / UX -->
+  <section class="slide" data-step="7">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>Technical quality, UX &amp; presentation · 5% of score</span>
+      <h2>Production-<span class="info">shaped</span>, not a demo hack.</h2>
+    </div>
+    <div class="grid-2">
+      <div class="cell glass"><h3 class="info">Clean architecture</h3><p>One system of record. The LLM does scoped jobs (NLU, triage, dispatch, vision); every consequential decision — confidence, declare gate, cordon radius, capacity — is deterministic Python. All AI writes funnel through one client stamped <span class="mono">source='ai'</span>. A real test suite lives under <span class="mono">backend/tests/</span>.</p></div>
+      <div class="cell glass"><h3 class="info">Accessible, keyboard-first UI</h3><p>Custom cyber-noir glass system: WCAG-AA body contrast, focus-visible rings, ARIA roles + <span class="mono">aria-live</span> on overlays, full keyboard nav (<kbd>⌘K</kbd>, <kbd>?</kbd>, <kbd>A</kbd>, <kbd>F</kbd>), and <span class="mono">prefers-reduced-motion</span> honored.</p></div>
+      <div class="cell glass"><h3 class="info">Reproducible &amp; documented</h3><p>One command — <span class="mono">docker compose up --build</span> — brings up dashboard (5173), API + Swagger (8000), Postgres. README documents the architecture, every env var, the AI-only feed contract, and an implemented-vs-simulated table.</p></div>
+      <div class="cell glass"><h3 class="info">Auditable by design</h3><p>Datadog-style AI logs drawer with expandable payloads + filters; on mobile, every admin tile expands to the AI's full reasoning. Nothing the agent does is a black box.</p></div>
+    </div>
+    <p class="footnote">README.md · docker-compose.yml · backend/tests · the cyber-noir design system. <span class="warn">Print a repo/README QR on this slide.</span></p>
+  </section>
+
+  <!-- 15 · DEMO SPINE -->
+  <section class="slide" data-step="7">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>Presenter cue-card · 7-step live demo flow</span>
+      <h2>The <span class="info">demo spine</span> — who does what, when.</h2>
+    </div>
+    <div class="glass" style="padding:20px 26px;">
+      <div class="spine">
+        <div class="step"><span class="n">1</span><div><div class="st">Problem &amp; use case</div><div class="sd">Narrator frames the human-coordination bottleneck. ~25s. Title + Problem.</div></div></div>
+        <div class="step"><span class="n">2</span><div><div class="st">Architecture (+ Antigravity fit)</div><div class="sd">Walk the pipeline rail; name LLM vs deterministic vs simulated nodes. ~40s.</div></div></div>
+        <div class="step must"><span class="n">3</span><div><div class="st">Google Antigravity usage ★</div><div class="sd">Driver shows the real workspace: Agent Manager, a plan, a prompt→file, a debug trace. 25% of score.</div></div></div>
+        <div class="step must"><span class="n">4</span><div><div class="st">Live agentic workflow ★</div><div class="sd">Fresh report on the mobile app → triage → cluster gate → declare → dispatch/cordon/alert → 3 surfaces change.</div></div></div>
+        <div class="step"><span class="n">5</span><div><div class="st">Agent trace / logs</div><div class="sd">Open the AI logs drawer (A); expand one tool_call payload. Prove plan→reason→tool→result.</div></div></div>
+        <div class="step must"><span class="n">6</span><div><div class="st">Edge case — judge input ★</div><div class="sd">Invite a modified input; show triangulation / prank-check / capacity-clamp recover. 10% of score.</div></div></div>
+        <div class="step"><span class="n">7</span><div><div class="st">Final value proposition</div><div class="sd">Land impact + scalability; disclose simulated parts; show live URLs. ~30s.</div></div></div>
+      </div>
+    </div>
+    <p class="footnote">Roles: <strong style="color:var(--text)">Driver</strong> = dashboard + phone · <strong style="color:var(--text)">Narrator</strong> = reasoning out loud. Have a recorded backup run one keypress away in case Vertex stalls (known stale-creds risk).</p>
+  </section>
+
+  <!-- 16 · VALUE / CLOSE -->
+  <section class="slide" data-step="7">
+    <div style="max-width:1080px;">
+      <span class="kicker k-safe"><span class="dot"></span>Final value proposition · demo step 7</span>
+      <h2 style="font-size:clamp(30px,4.8vw,64px);">When seconds save lives,<br/>the city shouldn't <span class="grad">wait for a human.</span></h2>
+      <p class="lead" style="margin-top:22px;">Sentinel-City compresses the disaster decision loop — triangulate, declare, cordon, dispatch, warn — from minutes of radio chatter into a few <em class="hl">autonomous, auditable</em> seconds, with humans always supervising. One clean tool surface scales from one incident to a citywide event, and it already deploys to Cloud Run.</p>
+      <div class="grid-4" style="margin-top:26px;">
+        <div class="metric glass m-safe"><div class="big safe" style="font-size:clamp(26px,3.4vw,42px)" data-count="1284">0</div><div class="sub">lives saved · modeled</div></div>
+        <div class="metric glass m-info"><div class="big info" style="font-size:clamp(26px,3.4vw,42px)" data-count="48.32" data-prefix="$" data-suffix="M" data-dec="2">$0M</div><div class="sub">infrastructure preserved · modeled</div></div>
+        <div class="metric glass m-accent"><div class="big accent" style="font-size:clamp(26px,3.4vw,42px)" data-count="12.75" data-prefix="$" data-suffix="M" data-dec="2">$0M</div><div class="sub">operational savings · modeled</div></div>
+        <div class="metric glass m-warn"><div class="big warn" style="font-size:clamp(22px,2.6vw,34px)">Seconds</div><div class="sub">not the minutes of a human baseline</div></div>
+      </div>
+      <p class="footnote">Real &amp; live: agentic reasoning, tool calls, <span class="mono">source='ai'</span> DB writes, hazard-aware routing, mobile + dashboard. Simulated: weather/traffic, CCTV, 911 stations. Modeled: the impact figures. <span class="warn">Print live URLs here.</span></p>
+    </div>
+  </section>
+
+</div>
+
+<div class="nav" id="nav"></div>
+<div class="hud hud-brand"><span class="live"></span> SENTINEL-CITY</div>
+<div class="hud hud-step" id="stepHud"></div>
+<div class="hud hud-count"><b id="cur">01</b> / <span id="total">16</span></div>
+<div class="hint" id="hint">Press <kbd>N</kbd> for presenter notes · <kbd>←</kbd> <kbd>→</kbd> or click to navigate · <kbd>F</kbd> fullscreen</div>
+
+<div class="notes" id="notesPanel">
+  <h4 id="notesTitle">Presenter notes <span class="pmode">PRESENTER MODE — judges should not see this</span></h4>
+  <div class="ncols">
+    <div class="nsay"><div class="nlabel">Say</div><p id="nSay">—</p></div>
+    <div class="ndo"><div class="nlabel">Do</div><p id="nDo">—</p></div>
+    <div class="nprep"><div class="nlabel">Prep / fill-in</div><ul id="nPrep"></ul></div>
+  </div>
+</div>
+
+<script>
+  const NOTES = [
+    { say:"When a fire, flood, or collapse hits a dense city, the slow part isn't the trucks — it's the human decision loop. Sentinel-City hands that loop to AI agents, with humans always in control.", do:"Read the one-line pitch, point to the three chips, and promise: everything in the next ~8 minutes runs live — including the mandatory mobile app — and we'll be upfront about what's real vs simulated. ~20s.", prep:["Add team name + member names","Print live URLs: dashboard, API /docs, deployed Cloud Run"] },
+    { say:"The firefighters aren't the slow part — the decision loop is: fuse dozens of conflicting reports into one incident, size it, cordon it, dispatch the nearest units, warn the public. Today that's overloaded humans on radios, one incident at a time.", do:"Walk the right column top to bottom. ~45s. This sets up why the next slides are about AGENTS, not a chatbot.", prep:["Optional: swap in one cited real stat (e.g. median 911→dispatch latency) or keep the qualitative framing"] },
+    { say:"One system of record — Postgres. A citizen report triggers an event-driven pipeline: Gemini extracts and triages, deterministic code clusters and decides, Gemini plans the dispatch, deterministic code executes. Dashboard and mobile read the same DB. Antigravity is how we BUILT it — a dev-time frame, not a runtime service. And I'll flag the simulated feeds up front.", do:"Trace the rail left to right. Point at the cyan LLM nodes vs the deterministic nodes, then the Antigravity card, then say the simulated parts out loud. ~60s. This honesty earns Tech-Quality points.", prep:["Confirm the Antigravity box reads as a dev-time wrapper, not a request-path node"] },
+    { say:"Sentinel-City is an agentic pipeline, a FastAPI system-of-record, and a React + Expo front end. We didn't hand-roll that scaffolding — we built it inside Google Antigravity, Gemini's agentic IDE.", do:"Open the Antigravity workspace on screen and walk the four cards, pointing at the matching artifact as you name it. ~30s — the proof is the next slide.", prep:["CONFIRM which of the four Antigravity actually drove; demote any it didn't","Have ONE real prompt ready to read verbatim (e.g. the architecture-planning prompt)"] },
+    { say:"Here's the proof, not a slide claim: the prompt, what Antigravity generated, and the file running in the demo.", do:"This is the single highest-weighted moment (25%). Alt-tab into the real Antigravity workspace and open, in order: Agent Manager, a generated plan, a prompt→file pair, a debug trace. Rehearse the alt-tab so it's smooth. Live > screenshots if access is safe.", prep:["CAPTURE all four artifacts before finals — none exist in the repo yet","Pre-load screenshots on the demo machine as a fallback","Name the bug the debug-trace caught (e.g. malformed Gemini tool args / hallucinated camera_id)"] },
+    { say:"There's no fixed if/else driving this. The model PROPOSES — three real Gemini decision points — and deterministic Python DISPOSES. Triage chooses whether to pull a camera. The dispatch planner sets truck counts by doctrine. The vision check rates a 911 photo. Then rails the model can't bypass: confidence from report density not the model's self-rating, capacity clamps, a row-locked final commit.", do:"Lead with the three cyan cards (these are the genuinely agentic surfaces a judge can verify in the repo), then the rails box. ~75s. If a judge asks 'how do you stop a hallucinating model emptying the fleet?' — point at the rails.", prep:["Be ready to open pipeline/agent.py (bind_tools) and dispatch_agent.py (_validate_and_convert clamps) if a judge wants to see the code"] },
+    { say:"Follow one report through the loop: input, understanding via NLU plus an optional CCTV pull, reasoning via density-based clustering, the tool calls once the gate is crossed, the real DB writes, and the visible result. Reason, then act, then observe an outcome — that's an agent, not a summarizer.", do:"Narrate with the EXACT incident you'll trigger live, so this slide pre-mirrors the demo. ~75s.", prep:["Lock the exact transcript + Manhattan coordinates you'll trigger, and use them here too"] },
+    { say:"Now watch it live — not a recording. A citizen files a fresh report; a judge can pick the words. It does NOT fire on one report: the gate needs two corroborating reports and confidence over 0.5. Second report — threshold crossed — it declares, plans the dispatch against live capacity, cordons, and alerts. Three surfaces change at once.", do:"Do it live across dashboard + worker phone + citizen phone. End on the three synced state changes.", prep:["Lock the fresh transcript + address","MEASURE report→declared→dispatched wall-clock on a dry run — quote the real number","Capture a photo/clip of the 3 synced surfaces mid-run","Verify Vertex creds on the demo machine; have a recorded backup run ready"] },
+    { say:"This is the 15% action criterion: the agent performs meaningful, side-effecting actions with visible outcomes. Four real writes — declare, dispatch, cordon, alert — each changes a surface you can see. Dispatch is row-locked, so even a misbehaving model can't over-dispatch.", do:"For each card, name the tool, the DB write, and the surface it changes. Read the disclosure line aloud — dispatch hits seeded stations, not a real CAD.", prep:["Capture before/after dashboard map (zone + cordon + trucks)","Capture worker-phone route bending around the cordon polygon"] },
+    { say:"This is a real agent trace, not a UI mock. The rows you're seeing were just written by the incident we ran. Observation, decision, tool call with full args and results — click to expand the JSON. Noisy input or a downed feed shows up as a recovery row.", do:"Open the AI logs drawer (A) right after the Step-4 run. Walk one incident top to bottom; expand a declare/dispatch payload. Point out the filters.", prep:["Screenshot the OBSERVATION→DECISION→TOOL_CALL chain","Screenshot one expanded tool_call JSON payload"] },
+    { say:"Same incident, now measured — on the admin role of the mobile app, which is mandatory to show live. These are modeled impact numbers for our Manhattan simulation; tap a tile to expand the AI's full reasoning behind the number. Nothing is a black box.", do:"Close Step 4 on the admin app. Tap a tile to expand its reasoning. Be upfront the figures are modeled estimates vs a manual baseline.", prep:["Replace the latency tile with the measured number from your live run","Capture admin impact tiles + one tile expanded to its reasoning trace"] },
+    { say:"Hand me any report you like — I'll show you it doesn't break us. Every defense here is deterministic Python around the model, not the model policing itself: a hyperbolic caller can't fake a 'critical', duplicates de-dup, a meme photo is flagged likely-prank but never dropped, and any tool failure degrades gracefully.", do:"Live-fire ONE rehearsed input and narrate the trace as it resolves, then invite the judge's own input. This is the judge-modified-input moment (10%).", prep:["Lock 3 inputs, each hitting a different rail: (a) noisy/ambiguous → triage still extracts; (b) meme 911 photo → likely_prank; (c) over-dispatch request → capacity clamp","Rehearse each end-to-end against the live build","Capture the likely_prank verdict on the admin app"] },
+    { say:"To be straight with the judges: Antigravity is our development environment. The running system is real FastAPI + Postgres + Gemini with real tool execution stamped source='ai'. What's simulated is clearly marked — weather/traffic, CCTV frames, 911 station data — and the impact numbers are modeled. We tell you exactly which is which.", do:"Hold ~15s on this. It's the honesty beat that protects against an 'is this real?' gotcha and scores the 5% implemented-vs-simulated criterion.", prep:["Confirm this table matches what you can actually prove live"] },
+    { say:"This is production-shaped. The model does scoped jobs; every consequential decision is deterministic Python — which is exactly why the edge cases hold. One docker compose command brings the whole thing up, and the README spells out every env var and what's simulated.", do:"Tab through the dashboard to show focus rings and keyboard nav. Mention the test suite under backend/tests. End on reproducibility.", prep:["Add a repo/README QR code to the slide"] },
+    { say:"Here's our run of show. Driver clicks the dashboard and holds the phone; Narrator explains the reasoning. We go input → reasoning → tool call → visible action → outcome, take a judge's curveball, then land the value.", do:"Present briefly as a roadmap, or keep as your confidence monitor. If anything stalls live, the Narrator keeps talking to the agent trace while the Driver recovers.", prep:["Assign real names to Driver and Narrator","Pre-record a clean end-to-end run as a backup; verify Vertex creds before judging"] },
+    { say:"In our Manhattan simulation the agents modeled 1,284 lives saved, $48M of infrastructure preserved, $12.75M in operational savings. To be clear, those are modeled, and weather/traffic/CCTV/911 are simulated — what's fully real is the agentic reasoning, the tool calls, the source='ai' DB writes, the routing, and the live mobile + dashboard. One tool surface scales from one incident to a citywide event, and it already runs on Cloud Run.", do:"Land the headline and the live URLs; invite the judges to test it. Mark live-feed/CAD integration and multi-city as roadmap.", prep:["Print live demo URLs","If you measured a real per-incident latency, quote it here"] },
+  ];
+
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  const total = slides.length;
+  let i = 0, present = false;
+  const $ = id => document.getElementById(id);
+  $('total').textContent = String(total).padStart(2,'0');
+
+  const nav = $('nav');
+  slides.forEach((_, idx) => {
+    const b = document.createElement('button');
+    b.addEventListener('click', () => go(idx));
+    if ((NOTES[idx]?.prep || []).length) b.title = 'prep needed';
+    nav.appendChild(b);
+  });
+  const dots = Array.from(nav.children);
+
+  function animateCounters(slide) {
+    slide.querySelectorAll('[data-count]').forEach(el => {
+      if (el.dataset.static) return;
+      const target = parseFloat(el.dataset.count);
+      const dec = parseInt(el.dataset.dec || '0', 10);
+      const pre = el.dataset.prefix || '', suf = el.dataset.suffix || '';
+      const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const fmt = v => pre + Number(v).toLocaleString(undefined,{minimumFractionDigits:dec,maximumFractionDigits:dec}) + suf;
+      if (reduce) { el.innerHTML = fmt(target); return; }
+      const dur = 1050; let start = null;
+      function step(ts){ if(start===null)start=ts; const p=Math.min((ts-start)/dur,1); const e=1-Math.pow(1-p,3);
+        el.innerHTML = fmt(target*e); if(p<1) requestAnimationFrame(step); else el.innerHTML = fmt(target); }
+      requestAnimationFrame(step);
+    });
+  }
+
+  function renderNotes() {
+    const n = NOTES[i] || {say:'',do:'',prep:[]};
+    $('nSay').textContent = n.say || '—';
+    $('nDo').textContent = n.do || '—';
+    const ul = $('nPrep'); ul.innerHTML = '';
+    (n.prep || []).forEach(p => { const li = document.createElement('li'); li.textContent = p; ul.appendChild(li); });
+    if (!(n.prep||[]).length) { const li=document.createElement('li'); li.textContent='No open prep items for this slide.'; li.style.color='var(--safe)'; ul.appendChild(li); }
+    const flag = $('prepFlag');
+    flag.classList.toggle('show', (n.prep||[]).length>0);
+  }
+
+  function go(n) {
+    i = Math.max(0, Math.min(total-1, n));
+    slides.forEach((s,idx) => s.classList.toggle('active', idx===i));
+    dots.forEach((d,idx) => d.classList.toggle('on', idx===i));
+    $('progress').style.width = ((i+1)/total*100) + '%';
+    $('cur').textContent = String(i+1).padStart(2,'0');
+    const step = slides[i].dataset.step;
+    $('stepHud').textContent = step ? ('DEMO STEP ' + step) : '';
+    const active = slides[i];
+    if (active.querySelector('[data-count]')) animateCounters(active);
+    renderNotes();
+  }
+
+  function next(){ go(i+1); hideHint(); }
+  function prev(){ go(i-1); hideHint(); }
+  let hintHidden=false;
+  function hideHint(){ if(!hintHidden){ $('hint').classList.add('gone'); hintHidden=true; } }
+
+  function toggleNotes(){ present=!present; document.body.classList.toggle('present', present); }
+
+  document.addEventListener('keydown', e => {
+    if (['ArrowRight',' ','PageDown','ArrowDown'].includes(e.key)) { e.preventDefault(); next(); }
+    else if (['ArrowLeft','PageUp','ArrowUp'].includes(e.key)) { e.preventDefault(); prev(); }
+    else if (e.key==='Home') go(0);
+    else if (e.key==='End') go(total-1);
+    else if (e.key==='n' || e.key==='N') toggleNotes();
+    else if (e.key==='f' || e.key==='F') { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen(); }
+  });
+
+  $('deck').addEventListener('click', e => {
+    if (e.target.closest('a,button')) return;
+    if (e.clientX/window.innerWidth < 0.22) prev(); else next();
+  });
+
+  let tx=0;
+  document.addEventListener('touchstart', e => tx=e.changedTouches[0].clientX, {passive:true});
+  document.addEventListener('touchend', e => { const dx=e.changedTouches[0].clientX-tx; if(Math.abs(dx)>50){ dx<0?next():prev(); } }, {passive:true});
+
+  go(0);
+  setTimeout(hideHint, 7000);
+</script>
+</body>
+</html>

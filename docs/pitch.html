@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sentinel-City — 6-Slide Pitch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --bg:#070b12; --bg-2:#0a1019; --border:rgba(125,165,210,0.14); --border-2:rgba(125,165,210,0.30);
+    --accent:#fb7a3c; --accent-2:#ff9a5a; --info:#34d3ee; --info-2:#7ce7f7; --safe:#3ddc91; --warn:#f5b13a; --purple:#a78bfa;
+    --text:#e7eef7; --muted:#91a6c0; --muted-2:#6b819b;
+    --mono:'JetBrains Mono',ui-monospace,Menlo,monospace; --sans:'Inter',system-ui,'Segoe UI',sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{height:100%;}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);overflow:hidden;-webkit-font-smoothing:antialiased;}
+  .backdrop{position:fixed;inset:0;z-index:0;pointer-events:none;
+    background:radial-gradient(900px 600px at 84% -8%, rgba(251,122,60,0.13), transparent 60%),
+      radial-gradient(1000px 700px at 10% 112%, rgba(52,211,238,0.12), transparent 60%),
+      linear-gradient(180deg,var(--bg),var(--bg-2));}
+  .backdrop::before{content:"";position:absolute;inset:0;
+    background-image:linear-gradient(rgba(125,165,210,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(125,165,210,0.05) 1px,transparent 1px);
+    background-size:48px 48px;mask-image:radial-gradient(ellipse 80% 80% at 50% 45%,#000 35%,transparent 100%);}
+
+  .deck{position:relative;z-index:1;height:100%;}
+  .slide{position:absolute;inset:0;display:none;flex-direction:column;justify-content:center;
+    padding:clamp(34px,5.5vw,96px);padding-bottom:clamp(54px,8vh,108px);opacity:0;}
+  .slide.active{display:flex;opacity:1;animation:rise .5s cubic-bezier(.2,.7,.2,1) both;}
+  @keyframes rise{from{opacity:0;transform:translateY(16px);}to{opacity:1;transform:translateY(0);}}
+  @media (prefers-reduced-motion:reduce){.slide.active{animation:none;}*{transition:none!important;}}
+
+  .kicker{font-family:var(--mono);font-size:clamp(11px,1vw,13px);letter-spacing:.24em;text-transform:uppercase;
+    color:var(--info);display:inline-flex;align-items:center;gap:10px;margin-bottom:18px;}
+  .kicker::before{content:"";width:26px;height:1px;background:linear-gradient(90deg,var(--info),transparent);}
+  .kicker .dot{width:7px;height:7px;border-radius:50%;background:var(--info);box-shadow:0 0 12px var(--info);}
+  .kicker.acc{color:var(--accent);} .kicker.acc::before{background:linear-gradient(90deg,var(--accent),transparent);} .kicker.acc .dot{background:var(--accent);box-shadow:0 0 12px var(--accent);}
+  .kicker.saf{color:var(--safe);} .kicker.saf::before{background:linear-gradient(90deg,var(--safe),transparent);} .kicker.saf .dot{background:var(--safe);box-shadow:0 0 12px var(--safe);}
+  .kicker.pur{color:var(--purple);} .kicker.pur::before{background:linear-gradient(90deg,var(--purple),transparent);} .kicker.pur .dot{background:var(--purple);box-shadow:0 0 12px var(--purple);}
+
+  h1{font-size:clamp(42px,7vw,104px);font-weight:900;line-height:.97;letter-spacing:-0.03em;}
+  h2{font-size:clamp(30px,4.4vw,60px);font-weight:800;line-height:1.04;letter-spacing:-0.02em;}
+  h3{font-size:clamp(16px,1.55vw,20px);font-weight:700;letter-spacing:-0.01em;}
+  .lead{font-size:clamp(16px,1.65vw,22px);color:var(--muted);max-width:60ch;line-height:1.5;}
+  .muted{color:var(--muted);} .accent{color:var(--accent);} .info{color:var(--info);} .safe{color:var(--safe);} .warn{color:var(--warn);} .purple{color:var(--purple);} .mono{font-family:var(--mono);}
+  .grad{background:linear-gradient(100deg,var(--info),var(--info-2) 40%,var(--accent-2));-webkit-background-clip:text;background-clip:text;color:transparent;}
+  em.hl{font-style:normal;color:var(--info);}
+  .hd{margin-bottom:clamp(22px,3vw,38px);}
+
+  .glass{background:linear-gradient(160deg,rgba(255,255,255,0.045),rgba(255,255,255,0.012));border:1px solid var(--border);
+    border-radius:16px;backdrop-filter:blur(14px);box-shadow:0 20px 50px -28px rgba(0,0,0,0.9),inset 0 1px 0 rgba(255,255,255,0.06);}
+  .glass-info{border-color:rgba(52,211,238,0.3);}
+  .glass-acc{border-color:rgba(251,122,60,0.32);}
+  .glass-saf{border-color:rgba(61,220,145,0.3);}
+
+  .row{display:flex;gap:26px;} .col{flex:1;} .stack>*+*{margin-top:14px;}
+  .g2{display:grid;grid-template-columns:1fr 1fr;gap:20px;}
+  .g3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;}
+  .g4{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;}
+
+  .tile{padding:24px 24px;border-radius:15px;}
+  .tile .big{font-weight:900;font-size:clamp(26px,3.2vw,42px);line-height:1;letter-spacing:-0.02em;}
+  .tile .cap{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:12px;}
+  .tile .dsc{color:var(--muted);font-size:13.5px;line-height:1.45;margin-top:10px;}
+
+  .pt{padding:18px 20px;border-radius:14px;}
+  .pt h3{margin-bottom:5px;} .pt p{color:var(--muted);font-size:13.5px;line-height:1.45;}
+  .ic{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;margin-bottom:13px;font-size:17px;font-family:var(--mono);font-weight:700;}
+  .ic-i{background:rgba(52,211,238,0.12);color:var(--info);border:1px solid rgba(52,211,238,0.3);}
+  .ic-a{background:rgba(251,122,60,0.12);color:var(--accent);border:1px solid rgba(251,122,60,0.3);}
+  .ic-s{background:rgba(61,220,145,0.12);color:var(--safe);border:1px solid rgba(61,220,145,0.3);}
+  .ic-w{background:rgba(245,177,58,0.12);color:var(--warn);border:1px solid rgba(245,177,58,0.3);}
+  .ic-p{background:rgba(167,139,250,0.12);color:var(--purple);border:1px solid rgba(167,139,250,0.3);}
+
+  .chips{display:flex;gap:10px;flex-wrap:wrap;}
+  .chip{font-family:var(--mono);font-size:12px;padding:7px 13px;border-radius:999px;border:1px solid var(--border-2);color:var(--muted);display:inline-flex;align-items:center;gap:8px;}
+  .chip .d{width:6px;height:6px;border-radius:50%;}
+  .chip.ph{border-style:dashed;border-color:rgba(245,177,58,0.5);color:var(--warn);}
+  .tag{font-size:12.5px;padding:5px 11px;border-radius:8px;background:rgba(255,255,255,0.04);border:1px solid var(--border);color:var(--text);}
+
+  .src{font-family:var(--mono);font-size:10.5px;color:var(--muted-2);letter-spacing:.02em;margin-top:16px;line-height:1.6;}
+  .src b{color:var(--muted);font-weight:500;}
+  kbd{font-family:var(--mono);background:rgba(255,255,255,0.06);border:1px solid var(--border);border-radius:5px;padding:1px 6px;color:var(--muted);font-size:11px;}
+
+  /* pipeline rail */
+  .rail{display:flex;align-items:stretch;flex-wrap:wrap;gap:0;}
+  .rn{flex:1 1 0;min-width:104px;padding:12px 11px;border-radius:11px;border:1px solid var(--border);background:rgba(255,255,255,0.02);}
+  .rn.llm{border-color:rgba(52,211,238,0.4);background:rgba(52,211,238,0.05);}
+  .rn .rt{font-family:var(--mono);font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted-2);margin-bottom:5px;}
+  .rn .rv{font-weight:700;font-size:13px;line-height:1.12;}
+  .ra{align-self:center;color:var(--muted-2);padding:0 5px;font-size:14px;}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:13px;font-size:11.5px;color:var(--muted);}
+  .legend span{display:inline-flex;align-items:center;gap:7px;} .legend i{width:12px;height:12px;border-radius:4px;}
+
+  /* phones + demo cue */
+  .phones{display:flex;gap:22px;justify-content:center;}
+  .phone{width:158px;border-radius:26px;padding:7px;background:linear-gradient(160deg,#1a2433,#0b121d);border:1px solid var(--border-2);
+    box-shadow:0 34px 70px -34px rgba(0,0,0,0.95),inset 0 1px 0 rgba(255,255,255,0.08);}
+  .phone img{width:100%;border-radius:20px;display:block;}
+  .demo-cue{margin-top:18px;display:flex;align-items:center;gap:14px;padding:16px 22px;border-radius:14px;
+    background:linear-gradient(100deg,rgba(61,220,145,0.16),rgba(61,220,145,0.05));border:1px solid rgba(61,220,145,0.4);}
+  .demo-cue .play{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;flex:none;
+    background:var(--safe);color:#04140c;font-size:17px;box-shadow:0 0 28px -4px rgba(61,220,145,0.7);}
+  .demo-cue .t{font-weight:800;font-size:17px;} .demo-cue .s{color:var(--muted);font-size:13px;margin-top:2px;}
+
+  /* roadmap */
+  .road{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;}
+  .ph-step{padding:20px 20px;border-radius:14px;position:relative;}
+  .ph-step .q{font-family:var(--mono);font-size:12px;letter-spacing:.06em;color:var(--info);margin-bottom:9px;}
+  .ph-step h3{margin-bottom:8px;} .ph-step ul{list-style:none;} .ph-step li{color:var(--muted);font-size:13px;line-height:1.4;padding:3px 0;display:flex;gap:8px;}
+  .ph-step li::before{content:"▸";color:var(--accent);flex:none;}
+
+  .logo-row{display:flex;align-items:center;gap:14px;margin-bottom:26px;}
+  .logo-mark{width:50px;height:50px;border-radius:13px;display:grid;place-items:center;
+    background:radial-gradient(circle at 30% 25%,rgba(251,122,60,0.9),rgba(251,122,60,0.15));border:1px solid rgba(251,122,60,0.45);box-shadow:0 0 30px -6px rgba(251,122,60,0.7);}
+  .logo-mark svg{width:27px;height:27px;}
+  .logo-word{font-family:var(--mono);font-weight:700;letter-spacing:.16em;font-size:14px;color:var(--muted);text-transform:uppercase;}
+
+  .progress{position:fixed;top:0;left:0;height:3px;z-index:50;background:linear-gradient(90deg,var(--info),var(--accent));box-shadow:0 0 14px rgba(52,211,238,0.6);transition:width .45s cubic-bezier(.2,.7,.2,1);}
+  .hud{position:fixed;z-index:40;font-family:var(--mono);font-size:11.5px;color:var(--muted-2);letter-spacing:.08em;}
+  .hud-brand{left:clamp(20px,4vw,44px);bottom:24px;display:flex;align-items:center;gap:9px;}
+  .hud-brand .live{width:7px;height:7px;border-radius:50%;background:var(--safe);box-shadow:0 0 10px var(--safe);animation:pulse 2s infinite;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.35;}}
+  .hud-count{right:clamp(20px,4vw,44px);bottom:24px;} .hud-count b{color:var(--text);font-size:12.5px;}
+  .nav{position:fixed;right:clamp(18px,3.4vw,38px);top:50%;transform:translateY(-50%);z-index:40;display:flex;flex-direction:column;gap:9px;}
+  .nav button{width:9px;height:9px;border-radius:50%;border:0;padding:0;cursor:pointer;background:rgba(145,166,192,0.3);transition:all .25s;}
+  .nav button:hover{background:var(--muted);} .nav button.on{background:var(--info);box-shadow:0 0 10px var(--info);transform:scale(1.25);}
+  .hint{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:40;font-family:var(--mono);font-size:11px;color:var(--muted-2);letter-spacing:.1em;opacity:.85;transition:opacity .4s;}
+  .hint.gone{opacity:0;}
+
+  @media (max-width:900px){.g2,.g3,.g4,.road{grid-template-columns:1fr;}.row{flex-direction:column;}.phones{flex-wrap:wrap;}.nav{display:none;}.rail{flex-direction:column;}.ra{transform:rotate(90deg);padding:6px 0;}}
+</style>
+</head>
+<body>
+<div class="backdrop"></div>
+<div class="progress" id="progress"></div>
+
+<div class="deck" id="deck">
+
+  <!-- 1 · TITLE & TEAM -->
+  <section class="slide">
+    <div style="max-width:1100px;">
+      <div class="logo-row">
+        <div class="logo-mark"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.4 8.6 8 11 4.6-2.4 8-6 8-11V5l-8-3z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <div class="logo-word">Sentinel-City</div>
+      </div>
+      <h1>The city that <span class="grad">responds&nbsp;to&nbsp;itself.</span></h1>
+      <p class="lead" style="margin-top:24px;">An <strong style="color:var(--text)">agentic disaster-response platform</strong> — AI detects, declares, cordons, dispatches &amp; warns; operators supervise; citizens act.</p>
+      <div class="chips" style="margin-top:30px;">
+        <span class="chip"><span class="d" style="background:var(--accent)"></span>Team&nbsp;<strong style="color:var(--text)">Disaster&nbsp;Duo</strong></span>
+        <span class="chip"><span class="d" style="background:var(--info)"></span>Abdul Rehman Butt</span>
+        <span class="chip"><span class="d" style="background:var(--safe)"></span>M. Subhan Rauf</span>
+      </div>
+      <p class="src">AISeekho Hackathon 2026 · Regional Finals &nbsp;·&nbsp; Built with <span class="purple">Google Antigravity</span> · Vertex AI Gemini · FastAPI · React Native</p>
+    </div>
+  </section>
+
+  <!-- 2 · PROBLEM & AI SOLUTION -->
+  <section class="slide">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>The problem &amp; the AI solution</span>
+      <h2>Disaster response is bottlenecked by <span class="accent">human coordination.</span></h2>
+    </div>
+    <div class="g2">
+      <div class="glass tile">
+        <h3 class="accent" style="margin-bottom:12px;">The problem</h3>
+        <p class="lead" style="font-size:16px;">Thousands of concurrent, duplicate, sometimes fake 911 reports must be fused into one incident, sized, cordoned, matched to the nearest units, and turned into a public warning — today through overloaded humans on radios, one incident at a time. The citizen inside the zone gets <em class="hl">no guidance at all</em>.</p>
+      </div>
+      <div class="glass-info glass tile">
+        <h3 class="info" style="margin-bottom:12px;">The AI solution</h3>
+        <p class="lead" style="font-size:16px;">An event-driven AI pipeline puts an agent <em class="hl">on that loop</em>: it triages reports, triangulates them into one incident, then autonomously <strong style="color:var(--text)">declares · cordons · dispatches · warns</strong> — operator-supervised, and every action stamped <span class="mono info">source='ai'</span> and replayable.</p>
+      </div>
+    </div>
+    <p class="src"><b>Why now —</b> 2024 saw <b>27</b> separate US billion-dollar weather/climate disasters totaling <b>$182.7B</b> (4th-costliest on record · NOAA/climate.gov 2024); DHS shipped a Generative-AI emergency-response playbook (Jan 2025).</p>
+  </section>
+
+  <!-- 3 · TECH ARCHITECTURE & LIVE DEMO -->
+  <section class="slide">
+    <div class="hd">
+      <span class="kicker pur"><span class="dot"></span>Technical architecture &amp; live demo</span>
+      <h2>The model <span class="info">proposes.</span> Deterministic code <span class="accent">disposes.</span></h2>
+    </div>
+    <div class="row" style="gap:30px;align-items:stretch;">
+      <div class="col" style="flex:1.25;">
+        <div class="glass" style="padding:18px 20px;">
+          <div class="rail">
+            <div class="rn"><div class="rt">Input</div><div class="rv">911 report</div></div>
+            <div class="ra">→</div>
+            <div class="rn llm"><div class="rt">Gemini · NLU</div><div class="rv">extract</div></div>
+            <div class="ra">→</div>
+            <div class="rn llm"><div class="rt">Gemini · tool</div><div class="rv">triage CCTV</div></div>
+            <div class="ra">→</div>
+            <div class="rn"><div class="rt">Deterministic</div><div class="rv">cluster · decide</div></div>
+            <div class="ra">→</div>
+            <div class="rn llm"><div class="rt">Gemini · plan</div><div class="rv">dispatch</div></div>
+            <div class="ra">→</div>
+            <div class="rn"><div class="rt">Deterministic</div><div class="rv">execute</div></div>
+          </div>
+          <div class="legend">
+            <span><i style="background:rgba(52,211,238,0.5)"></i> Gemini decision point</span>
+            <span><i style="background:rgba(231,238,247,0.25)"></i> Deterministic safety rail</span>
+          </div>
+        </div>
+        <div class="chips" style="margin-top:16px;">
+          <span class="tag">FastAPI</span><span class="tag">PostgreSQL 16</span><span class="tag">Vertex AI Gemini 2.5</span><span class="tag">LangChain</span><span class="tag">React 19</span><span class="tag">React Native / Expo</span><span class="tag">Valhalla routing</span><span class="tag">Cloud Run</span>
+        </div>
+        <p class="src">3 real Gemini decision points (triage tool-call · dispatch planning · 911 vision check) over deterministic rails — confidence from report density, capacity clamps, row-locked writes. <span class="purple">Built in Google Antigravity</span> (plan · scaffold · debug).</p>
+      </div>
+      <div class="col" style="flex:0.95;display:flex;flex-direction:column;justify-content:center;">
+        <div class="phones">
+          <div class="phone"><img src="screenshots/mobile-heatmap.png" alt="citizen heatmap" /></div>
+          <div class="phone"><img src="screenshots/mobile-impact.png" alt="admin impact" /></div>
+        </div>
+        <div class="demo-cue">
+          <div class="play">▶</div>
+          <div><div class="t safe">LIVE DEMO</div><div class="s">Fresh 911 report → autonomous declare · cordon · dispatch · warn → 3 surfaces update live.</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 · MARKET & AUDIENCE -->
+  <section class="slide">
+    <div class="hd">
+      <span class="kicker acc"><span class="dot"></span>Market opportunity &amp; target audience</span>
+      <h2>A <span class="accent">$575B</span> public-safety market, hitting its <span class="info">AI inflection.</span></h2>
+    </div>
+    <div class="g3">
+      <div class="glass tile"><div class="cap">TAM · public safety</div><div class="big">$575B<span style="font-size:.5em;color:var(--muted)"> →$982B</span></div><div class="dsc">Global public-safety &amp; security spend, <span class="info">11.3% CAGR</span> to 2030 — the budget our buyers sit inside.</div></div>
+      <div class="glass-info glass tile"><div class="cap">SAM · AI for public safety</div><div class="big info">~$21B</div><div class="dsc"><span class="info">~30% CAGR</span> — the agentic, software-led slice we compete in (+ emergency-mgmt SW &amp; NG911).</div></div>
+      <div class="glass tile"><div class="cap">SOM · US beachhead, 3-yr</div><div class="big accent">~$40–80M</div><div class="dsc">PSAP + county EM modernization wedge. <span class="warn">Bottom-up estimate, pre-revenue.</span></div></div>
+    </div>
+    <div class="g3" style="margin-top:18px;">
+      <div class="glass pt"><h3>Emergency-mgmt director</h3><p>Owns the disaster — auto-detect, declare &amp; cordon in seconds, audit-ready.</p></div>
+      <div class="glass pt"><h3>911 / PSAP supervisor</h3><p>Drowning in concurrent + prank calls — we cluster, flag, and propose dispatch.</p></div>
+      <div class="glass pt"><h3>Fire / EMS ops chief</h3><p>Needs the fastest safe route — dispatch + hazard-aware routing around the cordon.</p></div>
+    </div>
+    <p class="src"><b>Sources:</b> MarketsandMarkets 2025 (public safety) · Business Research Co. 2025 (AI public safety) · Frost &amp; Sullivan 2025 (US NG911 $1.17B→$1.51B) · ~6,000 US PSAPs (NENA). SAM = composite of separately-sourced markets; SOM is our estimate.</p>
+  </section>
+
+  <!-- 5 · BUSINESS MODEL & EDGE -->
+  <section class="slide">
+    <div class="hd">
+      <span class="kicker saf"><span class="dot"></span>Business model &amp; competitive edge</span>
+      <h2>The moat isn't the model — it's <span class="info">auditable, supervised</span> AI.</h2>
+    </div>
+    <div class="g2">
+      <div class="glass pt"><div class="ic ic-s">$</div><h3>Revenue — per-city SaaS</h3><p>Annual license to emergency-mgmt agencies &amp; 911 centers, tiered by population + incident volume, plus usage-based AI inference. Land with a paid pilot, expand across stations &amp; neighbors.</p></div>
+      <div class="glass-info glass pt"><div class="ic ic-i">◆</div><h3>The moat — gov-grade trust</h3><p>Every AI action stamped <span class="mono">source='ai'</span>, row-locked, fully replayable; deterministic rails constrain the model. The auditability &amp; supervision government procurement <em>requires</em> — a generic chatbot can't clear that bar.</p></div>
+      <div class="glass pt"><div class="ic ic-a">⊕</div><h3>vs. status quo</h3><p>We don't replace legacy CAD (Motorola, Tyler) — we're the <strong style="color:var(--text)">agentic layer on top of it</strong>, proposing actions a supervised operator confirms. Not a rip-and-replace.</p></div>
+      <div class="glass pt"><div class="ic ic-w">↗</div><h3>Tailwind</h3><p>CAD market <span class="warn">$2.46B</span> @ ~11% CAGR; US NG911 <span class="warn">$1.17B→$1.51B</span> by 2030 — explicitly forecast as an AI-enabled ecosystem. ~6,000 US PSAPs to win.</p></div>
+    </div>
+    <p class="src"><b>Sources:</b> Grand View 2025 (CAD $2.46B) · Frost &amp; Sullivan 2025 (NG911). <b>Honest framing:</b> pre-revenue — pricing is a go-to-market hypothesis to validate in pilots, not a signed deal.</p>
+  </section>
+
+  <!-- 6 · ROADMAP -->
+  <section class="slide">
+    <div class="hd">
+      <span class="kicker"><span class="dot"></span>Future roadmap &amp; next steps</span>
+      <h2>From <span class="accent">simulation</span> to <span class="safe">production</span> — retire every mock.</h2>
+    </div>
+    <div class="road">
+      <div class="glass-info glass ph-step"><div class="q">Q3 2026</div><h3>Real data in</h3><ul>
+        <li>Live weather/traffic APIs (NOAA, traffic) into the same rails</li>
+        <li>Promote 911 vision check to a tuned operator signal</li></ul></div>
+      <div class="glass-acc glass ph-step"><div class="q">Q4 2026</div><h3>Real dispatch + scale</h3><ul>
+        <li>One live CAD / NG911 (PSAP) pilot — human-in-the-loop</li>
+        <li>Multi-tenant Cloud Run, more roles &amp; languages</li></ul></div>
+      <div class="glass-saf glass ph-step"><div class="q">H1 2027</div><h3>Trust &amp; validation</h3><ul>
+        <li>AI-planned cordon &amp; alert wording, behind safety clamps</li>
+        <li>SOC2 + FedRAMP path; measured pilot vs. baseline</li></ul></div>
+    </div>
+    <p class="lead" style="margin-top:22px;font-size:17px;">The roadmap is simply to <em class="hl">retire each disclosed simulation</em> — and ~35 US states have started NG911 but <strong style="color:var(--text)">none run it end-to-end</strong>. The gap is real, and open.</p>
+    <p class="src"><b>Sources:</b> FCC 2024 (NG911 status) · Mordor 2025 (cloud CAD 16% CAGR) · FedRAMP 20x 2025 (3–6 mo accelerated vs. 12–18 mo legacy). All items are roadmap, not shipped.</p>
+  </section>
+
+</div>
+
+<div class="nav" id="nav"></div>
+<div class="hud hud-brand"><span class="live"></span> SENTINEL-CITY</div>
+<div class="hud hud-count"><b id="cur">1</b> / 6</div>
+<div class="hint" id="hint"><kbd>←</kbd> <kbd>→</kbd> or click to navigate · <kbd>F</kbd> fullscreen</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  const total=slides.length; let i=0;
+  const nav=document.getElementById('nav');
+  slides.forEach((_,idx)=>{const b=document.createElement('button');b.onclick=()=>go(idx);nav.appendChild(b);});
+  const dots=[...nav.children];
+  function go(n){i=Math.max(0,Math.min(total-1,n));
+    slides.forEach((s,x)=>s.classList.toggle('active',x===i));
+    dots.forEach((d,x)=>d.classList.toggle('on',x===i));
+    document.getElementById('progress').style.width=((i+1)/total*100)+'%';
+    document.getElementById('cur').textContent=i+1;}
+  let hh=false; const hide=()=>{if(!hh){document.getElementById('hint').classList.add('gone');hh=true;}};
+  const next=()=>{go(i+1);hide();}, prev=()=>{go(i-1);hide();};
+  document.addEventListener('keydown',e=>{
+    if(['ArrowRight',' ','PageDown','ArrowDown'].includes(e.key)){e.preventDefault();next();}
+    else if(['ArrowLeft','PageUp','ArrowUp'].includes(e.key)){e.preventDefault();prev();}
+    else if(e.key==='Home')go(0); else if(e.key==='End')go(total-1);
+    else if(e.key==='f'||e.key==='F'){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen();}
+  });
+  document.getElementById('deck').addEventListener('click',e=>{
+    if(e.target.closest('a,button'))return;
+    (e.clientX/window.innerWidth<0.22)?prev():next();});
+  let tx=0;
+  document.addEventListener('touchstart',e=>tx=e.changedTouches[0].clientX,{passive:true});
+  document.addEventListener('touchend',e=>{const d=e.changedTouches[0].clientX-tx;if(Math.abs(d)>50){d<0?next():prev();}},{passive:true});
+  go(0); setTimeout(hide,6000);
+</script>
+</body>
+</html>
