@@ -65,8 +65,10 @@ The web `MapView` was updated to render mobile users as well. Look for the **cya
 Three integration points have explicit hooks:
 
 - `backend/main.py` → `MOCK_AGENTS` list. Replace each entry with live model status.
-- `backend/main.py` → `_SAVINGS_INSIGHTS` dict. Replace pre-written narratives with model-generated text.
-- `backend/main.py` → `_tick_savings()` function. Replace synthetic counters with aggregates from the prediction agent.
+
+The savings tiles are now live: `_compute_savings()` derives the headline numbers from
+real event history (resolved casualties, handled-disaster severity, dispatched units) and
+`_savings_insight()` grounds each narrative in those live counts.
 
 ## Project layout
 

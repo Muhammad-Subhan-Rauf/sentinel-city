@@ -58,23 +58,36 @@ const STADIA_API_KEY: string =
   (Constants.expoConfig?.extra as any)?.stadiaApiKey ??
   '';
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  // Pull our own `timeoutMs` out before spreading into fetch. Without a bound,
+  // a slow endpoint (e.g. the ~20s Gemini /api/city-insight call) leaves the UI
+  // spinning forever if the request stalls; the AbortController turns that into
+  // a catchable error the caller can fall back from.
+  const { timeoutMs, ...fetchInit } = init ?? {};
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   let res: Response;
   try {
     res = await fetch(`${BACKEND_URL}${path}`, {
-      ...init,
+      ...fetchInit,
+      signal: controller?.signal ?? fetchInit.signal,
       headers: {
         'Content-Type': 'application/json',
         ...(init?.headers ?? {}),
       },
     });
   } catch (e: any) {
+    if (controller?.signal.aborted) {
+      throw new Error(`Request to ${path} timed out after ${timeoutMs}ms.`);
+    }
     // Network-level failure (DNS, can't reach host, CORS pre-flight). Give a
     // clearer message than "Network request failed" so the user can spot
     // backend-not-running vs. wrong-IP issues quickly.
     throw new Error(
       `Cannot reach backend at ${BACKEND_URL}. Check that the FastAPI server is running and on the same network. (${e?.message ?? 'network error'})`,
     );
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -127,6 +140,10 @@ const TTL_LIVE = 3000;
 const TTL_WARNINGS = 4000;
 const TTL_ADMIN = 4000;
 const TTL_STATIONS = 60000;
+// The AI insight is an expensive Gemini call whose inputs barely change. Cache
+// it for several minutes so re-opening the tab is instant, matched by the
+// backend's own stats-hash cache. A poll/tick won't refetch within this window.
+const TTL_INSIGHT = 300000;
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -619,8 +636,16 @@ export const api = {
     ),
   // City Resilience Heatmap (admin). Aggregate is cheap-ish + polled → cached.
   cityHeatmap: () => cachedGet('city-heatmap', TTL_ADMIN, () => request<CityHeatmap>('/api/city-heatmap')),
-  // Live AI insight — fetched on explicit tap, not cached (one Gemini call).
-  cityInsight: () => request<CityInsight>('/api/city-insight'),
+  // Live AI insight — one ~20s Gemini call. Cached (+ in-flight de-duped) so a
+  // tap/prefetch reuses it instead of re-spinning, and bounded by a timeout so a
+  // stalled call surfaces as an error the screen can fall back from.
+  cityInsight: () =>
+    cachedGet('city-insight', TTL_INSIGHT, () =>
+      // Cold generation is ~25-30s (stats + Gemini); give comfortable headroom
+      // over the worst case + mobile/adb network overhead so it never aborts a
+      // call that would have succeeded.
+      request<CityInsight>('/api/city-insight', { timeoutMs: 75000 }),
+    ),
 
   // Dispatch — reuses the same endpoints as the web operator console so the
   // mobile map shows the exact same infrastructure (fire / hospital / police).

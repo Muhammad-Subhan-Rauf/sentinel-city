@@ -74,6 +74,20 @@ export default function AdminHeatmapScreen() {
     };
   }, []);
 
+  // Prefetch the AI insight in the background once we know there's incident
+  // history, so tapping the launcher opens an already-loaded (cached) result
+  // instead of waiting out the ~20s Gemini call. cityInsight() is cached +
+  // in-flight de-duped, so the 8s heatmap poll re-running this is harmless.
+  useEffect(() => {
+    if (!data || insight) return;
+    if (data.casualties.count + data.damage.count === 0) return;
+    let cancelled = false;
+    api.cityInsight()
+      .then((r) => { if (!cancelled) setInsight(r); })
+      .catch((e) => { console.warn('[Sentinel] city-insight prefetch failed:', e?.message ?? e); });
+    return () => { cancelled = true; };
+  }, [data, insight]);
+
   const activeLayer = data ? data[layer] : null;
   const heatPoints = useMemo(
     () => (activeLayer ? normalize(activeLayer.points, activeLayer.max_weight) : []),
@@ -89,11 +103,13 @@ export default function AdminHeatmapScreen() {
 
   const openInsight = async () => {
     setInsightOpen(true);
-    setInsight(null);
+    // Prefetched/cached already — show it instantly, no skeleton.
+    if (insight) return;
     setLoadingInsight(true);
     try {
       setInsight(await api.cityInsight());
-    } catch {
+    } catch (e: any) {
+      console.warn('[Sentinel] city-insight fetch failed:', e?.message ?? e);
       setInsight({
         title: 'Insight unavailable',
         summary: 'Could not reach the AI insight service. Try again shortly.',
