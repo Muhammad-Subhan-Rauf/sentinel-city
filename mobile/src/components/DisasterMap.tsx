@@ -6,11 +6,13 @@
 // light mode. The WebView is keyed by scheme so it rebuilds cleanly on switch.
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Animated, StyleSheet, View } from 'react-native';
 import { WebView } from 'react-native-webview';
 import type { WebView as WebViewType } from 'react-native-webview';
-import { api, MobileCitizen, StationPoint, Notification, Cordon, Route, Disaster, WorkerSubRole } from '@/lib/api';
+import { MobileCitizen, StationPoint, Notification, Cordon, Route, Disaster, WorkerSubRole } from '@/lib/api';
 import { useTheme } from '@/theme';
+import { Text } from '@/components/ui';
+import { useMapData } from '@/lib/mapData';
 import { disasterRing, geometryCentroid } from '@/lib/geo';
 import { disasterColor, disasterEmoji, disasterLabel } from '@/lib/disasterMeta';
 import { MapLegend } from './MapLegend';
@@ -66,7 +68,6 @@ function buildLeafletHtml(p: MapPalette): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
   html, body, #map { height: 100%; margin: 0; padding: 0; background: ${p.bg}; }
   /* --mscale is updated on every zoom so markers shrink as you zoom out
@@ -82,12 +83,53 @@ function buildLeafletHtml(p: MapPalette): string {
 </head>
 <body>
 <div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<!-- Heat-map plugin (admin City Resilience Heatmap). Optional: if this CDN
-     fails the base map still renders; we just skip the heat layer. -->
-<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<!-- Leaflet is loaded with a multi-CDN fallback chain (jsdelivr → unpkg →
+     cdnjs). A single CDN being slow/blocked was making the map intermittently
+     fail to initialise ("blank map" / no markers) — trying several hosts makes
+     loading reliable. The map only initialises (__startMap) once Leaflet is
+     confirmed loaded, so we never run map code against an undefined L. -->
 <script>
 (function () {
+  var post = function (p) { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(p)); };
+  function loadCss(urls) {
+    var i = 0;
+    (function next() {
+      if (i >= urls.length) return;
+      var l = document.createElement('link'); l.rel = 'stylesheet'; l.href = urls[i++];
+      l.onerror = next; document.head.appendChild(l);
+    })();
+  }
+  function loadJs(urls, done) {
+    var i = 0;
+    (function next() {
+      if (i >= urls.length) { done(false); return; }
+      var s = document.createElement('script'); s.src = urls[i++];
+      s.onload = function () { done(true); }; s.onerror = next;
+      document.head.appendChild(s);
+    })();
+  }
+  loadCss([
+    'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css',
+    'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css',
+    'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css'
+  ]);
+  loadJs([
+    'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js',
+    'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js'
+  ], function (ok) {
+    if (!ok || !window.L) { post({ type: 'error', message: 'Leaflet failed to load from all CDNs' }); return; }
+    loadJs([
+      'https://cdn.jsdelivr.net/npm/leaflet.heat@0.2.0/dist/leaflet-heat.js',
+      'https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js'
+    ], function () {
+      if (window.__startMap) window.__startMap();
+    });
+  });
+})();
+</script>
+<script>
+window.__startMap = function () {
   var post = function (payload) { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(payload)); };
   var map = L.map('map', { zoomControl: false, attributionControl: false }).setView([${MANHATTAN.lat}, ${MANHATTAN.lng}], 13);
   L.tileLayer('${p.tiles}', { subdomains: 'abcd', maxZoom: 20, keepBuffer: 8 }).addTo(map);
@@ -203,7 +245,7 @@ function buildLeafletHtml(p: MapPalette): string {
   };
 
   post({ type: 'ready' });
-})();
+};
 true;
 </script>
 </body>
@@ -230,13 +272,10 @@ export function DisasterMap({
   const t = useTheme();
   const webviewRef = useRef<WebViewType | null>(null);
   const [ready, setReady] = useState(false);
-  const [notifs, setNotifs] = useState<Notification[]>([]);
-  const [cordons, setCordons] = useState<Cordon[]>([]);
-  const [disasters, setDisasters] = useState<Disaster[]>([]);
-  const [citizens, setCitizens] = useState<MobileCitizen[]>([]);
-  const [fireStations, setFireStations] = useState<StationPoint[]>([]);
-  const [hospitals, setHospitals] = useState<StationPoint[]>([]);
-  const [policeStations, setPoliceStations] = useState<StationPoint[]>([]);
+  // Common hazard + station layers come from a single shared, persisted store
+  // (loaded once, reused across both maps + every remount). Only `myLocation`
+  // below is per-user. `showOtherUsers` opts the citizen layer into the poll.
+  const { notifs, cordons, disasters, citizens, fireStations, hospitals, policeStations } = useMapData(showOtherUsers);
 
   // Colours the user's own "me" dot by their sub-role; individual workers are no
   // longer plotted (their stations are shown instead).
@@ -259,44 +298,10 @@ export function DisasterMap({
     [t.scheme, t.color.bg, t.color.primary, t.color.success],
   );
 
+  // Surface the (shared) disaster layer to the parent for route-avoidance, etc.
   useEffect(() => {
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const [notifs, cordons, disasters, citizens, fireStations, hospitals, policeStations] = await Promise.all([
-          api.listNotifications().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => []),
-          api.listCordons().then((rs) => rs.filter((r) => r.source === 'ai')).catch(() => []),
-          // Disasters are gated on citizen reports (see api.listReportedDisasters):
-          // a placed disaster only appears once users report it, any source.
-          api.listReportedDisasters().catch(() => []),
-          // Other citizens stay private to citizens — only fetched when allowed.
-          showOtherUsers ? api.listCitizens().catch(() => []) : Promise.resolve([]),
-          // Public infrastructure — fire / hospital / police stations — is shown
-          // on EVERY user's map (synced with the web operator console).
-          api.listFireStations().catch(() => []),
-          api.listHospitals().catch(() => []),
-          api.listPoliceStations().catch(() => []),
-        ]);
-        if (cancelled) return;
-        setNotifs(notifs);
-        setCordons(cordons);
-        setDisasters(disasters);
-        setCitizens(citizens);
-        setFireStations(fireStations);
-        setHospitals(hospitals);
-        setPoliceStations(policeStations);
-        onDisastersChange?.(disasters);
-      } catch {
-        /* skip frame on error */
-      }
-    };
-    tick();
-    const handle = setInterval(tick, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(handle);
-    };
-  }, [showOtherUsers]);
+    onDisastersChange?.(disasters);
+  }, [disasters, onDisastersChange]);
 
   const polygons = useMemo<PolygonItem[]>(() => {
     const merged: PolygonItem[] = [];
@@ -376,10 +381,40 @@ export function DisasterMap({
       if (msg.type === 'ready') setReady(true);
       else if (msg.type === 'press') onMapPress?.(msg.lat, msg.lng);
       else if (msg.type === 'polygonPress') onPolygonPress?.(msg.eventId ?? null, msg.label ?? '');
+      else if (msg.type === 'error') console.warn('[DisasterMap] page error:', msg.message);
     } catch {
       /* ignore malformed bridge messages */
     }
   };
+
+  // Loading overlay: shown while the WebView/Leaflet is still spinning up (it
+  // can't post 'ready' until Leaflet has loaded), then faded out — so the user
+  // sees clear "loading" feedback instead of a blank/uncentred map. A safety
+  // timeout fades it even if 'ready' never arrives, so a stuck CDN can't trap
+  // the user behind a permanent spinner.
+  const overlayOpacity = useRef(new Animated.Value(1)).current;
+  const [overlayGone, setOverlayGone] = useState(false);
+  useEffect(() => {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const fadeOut = () => {
+      Animated.timing(overlayOpacity, {
+        toValue: 0,
+        duration: t.reduceMotion ? 0 : 350,
+        useNativeDriver: true,
+      }).start(() => setOverlayGone(true));
+    };
+    if (ready) {
+      fadeOut();
+    } else {
+      // Reset to visible for a fresh load (e.g. theme swap remounts the WebView).
+      setOverlayGone(false);
+      overlayOpacity.setValue(1);
+      timeout = setTimeout(fadeOut, 12000);
+    }
+    return () => {
+      if (timeout) clearTimeout(timeout);
+    };
+  }, [ready, t.reduceMotion, overlayOpacity]);
 
   return (
     <View style={[styles.container, { backgroundColor: t.color.bg }]}>
@@ -393,9 +428,24 @@ export function DisasterMap({
         style={[styles.webview, { backgroundColor: t.color.bg }]}
         onMessage={handleMessage}
         onLoadStart={() => setReady(false)}
+        onError={(e) => console.warn('[DisasterMap] WebView error:', e.nativeEvent?.description)}
+        onHttpError={(e) => console.warn('[DisasterMap] WebView HTTP error:', e.nativeEvent?.statusCode)}
         androidLayerType="hardware"
         mixedContentMode="never"
       />
+
+      {/* Map loading indicator (non-blocking; covers the blank map until ready). */}
+      {!overlayGone && (
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.loadingOverlay, { backgroundColor: t.color.bg, opacity: overlayOpacity }]}
+        >
+          <ActivityIndicator size="large" color={t.color.primary} />
+          <Text variant="caption" tone="muted" style={{ marginTop: 10 }}>
+            Loading map…
+          </Text>
+        </Animated.View>
+      )}
 
       <MapLegend
         myRole={myRole}
@@ -417,4 +467,9 @@ export function DisasterMap({
 const styles = StyleSheet.create({
   container: { flex: 1 },
   webview: { flex: 1 },
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 });
