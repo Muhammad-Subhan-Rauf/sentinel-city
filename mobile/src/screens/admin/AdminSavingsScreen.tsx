@@ -4,6 +4,7 @@
 import React, { useEffect, useState } from 'react';
 import { Modal, RefreshControl, ScrollView, StyleSheet, View, Pressable } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useNavigation } from '@react-navigation/native';
 import { Screen } from '@/components/Screen';
 import { api, SavingsInsight, SavingsSummary } from '@/lib/api';
 import { useTheme } from '@/theme';
@@ -19,6 +20,7 @@ function formatUsd(n: number): string {
 
 export default function AdminSavingsScreen() {
   const t = useTheme();
+  const navigation = useNavigation<any>();
   const [summary, setSummary] = useState<SavingsSummary | null>(null);
   const [injured, setInjured] = useState<{ injured_estimate: number; contributing_events: number } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -86,6 +88,26 @@ export default function AdminSavingsScreen() {
             />
             <StatTile label="Infrastructure value preserved" value={formatUsd(summary.infrastructure_value_usd)} accent={METRIC_ACCENT.infrastructure} icon="infrastructure" onPress={() => openInsight('infrastructure')} />
             <StatTile label="Operational money saved" value={formatUsd(summary.money_saved_usd)} accent={METRIC_ACCENT.money} icon="impact" onPress={() => openInsight('money')} />
+            <Card
+              onPress={() => navigation.navigate('Heatmap')}
+              accent={t.color.info}
+              style={{ marginBottom: t.spacing.md }}
+              accessibilityLabel="Open the City Resilience Heatmap"
+              accessibilityHint="Shows casualty and damage hotspots with AI recommendations"
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: t.spacing.md }}>
+                <IconBadge name="map" color={t.color.info} size={44} />
+                <View style={{ flex: 1 }}>
+                  <Text variant="label" tone="secondary">
+                    City Resilience Heatmap
+                  </Text>
+                  <Text variant="body" style={{ marginTop: 2 }}>
+                    Casualty &amp; damage hotspots + AI advice
+                  </Text>
+                </View>
+                <Icon name="chevronRight" size={20} color={t.color.textMuted} />
+              </View>
+            </Card>
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, marginTop: t.spacing.sm }}>
               <Icon name="time" size={12} color={t.color.textMuted} />
               <Text variant="caption" tone="muted">

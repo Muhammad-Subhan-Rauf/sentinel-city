@@ -378,6 +378,42 @@ export type SavingsInsight = {
   highlights: string[];
 };
 
+// ── City Resilience Heatmap (admin only) ──────────────────────────────
+// A weighted point for the Leaflet heat layer: [lat, lng, weight].
+export type HeatPoint = [number, number, number];
+
+export type HeatLayer = {
+  points: HeatPoint[];
+  // Largest raw weight in this layer — the screen normalises against it so a
+  // lone point is never invisible.
+  max_weight: number;
+  count: number;
+};
+
+export type CityHeatmap = {
+  // Casualties: responder casualty reports (critical > fainted > injured).
+  casualties: HeatLayer & { by_kind: { critical: number; fainted: number; injured: number } };
+  // Damage: disasters reduced to centroids, weighted by severity + at-risk.
+  damage: HeatLayer & { total_est_fatalities: number };
+  generated_at: string;
+};
+
+export type CityRecommendation = {
+  action: string;
+  rationale: string;
+  target_area: string;
+  priority: 'high' | 'medium' | 'low';
+};
+
+// Live Gemini-generated resilience analysis. `status` is 'done' on success,
+// 'empty' when there's no data, 'unavailable' when the AI couldn't be reached.
+export type CityInsight = {
+  title: string;
+  summary: string;
+  recommendations: CityRecommendation[];
+  status?: 'done' | 'empty' | 'unavailable';
+};
+
 // ─── Endpoints ───────────────────────────────────────────────────────
 
 export const api = {
@@ -581,6 +617,10 @@ export const api = {
     cachedGet('injured', TTL_ADMIN, () =>
       request<{ injured_estimate: number; contributing_events: number }>('/api/stats/injured'),
     ),
+  // City Resilience Heatmap (admin). Aggregate is cheap-ish + polled → cached.
+  cityHeatmap: () => cachedGet('city-heatmap', TTL_ADMIN, () => request<CityHeatmap>('/api/city-heatmap')),
+  // Live AI insight — fetched on explicit tap, not cached (one Gemini call).
+  cityInsight: () => request<CityInsight>('/api/city-insight'),
 
   // Dispatch — reuses the same endpoints as the web operator console so the
   // mobile map shows the exact same infrastructure (fire / hospital / police).

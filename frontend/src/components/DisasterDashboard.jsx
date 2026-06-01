@@ -55,6 +55,43 @@ const MAP_STYLES = [
   { value: 'satellite', label: 'Satellite' },
 ]
 
+// One-click demo scenarios. Each preset activates its zones immediately
+// (no Trigger step) so a demo runs from a single button. Coordinates are
+// the same ones the backend stress test uses, so AI rationales the
+// operator sees here line up with the test harness output.
+const DEMO_PRESETS = [
+  {
+    label: 'Citywide stress',
+    description: '8 simultaneous disasters across Manhattan — matches the AI stress-test suite.',
+    zones: [
+      { type: 'Building_Fire', severity: 5, lat: 40.7820, lng: -73.9760, notes: 'UWS apartment fire' },
+      { type: 'Building_Fire', severity: 4, lat: 40.7570, lng: -73.9830, notes: 'Midtown office fire' },
+      { type: 'Building_Fire', severity: 3, lat: 40.8120, lng: -73.9460, notes: 'Harlem brownstone fire' },
+      { type: 'Wildfire',      severity: 5, lat: 40.8730, lng: -73.9230, notes: 'Inwood Hill wildfire' },
+      { type: 'Wildfire',      severity: 3, lat: 40.7990, lng: -73.9580, notes: 'Central Park N brushfire' },
+      { type: 'Wildfire',      severity: 4, lat: 40.7700, lng: -73.9750, notes: 'Central Park S brushfire' },
+      { type: 'Flood',         severity: 5, lat: 40.7150, lng: -73.9870, notes: 'Lower East Side flood' },
+      { type: 'Flood',         severity: 4, lat: 40.7060, lng: -74.0100, notes: 'Financial District flood' },
+    ],
+  },
+  {
+    label: 'Three-alarm sweep',
+    description: '3 high-severity incidents (fire + flood + wildfire) — tests AI prioritisation.',
+    zones: [
+      { type: 'Building_Fire', severity: 4, lat: 40.7570, lng: -73.9830, notes: 'Midtown office fire' },
+      { type: 'Flood',         severity: 4, lat: 40.7150, lng: -73.9870, notes: 'LES flood' },
+      { type: 'Wildfire',      severity: 4, lat: 40.7990, lng: -73.9580, notes: 'Central Park brushfire' },
+    ],
+  },
+  {
+    label: 'Single critical',
+    description: 'One critical Building_Fire on the UWS — fastest demo path.',
+    zones: [
+      { type: 'Building_Fire', severity: 5, lat: 40.7820, lng: -73.9760, notes: 'UWS apartment block fire' },
+    ],
+  },
+]
+
 // Default operating area on app load. Bounds match the Manhattan admin boundary
 // from OSM/Nominatim. The polygon is a hand-traced approximation of the island
 // outline so we can filter the road graph to Manhattan-only nodes (the bbox
@@ -1285,6 +1322,76 @@ export default function DisasterDashboard() {
     setZones((prev) => prev.map((z) => (z.id === id ? { ...z, ...patch } : z)))
   }, [])
 
+  // One-click preset: spawn N zones with status='active' and POST them to
+  // the backend in parallel. Skips the Trigger step entirely so a demo
+  // runs end-to-end from a single button click. Citizen sim will pick up
+  // the active zones on its next tick and start firing reports, which
+  // kicks the AI pipeline through declare → dispatch.
+  const handleApplyPreset = useCallback(async (preset) => {
+    const buildId = () =>
+      typeof crypto !== 'undefined' && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `zone-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    const tNow = engine?.getCurrentTime?.() ?? Date.now() / 1000
+
+    const newZones = preset.zones.map((z) => {
+      const t = DISASTER_TYPES.find((x) => x.value === z.type) || DISASTER_TYPES[0]
+      const isBldg = BUILDING_TYPES.includes(z.type)
+      const isSpread = SPREADING_TYPES.includes(z.type)
+      const isCause = CAUSE_AMBIGUOUS_TYPES.includes(z.type)
+      return {
+        id: buildId(),
+        type: z.type,
+        typeLabel: t.label,
+        typeIcon: t.icon,
+        color: t.color,
+        severity: z.severity,
+        notes: z.notes || null,
+        cause: isCause ? 'infrastructure' : null,
+        spreadSpeed: isSpread ? 0.25 : 1,
+        peopleInside: isBldg ? 50 : null,
+        safeExitPct: isBldg ? 70 : null,
+        parentId: null,
+        spreadInSeconds: isBldg ? 30 : null,
+        triggeredAt: tNow,
+        status: 'active',
+        geometry: { type: 'Point', coordinates: [z.lng, z.lat] },
+        geometryKind: 'point',
+      }
+    })
+
+    setZones((prev) => [...prev, ...newZones])
+    addLog('info', `Preset "${preset.label}" activated — ${newZones.length} disaster${newZones.length === 1 ? '' : 's'} live.`)
+
+    // Fan out POSTs in parallel. Backend creates the disaster_events row
+    // AND spawns mock CCTV cameras around each zone (see backend/main.py).
+    await Promise.all(
+      newZones.map((zone) =>
+        fetch(`${BACKEND_URL}/api/trigger-disaster`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: zone.id,
+            disaster_type: zone.type,
+            severity: zone.severity,
+            geometry: zone.geometry,
+            geometry_kind: zone.geometryKind,
+            notes: zone.notes,
+            cause: zone.cause,
+            status: 'active',
+            source: 'operator',
+            spread_speed: zone.spreadSpeed ?? 1,
+            people_inside: zone.peopleInside ?? null,
+            safe_exit_pct: zone.safeExitPct ?? null,
+            spread_in_seconds: zone.spreadInSeconds ?? null,
+          }),
+        }).catch(() => {})
+      )
+    )
+    refreshWeather()
+  }, [engine]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleZoneRemove = useCallback((id) => {
     setZones((prev) => prev.filter((z) => z.id !== id))
     fetch(`${BACKEND_URL}/api/disasters/${id}`, { method: 'DELETE' })
@@ -1718,6 +1825,35 @@ export default function DisasterDashboard() {
         </div>
 
         <div className="sidebar-stagger flex-1 overflow-y-auto px-5 py-5 space-y-6">
+          {/* Demo presets — one-click multi-disaster scenarios. Each button
+              spawns its zones in 'active' state so the citizen sim + AI
+              pipeline start working immediately, no Trigger step required. */}
+          <section>
+            <SectionLabel>Demo presets</SectionLabel>
+            <div className="space-y-1.5">
+              {DEMO_PRESETS.map((p) => (
+                <button
+                  key={p.label}
+                  onClick={() => handleApplyPreset(p)}
+                  disabled={loading}
+                  className="w-full text-left px-3 py-2 rounded-md border border-zinc-800 bg-zinc-900 hover:border-amber-700 hover:bg-zinc-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[12px] text-zinc-100 font-medium">{p.label}</span>
+                    <span className="text-[10px] text-zinc-500 tabular-nums shrink-0">
+                      {p.zones.length} zone{p.zones.length === 1 ? '' : 's'}
+                    </span>
+                  </div>
+                  {p.description && (
+                    <div className="text-[10px] text-zinc-500 mt-0.5 leading-snug">
+                      {p.description}
+                    </div>
+                  )}
+                </button>
+              ))}
+            </div>
+          </section>
+
           {/* Operating area */}
           <section>
             <SectionLabel>Operating area</SectionLabel>

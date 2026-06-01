@@ -4,8 +4,9 @@
 // NavigationContainer is themed light/dark to match the app.
 
 import React from 'react';
-import { NavigationContainer, DefaultTheme, DarkTheme } from '@react-navigation/native';
+import { NavigationContainer, DefaultTheme, DarkTheme, getFocusedRouteNameFromRoute } from '@react-navigation/native';
 import { createBottomTabNavigator, BottomTabNavigationOptions } from '@react-navigation/bottom-tabs';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { View } from 'react-native';
 import { useAuth } from '@/lib/auth';
 import { useGeofenceWatcher } from '@/lib/geofence';
@@ -28,8 +29,22 @@ import AdminDispatchScreen from '@/screens/admin/AdminDispatchScreen';
 import AdminCallsScreen from '@/screens/admin/AdminCallsScreen';
 import AdminAgentsScreen from '@/screens/admin/AdminAgentsScreen';
 import AdminSavingsScreen from '@/screens/admin/AdminSavingsScreen';
+import AdminHeatmapScreen from '@/screens/admin/AdminHeatmapScreen';
 
 const Tab = createBottomTabNavigator();
+const ImpactStackNav = createNativeStackNavigator();
+
+// The Impact tab is a stack so the City Resilience Heatmap can be pushed
+// full-screen over the impact summary (entered from a row on AdminSavingsScreen).
+// Headerless — each screen renders its own Screen scaffold.
+function ImpactStack() {
+  return (
+    <ImpactStackNav.Navigator screenOptions={{ headerShown: false }}>
+      <ImpactStackNav.Screen name="ImpactHome" component={AdminSavingsScreen} />
+      <ImpactStackNav.Screen name="Heatmap" component={AdminHeatmapScreen} />
+    </ImpactStackNav.Navigator>
+  );
+}
 
 // Builds a tabBarIcon that swaps filled/outline by focus state.
 function tabIcon(base: string) {
@@ -108,7 +123,16 @@ function AdminTabs() {
       <Tab.Screen name="Dispatch" component={AdminDispatchScreen} options={{ tabBarIcon: tabIcon('megaphone') }} />
       <Tab.Screen name="Calls" component={AdminCallsScreen} options={{ tabBarIcon: tabIcon('calls') }} />
       <Tab.Screen name="Agents" component={AdminAgentsScreen} options={{ tabBarIcon: tabIcon('agents') }} />
-      <Tab.Screen name="Impact" component={AdminSavingsScreen} options={{ tabBarIcon: tabIcon('impact') }} />
+      <Tab.Screen
+        name="Impact"
+        component={ImpactStack}
+        options={({ route }) => {
+          // Hide the bottom-tab header on the pushed heatmap so it reads as a
+          // clean full-screen view; keep it on the impact summary.
+          const focused = getFocusedRouteNameFromRoute(route) ?? 'ImpactHome';
+          return { tabBarIcon: tabIcon('impact'), headerShown: focused !== 'Heatmap' };
+        }}
+      />
       <Tab.Screen name="Alerts" component={NotificationsScreen} options={{ tabBarIcon: tabIcon('alerts'), tabBarBadge: badgeValue(badges.alerts) }} />
       <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: tabIcon('settings') }} />
     </Tab.Navigator>

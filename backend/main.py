@@ -4508,6 +4508,236 @@ def update_agent(agent_id: str, update: Dict[str, Any]):
     raise HTTPException(status_code=404, detail="Agent not found.")
 
 
+# ════════════════════════════════════════════════════════════════════
+# Admin: City Resilience Heatmap + AI insight
+#
+# Two spatial layers for the mobile admin "Impact" view:
+#   • casualties — every responder casualty report (all statuses, all-time),
+#     weighted by kind (critical > fainted > injured) × severity. The app has
+#     no explicit "death" field, so critical (life-threatening) casualties are
+#     the proxy for the worst outcomes; the layer is labelled "Casualties".
+#   • damage — each disaster reduced to its centroid, weighted by severity
+#     blended with a log-scaled at-risk proxy (people_inside × unsafe-exit %).
+#
+# Raw weights + max_weight are returned; the mobile client normalises so a lone
+# point is never invisible. /api/city-insight reuses the same aggregate. Both
+# are admin-only via the mobile nav (client-side, like the other admin
+# endpoints) and never 500 on empty data.
+# ════════════════════════════════════════════════════════════════════
+
+_heat_log = logging.getLogger("sentinel.heatmap")
+
+# Per-kind casualty weights. critical (life-threatening) dominates — it's the
+# closest stand-in for a fatality. Severity (1-10, nullable) scales within a
+# kind; a floor keeps a severity-null row visible.
+_CASUALTY_KIND_WEIGHT = {
+    "casualty_critical": 1.0,
+    "casualty_fainted": 0.6,
+    "casualty_injured": 0.45,
+}
+_CASUALTY_SEVERITY_FLOOR = 0.35
+
+
+def _casualty_heat_points() -> Tuple[List[List[float]], Dict[str, int]]:
+    """All-time casualty responder reports → weighted [lat, lng, w] points.
+    Returns (points, by_kind counts). Never raises — ([], zeros) on error."""
+    points: List[List[float]] = []
+    by_kind: Dict[str, int] = {"critical": 0, "fainted": 0, "injured": 0}
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                # No status filter (the /api/responder-reports default of
+                # 'pending' would hide resolved history). Filter to casualty_*
+                # in SQL; validate the lat/lng in Python so we don't depend on
+                # the JSONB '?' operator / column type.
+                cur.execute(
+                    """
+                    SELECT report_kind, location, severity
+                    FROM responder_reports
+                    WHERE report_kind LIKE 'casualty_%';
+                    """
+                )
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        _heat_log.warning("city-heatmap casualties read failed: %s", exc)
+        return [], by_kind
+
+    for kind, location, severity in rows:
+        loc = _coerce_geojson(location) or {}
+        try:
+            lat = float(loc["lat"])
+            lng = float(loc["lng"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        kind_w = _CASUALTY_KIND_WEIGHT.get(kind, 0.4)
+        sev_scale = (
+            max(_CASUALTY_SEVERITY_FLOOR, float(severity) / 10.0)
+            if severity is not None
+            else 0.6
+        )
+        points.append([lat, lng, round(kind_w * sev_scale, 4)])
+        short = kind.replace("casualty_", "")
+        if short in by_kind:
+            by_kind[short] += 1
+    return points, by_kind
+
+
+def _damage_heat_points() -> Tuple[List[List[float]], int, int]:
+    """Disasters (active + cleared) → centroid points weighted by severity blended
+    with a log-scaled at-risk proxy. Returns (points, total_est_at_risk, count).
+    Never raises — ([], 0, 0) on error."""
+    points: List[List[float]] = []
+    total_est = 0.0
+    count = 0
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn:
+            with conn.cursor() as cur:
+                geom_expr = _geometry_select_expr(cur)
+                cur.execute(
+                    f"""
+                    SELECT severity, {geom_expr}, people_inside, safe_exit_pct, status
+                    FROM disaster_events
+                    WHERE status IN ('active', 'cleared');
+                    """
+                )
+                rows = cur.fetchall()
+        conn.close()
+    except Exception as exc:
+        _heat_log.warning("city-heatmap damage read failed: %s", exc)
+        return [], 0, 0
+
+    for severity, geom, people_inside, safe_exit_pct, status_val in rows:
+        centroid = _geometry_centroid(geom)
+        if not centroid:
+            continue
+        est = 0.0
+        if people_inside is not None and safe_exit_pct is not None:
+            try:
+                est = max(0.0, float(people_inside) * (1.0 - float(safe_exit_pct) / 100.0))
+            except (TypeError, ValueError):
+                est = 0.0
+        total_est += est
+        sev_term = float(severity or 0) / 10.0
+        people_term = (math.log1p(est) / math.log1p(150.0)) if est > 0 else 0.0
+        w = 0.6 * sev_term + 0.4 * min(1.0, people_term)
+        if status_val == "cleared":
+            w *= 0.6  # historical, not current — de-emphasise
+        points.append([centroid["lat"], centroid["lng"], round(max(0.1, w), 4)])
+        count += 1
+    return points, int(round(total_est)), count
+
+
+@app.get("/api/city-heatmap", tags=["Admin"])
+def city_heatmap():
+    """Admin-only spatial aggregate powering the mobile 'City Resilience Heatmap'.
+
+    Two layers — casualties (responder reports, all-time) and damage (disasters
+    reduced to centroids). Raw weights + max_weight per layer; the client
+    normalises. Admin-only is enforced client-side (mobile nav), consistent with
+    the other /api admin endpoints. Returns empty arrays (never 500) on no data."""
+    cas_points, by_kind = _casualty_heat_points()
+    dmg_points, total_est, dmg_count = _damage_heat_points()
+    return {
+        "casualties": {
+            "points": cas_points,
+            "max_weight": max((p[2] for p in cas_points), default=1.0),
+            "count": len(cas_points),
+            "by_kind": by_kind,
+        },
+        "damage": {
+            "points": dmg_points,
+            "max_weight": max((p[2] for p in dmg_points), default=1.0),
+            "count": dmg_count,
+            "total_est_fatalities": total_est,
+        },
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+# ── Grounding for /api/city-insight ──────────────────────────────────
+# The geographic math (clustering, nearest-service distances) is done here in
+# Python — LLMs are unreliable at it — and handed to Gemini as plain numbers so
+# it can write recommendations like "add a clinic near the Midtown cluster —
+# 4.2 km to the nearest hospital".
+
+def _cluster_points(points: List[List[float]], *, cell_deg: float, top_n: int) -> List[Dict[str, Any]]:
+    """Grid-bucket weighted [lat,lng,w] points (~cell_deg square) and return the
+    top_n buckets by summed weight, each as {lat, lng, count, weight} with a
+    weight-weighted centroid."""
+    buckets: Dict[Tuple[int, int], Dict[str, float]] = {}
+    for lat, lng, w in points:
+        key = (int(round(lat / cell_deg)), int(round(lng / cell_deg)))
+        b = buckets.setdefault(key, {"wsum": 0.0, "latw": 0.0, "lngw": 0.0, "count": 0.0})
+        b["wsum"] += w
+        b["latw"] += lat * w
+        b["lngw"] += lng * w
+        b["count"] += 1
+    out: List[Dict[str, Any]] = []
+    for b in buckets.values():
+        if b["wsum"] <= 0:
+            continue
+        out.append({
+            "lat": round(b["latw"] / b["wsum"], 5),
+            "lng": round(b["lngw"] / b["wsum"], 5),
+            "count": int(b["count"]),
+            "weight": round(b["wsum"], 3),
+        })
+    out.sort(key=lambda c: c["weight"], reverse=True)
+    return out[:top_n]
+
+
+def _nearest_summary(lat: float, lng: float) -> Dict[str, Any]:
+    """Nearest hospital / fire / police {name, distance_m} for a hotspot."""
+    out: Dict[str, Any] = {}
+    for kind in ("hospital", "fire_station", "police_station"):
+        near = _nearest_resources(lat, lng, kind, limit=1)
+        out[kind] = {"name": near[0]["name"], "distance_m": near[0]["distance_m"]} if near else None
+    return out
+
+
+def _build_insight_stats() -> Dict[str, Any]:
+    """Precompute the grounded spatial summary the insight model reasons over."""
+    cas_points, by_kind = _casualty_heat_points()
+    dmg_points, total_est, dmg_count = _damage_heat_points()
+    # ~0.005° ≈ 500 m at NYC latitude.
+    cas_clusters = _cluster_points(cas_points, cell_deg=0.005, top_n=5)
+    dmg_clusters = _cluster_points(dmg_points, cell_deg=0.005, top_n=3)
+    for c in cas_clusters + dmg_clusters:
+        c["nearest"] = _nearest_summary(c["lat"], c["lng"])
+    return {
+        "totals": {
+            "casualty_reports": len(cas_points),
+            "casualty_by_kind": by_kind,
+            "damage_zones": dmg_count,
+            "estimated_at_risk_people": total_est,
+        },
+        "top_casualty_clusters": cas_clusters,
+        "worst_damage_zones": dmg_clusters,
+        "note": (
+            "distance_m values are metres to the nearest existing service. Casualty "
+            "'weight' blends report count with severity (critical weighted highest). "
+            "The city keeps no explicit fatality records; critical casualties are the "
+            "proxy for the most severe outcomes."
+        ),
+    }
+
+
+@app.get("/api/city-insight", tags=["Admin"])
+def city_insight():
+    """Admin-only: a real, Gemini-generated city-resilience insight grounded in the
+    /api/city-heatmap aggregate (top casualty clusters, worst damage zones, and the
+    distance from each to the nearest hospital/fire/police station). Never 500s —
+    on any AI failure it returns a structured 'unavailable' payload so the client
+    still shows the raw heatmap. Unlike /api/savings-summary/insight (canned text),
+    this is generated live."""
+    from pipeline.city_insight import generate_insight
+
+    return generate_insight(_build_insight_stats())
+
+
 # Live-evolving savings counters. Numbers nudge up slightly on each read
 # so the admin dashboard feels active during a demo. Production replaces
 # this with values aggregated from the prediction / dispatch agents.

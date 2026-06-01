@@ -36,6 +36,11 @@ type Props = {
   legendBottom?: number;
   /** Turn-by-turn mode: keep the map zoomed in and locked on the user. */
   navMode?: boolean;
+  /** Admin heatmap: weighted [lat, lng, intensity] points for the heat layer. */
+  heatPoints?: Array<[number, number, number]>;
+  /** Render as a heatmap — suppress disaster polygons + type labels (stations
+   *  and the user dot stay visible). */
+  heatMode?: boolean;
 };
 
 type PolygonItem = {
@@ -78,6 +83,9 @@ function buildLeafletHtml(p: MapPalette): string {
 <body>
 <div id="map"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- Heat-map plugin (admin City Resilience Heatmap). Optional: if this CDN
+     fails the base map still renders; we just skip the heat layer. -->
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
 <script>
 (function () {
   var post = function (payload) { if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(payload)); };
@@ -98,6 +106,10 @@ function buildLeafletHtml(p: MapPalette): string {
   applyMarkerScale();
 
   var polygonLayer = L.layerGroup().addTo(map);
+  // Admin heatmap layer. Guarded: if leaflet.heat failed to load, heatLayer
+  // stays null and __applyState tells React via a 'heaterror' message. Added
+  // early so station/user markers stack on top of the heat blobs.
+  var heatLayer = (window.L && L.heatLayer) ? L.heatLayer([], { radius: 25, blur: 18, maxZoom: 17, max: 1.0, minOpacity: 0.25 }).addTo(map) : null;
   var labelLayer = L.layerGroup().addTo(map);
   var stationLayer = L.layerGroup().addTo(map);
   var pinLayer = L.layerGroup().addTo(map);
@@ -126,6 +138,8 @@ function buildLeafletHtml(p: MapPalette): string {
 
   window.__applyState = function (state) {
     try {
+      if (heatLayer) { heatLayer.setLatLngs(state.heatPoints || []); }
+      else if ((state.heatPoints || []).length) { post({ type: 'heaterror' }); }
       polygonLayer.clearLayers();
       (state.polygons || []).forEach(function (pg) {
         var latlngs = (pg.ring || []).map(function (c) { return [c[1], c[0]]; });
@@ -210,6 +224,8 @@ export function DisasterMap({
   onDisastersChange,
   legendBottom,
   navMode,
+  heatPoints,
+  heatMode,
 }: Props) {
   const t = useTheme();
   const webviewRef = useRef<WebViewType | null>(null);
@@ -339,18 +355,20 @@ export function DisasterMap({
       .filter(Boolean);
 
     const state = {
-      polygons,
+      // Heat mode shows only the heat layer (+ stations/me) so the blobs read clearly.
+      polygons: heatMode ? [] : polygons,
       stations,
-      disasterLabels,
+      disasterLabels: heatMode ? [] : disasterLabels,
       pins: pins ?? [],
       otherUsers,
       destination: destination ?? null,
       route: route?.coordinates.map((c) => [c.latitude, c.longitude]) ?? null,
       me: myLocation ? { lat: myLocation.lat, lng: myLocation.lng, color: meColor, title: meTitle } : null,
       follow: !!navMode,
+      heatPoints: heatPoints ?? [],
     };
     webviewRef.current?.injectJavaScript(`window.__applyState && window.__applyState(${JSON.stringify(state)}); true;`);
-  }, [ready, polygons, pins, showOtherUsers, citizens, fireStations, hospitals, policeStations, myLocation, myRole, mySubRole, myUserId, destination, route, navMode, t.color]);
+  }, [ready, polygons, pins, showOtherUsers, citizens, fireStations, hospitals, policeStations, myLocation, myRole, mySubRole, myUserId, destination, route, navMode, heatPoints, heatMode, t.color]);
 
   const handleMessage = (event: { nativeEvent: { data: string } }) => {
     try {
